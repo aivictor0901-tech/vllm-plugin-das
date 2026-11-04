@@ -29,6 +29,43 @@ def convert_packed_weight(weight: torch.Tensor) -> torch.Tensor:
     return (((packed << 4) | (packed >> 4)) ^ 0x88).view(torch.int8)
 
 
+def _load_w4a8_tuning_config(
+    num_experts: int,
+    n1: int,
+    n2: int,
+    k: int,
+    top_k: int,
+) -> None:
+    """Load the LightOp W4A8 tuning table selected by TRITON_JSON_DIR."""
+    from lightop._lmslim_native.vllm_compat.w8a8_get_cache_json import (
+        W8a8GetCacheJSON,
+    )
+
+    cache = W8a8GetCacheJSON()
+    json_path = cache.get_moeint8json_name(
+        num_experts,
+        n1,
+        n2,
+        k,
+        top_k,
+        use_int4_w4a8=True,
+    )
+    moe_config = cache.get_moeint8_triton_cache(
+        json_path, num_experts, n1, n2, k, top_k
+    )
+    cache.triton_moejson_dict = moe_config or {}
+    if moe_config:
+        logger.info_once(
+            "Using tuned LightOp W4A8 MoE config: %s", json_path
+        )
+    else:
+        logger.warning_once(
+            "W4A8 tuning config not found at %s; using LightOp default "
+            "MoE config.",
+            json_path,
+        )
+
+
 class HCUCompressedTensorsW4A8MoEMethod(FusedMoEMethodBase):
     """Load compressed-tensors directly, without a SlimQuant config override."""
 
@@ -168,6 +205,11 @@ class HCUCompressedTensorsW4A8MoEMethod(FusedMoEMethodBase):
             return output
         top_k = topk_ids.shape[1]
         n1, hidden = w1.shape[1], w2.shape[1]
+        if not getattr(layer, "_hcu_w4a8_tuning_config_loaded", False):
+            _load_w4a8_tuning_config(
+                w1.shape[0], n1, hidden, n1 // 2, top_k
+            )
+            layer._hcu_w4a8_tuning_config_loaded = True
         expert_map = getattr(layer, "_expert_map", None)
         if expert_map is None:
             expert_map = getattr(layer, "expert_map", None)
