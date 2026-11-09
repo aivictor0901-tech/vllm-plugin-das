@@ -245,6 +245,7 @@ _CORE_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(_adapter("core_fix", "patch_qwen4_exp_ple_prefetch")),
     _CallbackSpec(_adapter("core_fix", "patch_qwen4_exp_ple_cudagraph")),
     _CallbackSpec(_adapter("core_fix", "patch_rocm_mla_sparse_metadata")),
+    _CallbackSpec(_adapter("core_fix", "patch_step5_ct_w4a8")),
 )
 
 

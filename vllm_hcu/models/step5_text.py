@@ -180,6 +180,15 @@ FP8_DENSE = henvs.optional_custom_op_enabled(
     os.environ.get("VLLM_HCU_STEP5_FP8_DENSE", "0") == "1"
 )
 
+# INT8 supports FULL and PIECEWISE: keep BF16 weights for eager, where the Python
+# LightOp launch overhead can exceed the saved GEMM time. Validated TP4 shapes
+# are selected in ops/step5/int8_dense.py; scope matches FP8_DENSE.
+INT8_DENSE = henvs.optional_custom_op_enabled(
+    os.environ.get("VLLM_HCU_STEP5_INT8_DENSE", "0") == "1"
+)
+if INT8_DENSE and FP8_DENSE:
+    raise ValueError("Step5 INT8_DENSE and FP8_DENSE are mutually exclusive")
+
 # Append DSA q/k/z/w rows to the fused channel-FP8 QKV/gate projection.
 QKV_INDEXER = henvs.optional_custom_op_enabled(
     os.environ.get("VLLM_HCU_STEP5_QKV_INDEXER", "0") == "1"
@@ -508,6 +517,53 @@ class Step5FP8LinearMethod(LinearMethodBase):
         return out if bias is None else out + bias
 
 
+class Step5INT8LinearMethod(LinearMethodBase):
+    """Load BF16 normally, then cache INT8 for FULL and PIECEWISE graphs.
+
+    Adapted from Step5FP8LinearMethod; the native method and BF16 storage remain
+    available for graph-disabled runs and unprofiled shapes.
+    """
+
+    def __init__(self, native, post: Callable[[], None] | None = None):
+        self.native = native
+        self.post = post
+
+    def create_weights(self, *args, **kwargs):
+        raise NotImplementedError("swapped in after the layer is created")
+
+    def process_weights_after_loading(self, layer: nn.Module) -> None:
+        self.native.process_weights_after_loading(layer)
+        if self.post is not None:
+            self.post()
+            return
+        from vllm_hcu.ops.step5.int8_dense import prepare_weight
+
+        k, n = layer.input_size_per_partition, layer.output_size_per_partition
+        w = layer.weight if _weight_is_kn(layer.weight, k, n) else layer.weight.t()
+        q, scale = prepare_weight(w)
+        for name, value in (("int8_wq", q), ("int8_ws", scale)):
+            if name in layer._buffers:
+                setattr(layer, name, value)
+            else:
+                layer.register_buffer(name, value, persistent=False)
+        layer.int8_n = n
+
+    def apply(self, layer, x, bias=None):
+        from vllm_hcu.ops.step5.int8_dense import graph_enabled, int8_linear
+
+        if getattr(layer, "int8_wq", None) is not None and graph_enabled(x):
+            k, n = layer.input_size_per_partition, layer.output_size_per_partition
+            w = layer.weight if _weight_is_kn(layer.weight, k, n) else layer.weight.t()
+            out = int8_linear(x, layer.int8_wq, layer.int8_ws, layer.int8_n, w)
+            return out if bias is None else out + bias
+        return self.native.apply(layer, x, bias)
+
+
+def _use_int8(*layers: nn.Module) -> None:
+    for layer in layers:
+        layer.quant_method = Step5INT8LinearMethod(layer.quant_method)
+
+
 def _weight_is_kn(w: torch.Tensor, k: int, n: int) -> bool:
     """Whether a bf16 linear weight is stored ``[in, out]`` (HCU VLLM_USE_NN)."""
     if k != n:
@@ -746,6 +802,8 @@ class Step5Attention(nn.Module):
         self.register_buffer("qkvg_weight", None, persistent=False)
         self.register_buffer("qkvg_wq", None, persistent=False)
         self.register_buffer("qkvg_ws", None, persistent=False)
+        self.register_buffer("qkvg_int8_wq", None, persistent=False)
+        self.register_buffer("qkvg_int8_ws", None, persistent=False)
         if use_head_wise_attn_gate:
             self.g_proj = ColumnParallelLinear(
                 hidden_size,
@@ -755,6 +813,16 @@ class Step5Attention(nn.Module):
                 prefix=f"{prefix}.g_proj",
             )
             self._maybe_fuse_qkvg()
+        if INT8_DENSE:
+            _use_int8(self.o_proj)
+            if self.qkvg_weight is not None:
+                self.qkv_proj.quant_method = Step5INT8LinearMethod(
+                    self.qkv_proj.quant_method, post=self._quantize_qkvg_int8
+                )
+            else:
+                _use_int8(self.qkv_proj)
+                if use_head_wise_attn_gate:
+                    _use_int8(self.g_proj)
         if FP8_DENSE:
             _use_fp8(self.o_proj)
             if self.qkvg_weight is not None:
@@ -867,6 +935,36 @@ class Step5Attention(nn.Module):
         wg.data = fused[:, nq:]
         self.register_buffer("qkvg_weight", fused, persistent=False)
 
+    def _quantize_qkvg_int8(self) -> None:
+        from vllm_hcu.ops.step5.int8_dense import prepare_weight
+
+        # Match FP8_DENSE + QKV_INDEXER, including the original BF16 rounding
+        # boundary for the indexer head weights. Keep a merged BF16 fallback.
+        if getattr(self, "_int8_qkvg_prepared", False):
+            return
+        w = self.qkvg_weight
+        if QKV_INDEXER and self.indexer is not None:
+            parts = (
+                self.sparse_indexer_q.weight,
+                self.sparse_indexer_k.weight,
+                self.sparse_indexer_z.weight,
+                self.sparse_indexer_w.weight.to(w.dtype),
+            )
+            idx = torch.cat([t.detach().to(w.dtype) for t in parts], 0)
+            self.idx_off, self.idx_n = w.shape[1], idx.shape[0]
+            w = torch.cat([w, idx.t()], 1)
+        q, scale = prepare_weight(w)
+        if q is None:
+            return
+        self.qkvg_int8_wq, self.qkvg_int8_ws = q, scale
+        self.qkvg_weight = w
+        if QKV_INDEXER and self.indexer is not None:
+            self.indexer.pre_projected = True
+            for lin in (self.qkv_proj, self.g_proj, self.sparse_indexer_q,
+                        self.sparse_indexer_k, self.sparse_indexer_z):
+                _free_weight(lin.weight)
+        self._int8_qkvg_prepared = True
+
     def _quantize_qkvg(self) -> None:
         from vllm_hcu.ops.step5.fp8_dense import quantize_weight_fp8
 
@@ -899,7 +997,20 @@ class Step5Attention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-        if self.qkvg_wq is not None:
+        use_int8 = False
+        if self.qkvg_int8_wq is not None:
+            from vllm_hcu.ops.step5.int8_dense import graph_enabled, int8_linear
+
+            use_int8 = graph_enabled(hidden_states)
+        if use_int8:
+            qkvg = int8_linear(
+                hidden_states, self.qkvg_int8_wq, self.qkvg_int8_ws,
+                self.qkvg_weight.shape[1], self.qkvg_weight,
+            )
+            nqkv = self.q_size + 2 * self.kv_size
+            qkv = qkvg[..., :nqkv]
+            extra_dims = qkvg[..., nqkv : nqkv + self.num_heads]
+        elif self.qkvg_wq is not None:
             from vllm_hcu.ops.step5.fp8_dense import fp8_linear
 
             # N is padded; slice instead of split.
@@ -909,9 +1020,9 @@ class Step5Attention(nn.Module):
             extra_dims = qkvg[..., nqkv : nqkv + self.num_heads]
         elif self.qkvg_weight is not None:
             qkvg = torch.matmul(hidden_states, self.qkvg_weight)
-            qkv, extra_dims = qkvg.split(
-                [self.q_size + 2 * self.kv_size, self.num_heads], dim=-1
-            )
+            nqkv = self.q_size + 2 * self.kv_size
+            qkv = qkvg[..., :nqkv]
+            extra_dims = qkvg[..., nqkv : nqkv + self.num_heads]
         else:
             qkv, _ = self.qkv_proj(hidden_states)
             extra_dims = None
@@ -1278,6 +1389,8 @@ class Step5DecoderLayer(nn.Module):
                 reduce_results=True,
                 prefix=f"{prefix}.mlp",
             )
+            if INT8_DENSE:
+                _use_int8(self.mlp.gate_up_proj, self.mlp.down_proj)
             if FP8_DENSE:
                 _use_fp8(self.mlp.gate_up_proj, self.mlp.down_proj)
         self.input_layernorm = _fp32_gemma_rms_norm(
@@ -1578,6 +1691,8 @@ class Step5Model(nn.Module):
                 continue
 
             if ".moe.experts." in local_name:
+                if local_name.endswith(".weight_shape"):
+                    continue
                 is_expert_weight = False
                 for mapping in per_expert_mapping:
                     param_name, weight_name, expert_id, shard_id = mapping

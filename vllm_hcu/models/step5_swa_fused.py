@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
-"""Step5 sliding-window layers: q/k norm + RoPE + q fp8 quant + KV cache write.
+"""Step5 sliding-window layers: q/k norm + RoPE + optional q quant + KV cache write.
 
 One kernel replaces what Inductor emits for these layers at decode (a combo
 q-norm/rope/quant + k sum-sq kernel, a k norm/rope kernel) plus the separate
@@ -10,6 +10,10 @@ RMSNorm (``x * rsqrt(mean(x^2) + eps) * (1 + w)``) and the neox RoPE are
 evaluated in fp32 without intermediate rounding; q is quantized with the
 attention layer's static scale; k is rounded to bf16 before the fp8 cache
 store, as it was when it went through reshape_and_cache_flash.
+
+For the gfx936 BF16-query backend, norm outputs are rounded to BF16 before
+RoPE to match the eager path; Q stays BF16 and K/V are stored as E4M3FN.
+The legacy FP8-query branch retains its existing arithmetic.
 
 Gated by VLLM_HCU_STEP5_SWA_FUSED_QK. The op takes the layer name, so it is a
 graph splitting op (see CompilationConfig) like unified_kv_cache_update.
@@ -50,7 +54,8 @@ _HEADS_PER_PROG = 8
 
 
 @triton.jit
-def _norm_rope(x1, x2, w_ptr, cos, sin, eps, HALF: tl.constexpr, BH: tl.constexpr):
+def _norm_rope(x1, x2, w_ptr, cos, sin, eps, HALF: tl.constexpr,
+               BH: tl.constexpr, ROUND_NORM: tl.constexpr = False):
     offs = tl.arange(0, BH)
     m = offs < HALF
     ss = tl.sum(x1 * x1, axis=1) + tl.sum(x2 * x2, axis=1)
@@ -59,6 +64,9 @@ def _norm_rope(x1, x2, w_ptr, cos, sin, eps, HALF: tl.constexpr, BH: tl.constexp
     w2 = tl.load(w_ptr + HALF + offs, mask=m, other=0.0) + 1.0
     n1 = x1 * r * w1[None, :]
     n2 = x2 * r * w2[None, :]
+    if ROUND_NORM:
+        n1 = n1.to(tl.bfloat16).to(tl.float32)
+        n2 = n2.to(tl.bfloat16).to(tl.float32)
     return n1 * cos - n2 * sin, n2 * cos + n1 * sin
 
 
@@ -91,6 +99,7 @@ def _swa_qk_norm_rope_cache_kernel(
     HB: tl.constexpr,
     HALF: tl.constexpr,
     BH: tl.constexpr,
+    Q_BF16: tl.constexpr,
 ):
     # grid = (tokens, NQ // HB + num_kv_heads): q head groups first, then one
     # program per kv head that also writes the cache.
@@ -112,10 +121,14 @@ def _swa_qk_norm_rope_cache_kernel(
         base = row + h[:, None] * D + offs[None, :]
         x1 = tl.load(base, mask=dm[None, :], other=0.0).to(tl.float32)
         x2 = tl.load(base + HALF, mask=dm[None, :], other=0.0).to(tl.float32)
-        o1, o2 = _norm_rope(x1, x2, qw_ptr, cos, sin, eps, HALF, BH)
-        inv = 1.0 / tl.load(q_scale_ptr)
-        o1 = tl.minimum(tl.maximum(o1 * inv, -448.0), 448.0).to(tl.float8e4nv)
-        o2 = tl.minimum(tl.maximum(o2 * inv, -448.0), 448.0).to(tl.float8e4nv)
+        o1, o2 = _norm_rope(x1, x2, qw_ptr, cos, sin, eps, HALF, BH, Q_BF16)
+        if Q_BF16:
+            o1 = o1.to(tl.bfloat16)
+            o2 = o2.to(tl.bfloat16)
+        else:
+            inv = 1.0 / tl.load(q_scale_ptr)
+            o1 = tl.minimum(tl.maximum(o1 * inv, -448.0), 448.0).to(tl.float8e4nv)
+            o2 = tl.minimum(tl.maximum(o2 * inv, -448.0), 448.0).to(tl.float8e4nv)
         ob = q_out_ptr + t.to(tl.int64) * (NQ * D) + h[:, None] * D + offs[None, :]
         tl.store(ob, o1, mask=dm[None, :])
         tl.store(ob + HALF, o2, mask=dm[None, :])
@@ -127,7 +140,7 @@ def _swa_qk_norm_rope_cache_kernel(
                 kbase = row + (NQ + kh) * D + offs[None, :]
                 x1 = tl.load(kbase, mask=dm[None, :], other=0.0).to(tl.float32)
                 x2 = tl.load(kbase + HALF, mask=dm[None, :], other=0.0).to(tl.float32)
-                o1, o2 = _norm_rope(x1, x2, kw_ptr, cos, sin, eps, HALF, BH)
+                o1, o2 = _norm_rope(x1, x2, kw_ptr, cos, sin, eps, HALF, BH, Q_BF16)
                 kinv = 1.0 / tl.load(k_scale_ptr)
                 o1 = o1.to(tl.bfloat16).to(tl.float32) * kinv
                 o2 = o2.to(tl.bfloat16).to(tl.float32) * kinv
@@ -184,9 +197,12 @@ def swa_qk_norm_rope_cache(
     heads_per_prog: int = _HEADS_PER_PROG,
     num_warps: int = 1,
 ) -> torch.Tensor:
-    """Writes q as fp8 [tokens, num_heads * head_dim] into q_out (allocated if
-    None) and returns it; writes k/v into the paged fp8 cache ([blocks, page,
-    kv_heads, head_dim] views) at slot_mapping."""
+    """Write Q into a BF16 or E4M3FN q_out, and K/V into E4M3FN caches.
+
+    A missing q_out retains the legacy E4M3FN default. BF16 output expects
+    BF16 activations and a BF16 RoPE cache, and does not use q_scale.
+    Cache views are [blocks, page, kv_heads, head_dim] with explicit strides.
+    """
     num_tokens = qkv.shape[0]
     head_dim = cos_sin_cache.shape[-1]
     if q_out is None:
@@ -196,12 +212,20 @@ def swa_qk_norm_rope_cache(
             dtype=torch.float8_e4m3fn,
             device=qkv.device,
         )
+    if q_out.dtype not in (torch.bfloat16, torch.float8_e4m3fn):
+        raise ValueError("SWA fused Q output must be BF16 or E4M3FN")
+    if q_out.dtype == torch.bfloat16 and (
+        qkv.dtype != torch.bfloat16 or cos_sin_cache.dtype != torch.bfloat16
+    ):
+        raise ValueError("BF16 fused Q requires BF16 QKV and RoPE cache")
     if num_tokens == 0:
         return q_out
     if slot_mapping is None or key_cache is None:
         num_slots = 0
         slot_mapping = positions
-        key_cache = value_cache = q_out.view(1, 1, 1, -1)
+        key_cache = value_cache = q_out.view(torch.uint8).view(
+            torch.float8_e4m3fn
+        ).view(1, 1, 1, -1)
     else:
         num_slots = slot_mapping.shape[0]
     hb = heads_per_prog
@@ -233,7 +257,9 @@ def swa_qk_norm_rope_cache(
         HB=hb,
         HALF=head_dim // 2,
         BH=triton.next_power_of_2(head_dim // 2),
+        Q_BF16=q_out.dtype == torch.bfloat16,
         num_warps=num_warps,
+        enable_fp_fusion=q_out.dtype != torch.bfloat16,
     )
     return q_out
 
@@ -400,7 +426,7 @@ def can_use(attn_module) -> bool:
         and not attn_module.is_sparse_layer
         and attn.sliding_window is not None
         and attn.kv_cache_dtype in ("fp8", "fp8_e4m3")
-        and attn.query_quant is not None
+        and (attn.query_quant is not None or getattr(attn.impl, "_gfx936_fp8_swa", False))
         and attn_module.use_rope
         and getattr(rope, "is_neox_style", False)
         and getattr(rope, "rotary_dim", -1) == attn_module.head_dim
@@ -419,10 +445,16 @@ def forward(attn_module, positions, qkv, v_view, k_view, gate=None):
     attn = attn_module.attn
     encoded = _encode_layer_name(attn.layer_name)
     head_dim = attn_module.head_dim
+    bf16_query = getattr(attn.impl, "_gfx936_fp8_swa", False)
+    rope_cache = attn_module.rotary_emb.cos_sin_cache
+    if bf16_query:
+        if qkv.dtype != torch.bfloat16:
+            raise ValueError("gfx936 fused SWA requires BF16 QKV")
+        rope_cache = attn_module.rotary_emb._match_cos_sin_cache_dtype(qkv)
     q = torch.empty(
         qkv.shape[0],
         attn_module.num_heads * head_dim,
-        dtype=torch.float8_e4m3fn,
+        dtype=torch.bfloat16 if bf16_query else torch.float8_e4m3fn,
         device=qkv.device,
     )
     dummy = torch.ops.vllm.step5_swa_qk_norm_rope_cache(
@@ -430,7 +462,7 @@ def forward(attn_module, positions, qkv, v_view, k_view, gate=None):
         positions,
         attn_module.q_norm.weight,
         attn_module.k_norm.weight,
-        attn_module.rotary_emb.cos_sin_cache,
+        rope_cache,
         attn_module.q_norm.variance_epsilon,
         attn_module.num_heads,
         attn_module.num_kv_heads,

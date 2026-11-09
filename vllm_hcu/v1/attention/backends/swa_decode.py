@@ -22,7 +22,8 @@ def _fp8e4m3_to_bf16(x):
     # covers subnormals); the generic conversion is far slower on this target.
     b = x.to(tl.uint8, bitcast=True).to(tl.uint32)
     f = (((b & 0x7F) << 20) | ((b & 0x80) << 24)).to(tl.float32, bitcast=True)
-    y = (f * 1.329227995784916e36).to(tl.bfloat16)
+    y = tl.where((b & 0x7F) == 0x7F, float("nan"),
+                 f * 1.329227995784916e36).to(tl.bfloat16)
     # Opaque identity: keeps the compiler from sinking the conversion past the
     # shared-memory staging of the dot operand (byte-wise LDS reads are slow).
     return tl.inline_asm_elementwise("", "=v,0", [y], dtype=tl.bfloat16, is_pure=False, pack=1)
@@ -49,6 +50,8 @@ def _swa_split_kernel(
     # One program per (request, kv head, key chunk).  The rows of the tile are
     # all (query token, q head) pairs of the request that share the kv head, so
     # each K/V tile is loaded once for every query token of the request.
+    k_cache = k_cache.to(tl.pointer_type(tl.uint8))
+    v_cache = v_cache.to(tl.pointer_type(tl.uint8))
     BLOCK_M: tl.constexpr = QL_MAX * GROUP
     r = tl.program_id(0)
     kvh = tl.program_id(1)
@@ -57,6 +60,8 @@ def _swa_split_kernel(
 
     q_start = tl.load(cu_seqlens_q + r)
     q_len = tl.load(cu_seqlens_q + r + 1) - q_start
+    if q_len == 0:
+        return
     seq_len = tl.load(seqused_k + r)
 
     offs_m = tl.arange(0, BLOCK_M)
@@ -97,10 +102,10 @@ def _swa_split_kernel(
     page = tl.load(bt_row + n1 // PAGE).to(tl.int64)
     kp = k_cache + page * stride_kb + (n1 % PAGE) * stride_ks + k_off
     vp = v_cache + page * stride_vb + (n1 % PAGE) * stride_vs + v_off
-    ka_r = tl.load(kp + offs_d1[:, None])
-    kb_r = tl.load(kp + offs_d2[:, None])
-    va_r = tl.load(vp + offs_d1[None, :])
-    vb_r = tl.load(vp + offs_d2[None, :])
+    ka_r = tl.load(kp + offs_d1[:, None], mask=(n1 + offs_n < seq_len)[None, :], other=0)
+    kb_r = tl.load(kp + offs_d2[:, None], mask=(n1 + offs_n < seq_len)[None, :], other=0)
+    va_r = tl.load(vp + offs_d1[None, :], mask=(n1 + offs_n < seq_len)[:, None], other=0)
+    vb_r = tl.load(vp + offs_d2[None, :], mask=(n1 + offs_n < seq_len)[:, None], other=0)
     for n0 in range(start, end, BLOCK_N):
         ka = _fp8e4m3_to_bf16(ka_r)
         kb = _fp8e4m3_to_bf16(kb_r)
@@ -111,10 +116,10 @@ def _swa_split_kernel(
         n1 = (n1 // BLOCK_N) * BLOCK_N
         kp = k_cache + page * stride_kb + (n1 % PAGE) * stride_ks + k_off
         vp = v_cache + page * stride_vb + (n1 % PAGE) * stride_vs + v_off
-        ka_r = tl.load(kp + offs_d1[:, None])
-        kb_r = tl.load(kp + offs_d2[:, None])
-        va_r = tl.load(vp + offs_d1[None, :])
-        vb_r = tl.load(vp + offs_d2[None, :])
+        ka_r = tl.load(kp + offs_d1[:, None], mask=(n1 + offs_n < seq_len)[None, :], other=0)
+        kb_r = tl.load(kp + offs_d2[:, None], mask=(n1 + offs_n < seq_len)[None, :], other=0)
+        va_r = tl.load(vp + offs_d1[None, :], mask=(n1 + offs_n < seq_len)[:, None], other=0)
+        vb_r = tl.load(vp + offs_d2[None, :], mask=(n1 + offs_n < seq_len)[:, None], other=0)
         s = tl.dot(qa, ka) + tl.dot(qb, kb)
         kpos = n0 + offs_n
         valid = (kpos[None, :] >= lo_row[:, None]) & (kpos[None, :] <= pos[:, None])

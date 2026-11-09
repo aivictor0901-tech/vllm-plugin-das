@@ -47,6 +47,12 @@ def execute_model(
         self.add_requests(scheduler_output)
         self.update_requests(scheduler_output)
         self.block_tables.apply_staged_writes()
+        transfer = self.vllm_config.kv_transfer_config
+        if transfer is not None and transfer.kv_connector == "DecodeBenchConnector":
+            # DSA metadata reads partial-region state before pre_forward().
+            from vllm_hcu.v1.step5_decode_bench import prepare_decode_bench
+
+            prepare_decode_bench(self, scheduler_output)
         if scheduler_output.total_num_scheduled_tokens == 0:
             # No need to run the model.
             empty_output = self.kv_connector.no_forward(scheduler_output)

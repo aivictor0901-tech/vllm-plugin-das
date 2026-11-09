@@ -113,6 +113,9 @@ def test_target_metadata_schema_and_round_trip(mooncake):
         "registered_layer_indices",
         "registered_group_indices",
         "num_blocks_per_layer",
+        "step5_pd_version",
+        "step5_mtp_tokens",
+        "step5_prompt_tokens",
     )
     metadata = _metadata(
         mooncake,
@@ -445,6 +448,101 @@ def test_registration_preserves_padded_stride_and_deduplicates_storage(mooncake)
     assert len(regions) == 2
     assert [r.kv_block_len for r in regions] == [16, 16]
     assert [r.group_index for r in regions] == [0, 1]
+
+
+def _hcu_flash_cache(*, dtype=torch.float16, padding=8):
+    # Logical [B, 2, N, H, C], physical [B, 2, H, N, C].
+    block_stride = 2 * 2 * 2 * 4 + padding
+    raw = torch.full((4 * block_stride,), 97, dtype=dtype)
+    cache = torch.as_strided(
+        raw, size=(4, 2, 2, 2, 4), stride=(block_stride, 16, 4, 8, 1),
+    )
+    return raw, cache
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.uint8])
+@pytest.mark.parametrize("ratio", [1, 2])
+def test_hcu_flash_registration_and_actual_block_copy(mooncake, dtype, ratio):
+    import ctypes
+
+    name = "model.layers.0.self_attn"
+    spec = mooncake.FullAttentionSpec(
+        block_size=2 * ratio, num_kv_heads=2, head_size=4,
+        dtype=torch.float8_e4m3fn if dtype == torch.uint8 else dtype,
+    )
+    workers, raw_buffers, caches = [], [], []
+    for padding in (8, 16):
+        worker = _worker(mooncake, blocks_first=True, tp_size=1)
+        worker._physical_blocks_per_logical_kv_block = ratio
+        worker._layer_specs[name] = spec
+        worker._layer_group_indices[name] = 0
+        worker.kv_cache_config = SimpleNamespace(
+            kv_cache_groups=[SimpleNamespace(kv_cache_spec=spec)],
+        )
+        raw, cache = _hcu_flash_cache(dtype=dtype, padding=padding)
+        worker.register_kv_caches({name: cache})
+        assert worker.device_kv_caches[name] is cache
+        assert worker.registered_layer_names == [
+            name + ".hcu_flash_k", name + ".hcu_flash_v",
+        ]
+        assert worker.registered_group_indices == [0, 0]
+        assert worker.num_blocks_per_layer == [4, 4]
+        assert worker.kv_caches_base_addr == [
+            cache[:, 0].data_ptr(), cache[:, 1].data_ptr(),
+        ]
+        assert worker.kv_block_len_per_layer == [16 * cache.element_size()] * 2
+        assert worker.engine.calls == [([raw.data_ptr()], [raw.numel() * raw.element_size()])]
+        workers.append(worker)
+        raw_buffers.append(raw)
+        caches.append(cache)
+
+    source, dest = caches
+    source.copy_(torch.arange(source.numel()).reshape(source.shape).to(dtype))
+    before = raw_buffers[1].clone()
+    regions = [w._get_transfer_regions(
+        w.kv_caches_base_addr, w.block_len_per_layer, w.kv_block_len_per_layer,
+        w.registered_layer_names, w.registered_layer_indices,
+        w.registered_group_indices, num_blocks_per_layer=w.num_blocks_per_layer,
+    ) for w in workers]
+    local_blocks = [2, 0] if ratio == 1 else [1]
+    remote_blocks = [1, 2] if ratio == 1 else [0]
+    send_meta = mooncake.SendBlockMeta(
+        p_req_id="p", transfer_id="x", local_block_ids=[local_blocks], ready=asyncio.Event(),
+    )
+    meta = _metadata(mooncake, remote_tp_size=1, req_blocks={"d": ("x", [remote_blocks])})
+    src, dst, lengths, errors, message = asyncio.run(workers[0]._build_transfer_params(
+        [("d", send_meta)], meta, *regions,
+    ))
+    assert errors == [] and message is None
+    for src_addr, dst_addr, size in zip(src, dst, lengths):
+        ctypes.memmove(dst_addr, src_addr, size)
+    physical_pairs = [(2, 1), (0, 2)] if ratio == 1 else [(2, 0), (3, 1)]
+    for source_block, dest_block in physical_pairs:
+        assert torch.equal(dest[dest_block], source[source_block])
+    # No copying across padding or into blocks not requested by the consumer.
+    changed = torch.zeros_like(before, dtype=torch.bool)
+    for _, dest_block in physical_pairs:
+        start = dest_block * dest.stride(0)
+        changed[start:start + 32] = True
+    assert torch.equal(raw_buffers[1][~changed], before[~changed])
+
+
+def test_hcu_flash_rejects_incompatible_layout_and_peer(mooncake):
+    name = "model.layers.0.self_attn"
+    spec = _attention_spec(mooncake, heads=2, block_size=2, head_size=4)
+    nhd = torch.zeros((4, 2, 2, 2, 4))
+    with pytest.raises(ValueError, match="LBHNC"):
+        mooncake._hcu_flash_registration_views(name, nhd, spec, 1)
+    with pytest.raises(ValueError, match="shape"):
+        mooncake._hcu_flash_registration_views(name, torch.zeros((4, 3, 2, 2, 4)), spec, 1)
+    raw, cache = _hcu_flash_cache()
+    overlapping = cache.as_strided(cache.shape, (16, 16, 4, 8, 1))
+    with pytest.raises(ValueError, match="Overlapping"):
+        mooncake._hcu_flash_registration_views(name, overlapping, spec, 1)
+    fused = [mooncake.TransferRegion(name, 0, 100, 64, 64)]
+    split = [mooncake.TransferRegion(name + ".hcu_flash_k", 0, 200, 64, 32)]
+    for left, right in ((fused, split), (split, fused)):
+        assert mooncake._align_transfer_regions(left, right)[2] is not None
 
 
 @pytest.mark.parametrize("spec_type", ["MLAAttentionSpec", "SlidingWindowMLASpec"])

@@ -782,6 +782,50 @@ def _get_tensor_dense_flag(tensor: torch.Tensor) -> bool | None:
     return None
 
 
+def _hcu_flash_registration_views(
+    layer_name: str,
+    cache: torch.Tensor,
+    spec: KVCacheSpec,
+    physical_blocks_per_logical_block: int,
+) -> list[tuple[str, torch.Tensor]]:
+    """Expose HCU [B, 2, N, H, C] pages as separate zero-copy K/V regions.
+
+    The attention tensor stays unchanged. LBHNC gives each K/V plane
+    contiguous [H, N, C] contents, preserving head-wise TP transfer offsets.
+    Explicit component names prevent matching these planes with fused v0.28
+    [B, H, N, 2*C] pages on an incompatible peer.
+    """
+    if not isinstance(cache, torch.Tensor) or cache.ndim != 5:
+        return [(layer_name, cache)]
+    ratio = physical_blocks_per_logical_block
+    if (
+        not isinstance(spec, (FullAttentionSpec, SlidingWindowSpec))
+        or isinstance(spec, (MLAAttentionSpec, SlidingWindowMLASpec))
+        or ratio <= 0
+        or spec.block_size % ratio
+    ):
+        raise ValueError(f"Unsupported HCU Flash KV page spec for {layer_name}.")
+    expected = (2, spec.block_size // ratio, spec.num_kv_heads, spec.head_size)
+    if tuple(cache.shape[1:]) != expected or cache.shape[0] <= 0:
+        raise ValueError(
+            f"HCU Flash KV page tensor for {layer_name} must have shape "
+            f"[B, {expected}], got {tuple(cache.shape)}."
+        )
+    plane_elements = expected[1] * expected[2] * expected[3]
+    if cache.stride(1) != plane_elements or cache.stride(0) < 2 * plane_elements:
+        raise ValueError(f"Overlapping or scattered HCU Flash KV planes: {layer_name}.")
+    views = [
+        (f"{layer_name}.hcu_flash_{component}", cache[:, index].permute(0, 2, 1, 3))
+        for index, component in enumerate(("k", "v"))
+    ]
+    if any(not view[0].is_contiguous() for _, view in views):
+        raise ValueError(
+            f"HCU Flash KV transfer requires contiguous [H, N, C] planes "
+            f"(LBHNC layout): {layer_name}."
+        )
+    return views
+
+
 class MooncakeXferMetadata(
     msgspec.Struct,
     omit_defaults=True,  # type: ignore[call-arg]
@@ -798,6 +842,9 @@ class MooncakeXferMetadata(
     registered_layer_indices: list[int] = msgspec.field(default_factory=list)
     registered_group_indices: list[int] = msgspec.field(default_factory=list)
     num_blocks_per_layer: list[int] = msgspec.field(default_factory=list)
+    step5_pd_version: int = 0
+    step5_mtp_tokens: int = 0
+    step5_prompt_tokens: dict[str, int] = msgspec.field(default_factory=dict)
 
 
 class MooncakeXferResponseStatus(IntEnum):
@@ -817,6 +864,7 @@ class MooncakeXferResponse(
     ok_reqs: list[ReqId] | None = None
     err_reqs: list[ReqId] | None = None
     err_msg: str | None = None
+    step5_tails: dict[str, dict[str, bytes]] = msgspec.field(default_factory=dict)
 
 
 @dataclass
@@ -830,6 +878,7 @@ class PullReqMeta:
     expire_time: float = float("inf")
     # Designed for one D pairing to multiple P
     pull_tasks_count: int = 0
+    step5_prompt_tokens: int = 0
 
 
 @dataclass
@@ -843,6 +892,8 @@ class SendBlockMeta:
     sent: int = 0
     sending: int = 0
     ttft_send_start_logged: bool = False
+    step5_tails: dict[str, bytes] | None = None
+    step5_prompt_tokens: int = 0
 
 
 class MooncakeConnectorMetadata(KVConnectorMetadata):
@@ -852,6 +903,8 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
         self.reqs_to_recv: dict[EngineId, dict[ReqId, PullReqMeta]] = defaultdict(dict)
         self.reqs_to_send: dict[ReqId, tuple[TransferId, list[list[int]]]] = {}
         self.reqs_not_processed: set[TransferId] = set()
+        self.step5_prompt_tokens: dict[str, int] = {}
+        self.step5_tails: dict[str, dict[str, bytes]] = {}
 
     def add_new_req(
         self,
@@ -859,8 +912,10 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
         local_block_ids: list[list[int]],
         kv_transfer_params: dict[str, Any],
         load_remote_cache: bool = True,
+        prompt_tokens: int = 0,
     ):
         transfer_id = kv_transfer_params["transfer_id"]
+        self.step5_prompt_tokens[request_id] = prompt_tokens
         if load_remote_cache:
             remote_engine_id = kv_transfer_params["remote_engine_id"]
             self.reqs_to_recv[remote_engine_id][request_id] = PullReqMeta(
@@ -869,6 +924,7 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
                 remote_engine_id=remote_engine_id,
                 remote_bootstrap_addr=kv_transfer_params["remote_bootstrap_addr"],
                 transfer_id=transfer_id,
+                step5_prompt_tokens=prompt_tokens,
             )
         else:
             self.reqs_to_send[request_id] = (transfer_id, local_block_ids)
@@ -1028,6 +1084,11 @@ class MooncakeConnectorScheduler:
         self.vllm_config = vllm_config
         self.block_size = vllm_config.cache_config.block_size
 
+        from . import step5_pd
+        self.step5_pd_enabled = step5_pd.enabled(vllm_config)
+        if self.step5_pd_enabled:
+            step5_pd.validate_config(vllm_config)
+
         assert vllm_config.kv_transfer_config
         self.is_kv_producer: bool = (
             vllm_config.kv_transfer_config.kv_role == "kv_producer"
@@ -1141,6 +1202,13 @@ class MooncakeConnectorScheduler:
             params,
         )
 
+        if (getattr(self, "step5_pd_enabled", False) and self.is_kv_producer
+                and params and params.get("do_remote_decode")
+                and request.max_tokens != 1):
+            # Only a handoff request needs this restriction: the exported
+            # DSA tail must describe the prompt, not later generated tokens.
+            raise ValueError("Step5 P must generate exactly one token before handoff.")
+
         if not params:
             return 0, False
 
@@ -1223,6 +1291,7 @@ class MooncakeConnectorScheduler:
                     request_id=req_id,
                     local_block_ids=block_ids,
                     kv_transfer_params=req.kv_transfer_params,
+                    prompt_tokens=req.num_prompt_tokens if self.step5_pd_enabled else 0,
                 )
             self._reqs_need_recv.clear()
 
@@ -1234,6 +1303,7 @@ class MooncakeConnectorScheduler:
                     local_block_ids=block_ids,
                     kv_transfer_params=req.kv_transfer_params,
                     load_remote_cache=False,
+                    prompt_tokens=req.num_prompt_tokens if self.step5_pd_enabled else 0,
                 )
             self._reqs_need_send.clear()
             meta.reqs_not_processed = self._reqs_not_processed
@@ -1694,6 +1764,14 @@ class MooncakeConnectorWorker:
             await sock.send_multipart((identity, self._encoder.encode(response)))
 
         pending_reqs: dict[ReqId, SendBlockMeta] = {}
+        step5_state = getattr(self, "_step5_state", None)
+        if (meta.step5_pd_version != (1 if step5_state else 0)
+                or (step5_state and (
+                    meta.remote_tp_size != self.tp_size
+                    or meta.step5_mtp_tokens != self.vllm_config.speculative_config.num_speculative_tokens
+                ))):
+            await reject_metadata("Step5 P/D requires matching protocol versions, TP sizes and MTP steps.")
+            return
         if meta.remote_tp_size <= 0 or not 0 <= meta.remote_tp_rank < meta.remote_tp_size:
             await reject_metadata(
                 "Mooncake remote TP size/rank is invalid: "
@@ -1845,6 +1923,16 @@ class MooncakeConnectorWorker:
                 remote_regions,
             )
             err_req_set = set(err_reqs)
+            if step5_state:
+                mismatched = [req_id for req_id, item in ready_reqs
+                              if meta.step5_prompt_tokens.get(req_id) != item.step5_prompt_tokens]
+                if mismatched:
+                    # The descriptor arrays include every ready request; do
+                    # not execute any writes if one request contract is wrong.
+                    err_reqs = [req_id for req_id, _ in ready_reqs]
+                    err_req_set = set(err_reqs)
+                    err_msg = "Step5 P/D prompt token count mismatch."
+                    src_ptrs, dst_ptrs, lengths = [], [], []
             ok_ready_reqs = [
                 (d_req_id, send_meta)
                 for d_req_id, send_meta in ready_reqs
@@ -1907,6 +1995,8 @@ class MooncakeConnectorWorker:
                 ok_reqs=[d_req_id for d_req_id, _ in ok_ready_reqs] or None,
                 err_reqs=err_reqs or None,
                 err_msg=err_msg,
+                step5_tails={req_id: item.step5_tails for req_id, item in ok_ready_reqs}
+                if step5_state else {},
             )
             await sock.send_multipart((identity, self._encoder.encode(response)))
 
@@ -2244,9 +2334,24 @@ class MooncakeConnectorWorker:
         self.registered_group_indices = []
         self.num_blocks_per_layer = []
 
-        for layer_name, cache in kv_caches.items():
+        from . import step5_pd
+        if step5_pd.enabled(self.vllm_config):
+            step5_pd.validate_config(self.vllm_config)
+            self._step5_state = step5_pd.Step5StateTransfer(self, kv_caches)
+            kv_caches = {**kv_caches, **self._step5_state.views}
+
+        registration_views = [
+            (source_name, region_name, view)
+            for source_name, cache in kv_caches.items()
+            if source_name in self._layer_specs
+            for region_name, view in _hcu_flash_registration_views(
+                source_name, cache, self._layer_specs[source_name],
+                self._physical_blocks_per_logical_kv_block,
+            )
+        ]
+        for source_name, layer_name, cache in registration_views:
             layer_index = extract_layer_index(layer_name)
-            layer_spec = self._layer_specs.get(layer_name)
+            layer_spec = self._layer_specs.get(source_name)
             if layer_spec is None:
                 logger.debug(
                     "Skipping layer %s because no KV cache spec is present.",
@@ -2319,6 +2424,12 @@ class MooncakeConnectorWorker:
                             "Mooncake KV content must divide into kernel blocks."
                         )
                     kv_block_len = layer_spec.unpadded_page_size_bytes // ratio
+                    if source_name != layer_name:
+                        # Each HCU region contains only K or V, but its
+                        # block stride still spans the complete padded page.
+                        if kv_block_len % 2:
+                            raise ValueError("HCU Flash KV page payload must be even.")
+                        kv_block_len //= 2
                     if kv_block_len != cache[0].numel() * cache.element_size():
                         raise ValueError(
                             "Mooncake KV page shape does not match its spec."
@@ -2342,7 +2453,7 @@ class MooncakeConnectorWorker:
             self.kv_block_len_per_layer.append(kv_block_len)
             self.registered_layer_names.append(layer_name)
             self.registered_layer_indices.append(layer_index)
-            self.registered_group_indices.append(self._layer_group_indices[layer_name])
+            self.registered_group_indices.append(self._layer_group_indices[source_name])
             self.num_blocks_per_layer.append(cache.shape[0])
             storage = cache.untyped_storage()
             storage_addr = storage.data_ptr()
@@ -2447,6 +2558,13 @@ class MooncakeConnectorWorker:
         finished_recving_reqs = recv_fut.result() if recv_fut else set()
         finished_sending_reqs = send_fut.result() if send_fut else set()
 
+        step5_state = getattr(self, "_step5_state", None)
+        if step5_state:
+            for req_id in finished_recving_reqs:
+                groups, tokens, tails = step5_state.received.pop(req_id)
+                if any(groups):
+                    step5_state.restore(groups, tokens, tails)
+
         if finished_sending_reqs or finished_recving_reqs:
             logger.debug(
                 "Rank %s, get_finished: %s requests done sending "
@@ -2487,6 +2605,11 @@ class MooncakeConnectorWorker:
             registered_layer_indices=self.registered_layer_indices,
             registered_group_indices=self.registered_group_indices,
             num_blocks_per_layer=self.num_blocks_per_layer,
+            step5_pd_version=1 if getattr(self, "_step5_state", None) else 0,
+            step5_mtp_tokens=self.vllm_config.speculative_config.num_speculative_tokens
+            if getattr(self, "_step5_state", None) else 0,
+            step5_prompt_tokens={key: value.step5_prompt_tokens for key, value in pull_metas.items()}
+            if getattr(self, "_step5_state", None) else {},
         )
 
         encoded_data = self._encoder.encode(metadata)
@@ -2553,6 +2676,15 @@ class MooncakeConnectorWorker:
 
         for req_id in dict.fromkeys((*ok_reqs, *err_reqs)):
             pull_meta = pull_metas[req_id]
+            step5_state = getattr(self, "_step5_state", None)
+            if step5_state:
+                tails = response.step5_tails.get(req_id)
+                if (tails is None and any(pull_meta.local_block_ids)) or pull_meta.pull_tasks_count != 1:
+                    self._kv_load_error = "Step5 P/D requires one complete, matching TP peer response."
+                    return
+                step5_state.received[req_id] = (
+                    pull_meta.local_block_ids, pull_meta.step5_prompt_tokens, tails,
+                )
             # No race because we are in async loop.
             pull_meta.pull_tasks_count -= 1
             if pull_meta.pull_tasks_count == 0:
@@ -2637,6 +2769,11 @@ class MooncakeConnectorWorker:
         remote_pcp_size, remote_layer_split = self._remote_pcp_info.get(
             remote_engine_id, (1, False)
         )
+        if getattr(self, "_step5_state", None) and (
+            self._tp_size[remote_engine_id] != self.tp_size or remote_pcp_size != 1
+        ):
+            self._fail_pull_metas(pull_metas, "Step5 P/D requires matching TP and PCP=1.")
+            return
         if remote_pcp_size > 1:
             if not remote_layer_split:
                 virtual_ranks = [
@@ -2662,6 +2799,9 @@ class MooncakeConnectorWorker:
             worker_addrs.extend(pp_to_addr[pp_rank] for pp_rank in pp_ranks)
 
         count = len(worker_addrs)
+        if getattr(self, "_step5_state", None) and count != 1:
+            self._fail_pull_metas(pull_metas, "Step5 P/D requires PP=1 and exactly one matching TP peer.")
+            return
         logger.debug(
             "Receiving Mooncake KV for engine %s from producer virtual TP "
             "ranks %s (pcp_size=%d, layer_split=%s) and PP ranks %s",
@@ -2726,6 +2866,9 @@ class MooncakeConnectorWorker:
                 send_meta = self.reqs_need_send[transfer_id]
                 send_meta.p_req_id = p_req_id
                 send_meta.local_block_ids = block_ids
+                if getattr(self, "_step5_state", None):
+                    send_meta.step5_tails = metadata.step5_tails[p_req_id]
+                    send_meta.step5_prompt_tokens = metadata.step5_prompt_tokens[p_req_id]
                 send_meta.expire_time = (
                     time.perf_counter() + envs.VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT
                 )
@@ -2753,6 +2896,15 @@ class MooncakeConnectorWorker:
                 assert not send_meta.ready.is_set()
 
     def start_load_kv(self, metadata: MooncakeConnectorMetadata):
+        step5_state = getattr(self, "_step5_state", None)
+        if step5_state and self.is_kv_producer:
+            # Snapshot on the model worker thread before new forwards can
+            # recycle the completed prefill's partial-region storage.
+            for req_id, (_, groups) in metadata.reqs_to_send.items():
+                if groups:
+                    metadata.step5_tails[req_id] = step5_state.capture(
+                        groups, metadata.step5_prompt_tokens[req_id],
+                    )
         if not self.is_kv_producer and metadata.reqs_to_recv:
             asyncio.run_coroutine_threadsafe(
                 self._start_load_kv(metadata.reqs_to_recv), self.receiver_loop

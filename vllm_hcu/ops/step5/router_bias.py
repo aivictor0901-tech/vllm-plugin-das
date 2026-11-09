@@ -51,8 +51,8 @@ def router_bias_topk_kernel(
     mask_e = offs_e < E
 
     row_ptr = gating_ptr + pid * stride_gm + offs_e
-    tl.multiple_of(row_ptr, 8)
-    tl.max_contiguous(offs_e, 128)
+    # Consecutive element pointers are not all multiples of eight. Keep
+    # Triton's inferred alignment and the explicit expert-tail load mask.
 
     gating = tl.load(row_ptr, mask=mask_e, other=0)
     gate_prob = tl.sigmoid(gating.to(tl.float32))
@@ -77,10 +77,15 @@ def router_bias_topk_kernel(
         max_score, max_index = tl.max(scores, axis=0, return_indices=True)
         max_index = max_index.to(tl.int32)
 
-        selected_gating = tl.load(
-            gating_ptr + pid * stride_gm + max_index, mask=True, other=0
-        ).to(tl.float32)
-        selected_prob = tl.sigmoid(selected_gating)
+        # Reuse the probabilities from the masked row load above. A second,
+        # unmasked global gather can cross the logits allocation at the final
+        # row (the observed PIECEWISE failure was [368, 352] FP32). Reducing
+        # the selected lane keeps selection entirely in the loaded vector;
+        # padded expert lanes never contribute, including on NaN rows.
+        # This preserves the original optimus-derived top-k/tie semantics.
+        selected_prob = tl.sum(
+            tl.where(mask_e & (offs_e == max_index), gate_prob, 0.0), axis=0
+        )
 
         weights = tl.where(topk_offsets == k, selected_prob, weights)
         indices = tl.where(topk_offsets == k, max_index, indices)
