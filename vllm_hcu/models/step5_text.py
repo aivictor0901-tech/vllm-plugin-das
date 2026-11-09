@@ -52,7 +52,7 @@ import os
 import re
 import functools
 import typing
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Sequence
 from typing import Any
 
 import torch
@@ -86,6 +86,9 @@ from vllm.model_executor.layers.linear import (
     QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
+    is_lazy_weight,
+    lazy_weight_storage,
+    materialize_lazy_weight,
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
@@ -148,6 +151,9 @@ _PLACED_TENSOR = re.compile(
     r"layers\.(\d+)\.moe\.(?:(?:gate|up|down)_proj\.weight(?:_scale(?:_inv)?)?"
     r"|gate\.weight|router_bias)$"
 )
+_PER_EXPERT_TENSOR = re.compile(
+    r"layers\.(\d+)\.moe\.experts\.(\d+)\."
+)
 
 # Run qkv_proj and g_proj as one GEMM. Both weights become column views of one
 # [hidden, qkv + heads] buffer, so the loaders fill it in place and no
@@ -194,6 +200,15 @@ QKV_INDEXER = henvs.optional_custom_op_enabled(
     os.environ.get("VLLM_HCU_STEP5_QKV_INDEXER", "0") == "1"
 )
 
+# With FP8_DENSE, build the attention projections without bf16 storage and
+# quantize each layer to fp8 as soon as its tensors have been read, so a rank
+# never holds more than a layer or two of bf16 attention weights. Without this
+# every layer's bf16 qkv/g/o weights exist from construction until the post-load
+# quantization (about 19 GiB per rank for Step-5).
+LAZY_FP8_ATTN = FP8_DENSE and os.environ.get(
+    "VLLM_HCU_STEP5_LAZY_FP8_ATTN", "1"
+) == "1"
+
 # Quantize the bf16 routed experts (layers 88-90) to fp8 per output channel at
 # load time, the scheme of the other layers' checkpoint experts, so they run the
 # same fp8 MoE path instead of the bf16 Triton experts. Channel (compressed-
@@ -223,6 +238,12 @@ def _get_step5_swa_fused():
     return step5_swa_fused
 
 _PACKED_EXPERT_WEIGHT = re.compile(r"\.moe\.(gate|up|down)_proj\.weight$")
+
+_ATTN_CHECKPOINT_WEIGHT = re.compile(
+    r"layers\.(\d+)\.self_attn\.(q_proj|k_proj|v_proj|g_proj|o_proj"
+    r"|sparse_indexer_q|sparse_indexer_k|sparse_indexer_z|sparse_indexer_w)\.weight$"
+)
+_ATTN_LAZY_KINDS = frozenset(("q_proj", "k_proj", "v_proj", "g_proj", "o_proj"))
 
 
 def _unignore_bf16_experts(quant_config: QuantizationConfig | None) -> None:
@@ -263,10 +284,33 @@ def _place_experts(
         if not torch.equal(row.sort().values, identity):
             raise ValueError("Step5 expert placement row is not a permutation")
     rows = dict(zip(moe_layer_ids, physical_to_logical))
+    logical_to_physical = {
+        layer_idx: torch.argsort(row)
+        for layer_idx, row in rows.items()
+    }
     logger.info_once("step5: expert placement loaded from %s", EXPERT_PLACEMENT)
     for name, w in weights:
         if ".moe.experts." in name:
-            raise ValueError("Step5 expert placement needs packed experts")
+            match = _PER_EXPERT_TENSOR.search(name)
+            if match is None:
+                raise ValueError(
+                    f"Step5 expert placement cannot parse checkpoint name {name}"
+                )
+            layer_idx, logical_expert = map(int, match.groups())
+            if layer_idx in logical_to_physical:
+                inverse = logical_to_physical[layer_idx]
+                if logical_expert >= inverse.numel():
+                    raise ValueError(
+                        f"Step5 expert placement index out of range: {name}"
+                    )
+                physical_expert = int(inverse[logical_expert])
+                name = (
+                    name[: match.start(2)]
+                    + str(physical_expert)
+                    + name[match.end(2) :]
+                )
+            yield name, w
+            continue
         m = _PLACED_TENSOR.search(name)
         if m is not None and int(m.group(1)) in rows:
             row = rows[int(m.group(1))]
@@ -301,6 +345,52 @@ def _quantize_bf16_experts(
             del x
         yield name, q
         yield name + "_scale", scale
+
+
+def _quantize_attention_as_loaded(
+    layers: Sequence[nn.Module],
+    weights: Iterable[tuple[str, torch.Tensor]],
+) -> Iterable[tuple[str, torch.Tensor]]:
+    """LAZY_FP8_ATTN: bf16 storage for a layer's qkv/g/o weights exists only
+    between its first tensor arriving and its last one being loaded.
+
+    The checkpoint stores each layer's tensors together, so at most a couple of
+    layers are in flight. A tensor counts as loaded when the consumer asks for
+    the next one, so quantization never runs under a loader that is still
+    writing.
+    """
+    seen: dict[int, set[str]] = {}
+    pending: tuple[int, str] | None = None
+
+    def attention(idx: int) -> "Step5Attention | None":
+        if idx >= len(layers):
+            return None
+        attn = getattr(layers[idx], "self_attn", None)
+        return attn if isinstance(attn, Step5Attention) else None
+
+    def loaded(idx: int, kind: str) -> None:
+        attn = attention(idx)
+        got = seen.setdefault(idx, set())
+        got.add(kind)
+        if got >= attn.expected_checkpoint_weights():
+            attn.quantize_loaded_attention()
+            del seen[idx]
+
+    for name, w in weights:
+        if pending is not None:
+            loaded(*pending)
+            pending = None
+        m = _ATTN_CHECKPOINT_WEIGHT.search(name)
+        if m is not None:
+            idx, kind = int(m.group(1)), m.group(2)
+            attn = attention(idx)
+            if attn is not None:
+                if kind in _ATTN_LAZY_KINDS:
+                    attn.materialize_bf16_attention()
+                pending = (idx, kind)
+        yield name, w
+    if pending is not None:
+        loaded(*pending)
 
 
 def dsa_layer_indices(config: Any) -> list[int]:
@@ -493,7 +583,14 @@ class Step5FP8LinearMethod(LinearMethodBase):
             return
         from vllm_hcu.ops.step5.fp8_dense import quantize_weight_fp8
 
+        if getattr(layer, "fp8_wq", None) is not None:
+            return  # already quantized while loading (LAZY_FP8_ATTN)
         w = layer.weight
+        if is_lazy_weight(w):
+            raise RuntimeError(
+                "step5: a lazily allocated attention weight was never loaded; "
+                "the checkpoint is missing tensors for this layer"
+            )
         k, n = layer.input_size_per_partition, layer.output_size_per_partition
         if not _weight_is_kn(w, k, n):
             w = w.t()
@@ -580,6 +677,13 @@ def _free_weight(p: Parameter) -> None:
 def _use_fp8(*layers: nn.Module) -> None:
     for layer in layers:
         layer.quant_method = Step5FP8LinearMethod()
+
+
+def _int8_dense() -> bool:
+    "Whether the dense linears run int8 (gfx936) instead of fp8."
+    from vllm_hcu.ops.step5.fp8_dense import int8_dense
+
+    return int8_dense()
 
 
 class Step5MLP(nn.Module):
@@ -763,22 +867,23 @@ class Step5Attention(nn.Module):
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
         self.rope_theta = rope_theta
-        self.qkv_proj = QKVParallelLinear(
-            hidden_size,
-            self.head_dim,
-            self.total_num_heads,
-            self.total_num_kv_heads,
-            bias=qkv_bias,
-            quant_config=None,
-            prefix=f"{prefix}.qkv_proj",
-        )
-        self.o_proj = RowParallelLinear(
-            self.total_num_heads * self.head_dim,
-            hidden_size,
-            bias=False,
-            quant_config=None,
-            prefix=f"{prefix}.o_proj",
-        )
+        with lazy_weight_storage(LAZY_FP8_ATTN):
+            self.qkv_proj = QKVParallelLinear(
+                hidden_size,
+                self.head_dim,
+                self.total_num_heads,
+                self.total_num_kv_heads,
+                bias=qkv_bias,
+                quant_config=None,
+                prefix=f"{prefix}.qkv_proj",
+            )
+            self.o_proj = RowParallelLinear(
+                self.total_num_heads * self.head_dim,
+                hidden_size,
+                bias=False,
+                quant_config=None,
+                prefix=f"{prefix}.o_proj",
+            )
 
         if rope_scaling is not None and not isinstance(rope_scaling, dict):
             raise ValueError("rope_scaling must be a dict for Step5Attention.")
@@ -805,13 +910,14 @@ class Step5Attention(nn.Module):
         self.register_buffer("qkvg_int8_wq", None, persistent=False)
         self.register_buffer("qkvg_int8_ws", None, persistent=False)
         if use_head_wise_attn_gate:
-            self.g_proj = ColumnParallelLinear(
-                hidden_size,
-                self.total_num_heads,
-                bias=False,
-                quant_config=None,
-                prefix=f"{prefix}.g_proj",
-            )
+            with lazy_weight_storage(LAZY_FP8_ATTN):
+                self.g_proj = ColumnParallelLinear(
+                    hidden_size,
+                    self.total_num_heads,
+                    bias=False,
+                    quant_config=None,
+                    prefix=f"{prefix}.g_proj",
+                )
             self._maybe_fuse_qkvg()
         if INT8_DENSE:
             _use_int8(self.o_proj)
@@ -892,6 +998,8 @@ class Step5Attention(nn.Module):
         self.fused_gate = (
             FUSED_GATE
             and FP8_DENSE
+            # gate_quant produces fp8 activations; int8 dense cannot take them.
+            and not _int8_dense()
             and use_head_wise_attn_gate
             and self.qkvg_weight is not None
             and isinstance(self.o_proj.quant_method, Step5FP8LinearMethod)
@@ -928,6 +1036,14 @@ class Step5Attention(nn.Module):
         ):
             return
         nq = wq.shape[1]
+        if is_lazy_weight(wq) and is_lazy_weight(wg):
+            # No storage yet: materialize_bf16_attention builds the fused buffer
+            # and the column views when the first tensor of this layer arrives.
+            fused = torch.empty(1, dtype=wq.dtype, device=wq.device).expand(
+                wq.shape[0], nq + wg.shape[1]
+            )
+            self.register_buffer("qkvg_weight", fused, persistent=False)
+            return
         fused = torch.empty(
             wq.shape[0], nq + wg.shape[1], dtype=wq.dtype, device=wq.device
         )
@@ -965,10 +1081,58 @@ class Step5Attention(nn.Module):
                 _free_weight(lin.weight)
         self._int8_qkvg_prepared = True
 
+    def materialize_bf16_attention(self) -> None:
+        """Allocate this layer's bf16 qkv/g/o weights (LAZY_FP8_ATTN)."""
+        if self.qkvg_weight is not None and is_lazy_weight(self.qkvg_weight):
+            fused = torch.empty(
+                tuple(self.qkvg_weight.shape),
+                dtype=self.qkvg_weight.dtype,
+                device=self.qkvg_weight.device,
+            )
+            nq = self.qkv_proj.weight.shape[1]
+            self.qkv_proj.weight.data = fused[:, :nq]
+            self.g_proj.weight.data = fused[:, nq:]
+            self.qkvg_weight = fused
+        for layer in (self.qkv_proj, self.o_proj) + (
+            (self.g_proj,) if self.use_head_wise_attn_gate else ()
+        ):
+            materialize_lazy_weight(layer.weight)
+
+    def expected_checkpoint_weights(self) -> frozenset[str]:
+        """Checkpoint tensors that must be read before this layer can be
+        quantized: its projections, and the indexer rows folded into qkvg."""
+        kinds = {"q_proj", "k_proj", "v_proj", "o_proj"}
+        if self.use_head_wise_attn_gate:
+            kinds.add("g_proj")
+        if QKV_INDEXER and self.indexer is not None and self.qkvg_weight is not None:
+            kinds |= {
+                "sparse_indexer_q",
+                "sparse_indexer_k",
+                "sparse_indexer_z",
+                "sparse_indexer_w",
+            }
+        return frozenset(kinds)
+
+    def quantize_loaded_attention(self) -> None:
+        """Run the post-load fp8 quantization now and drop the bf16 weights."""
+        self.o_proj.quant_method.process_weights_after_loading(self.o_proj)
+        self.qkv_proj.quant_method.process_weights_after_loading(self.qkv_proj)
+        if self.use_head_wise_attn_gate and isinstance(
+            self.g_proj.quant_method, Step5FP8LinearMethod
+        ):
+            self.g_proj.quant_method.process_weights_after_loading(self.g_proj)
+
     def _quantize_qkvg(self) -> None:
         from vllm_hcu.ops.step5.fp8_dense import quantize_weight_fp8
 
+        if self.qkvg_wq is not None:
+            return  # already quantized while loading (LAZY_FP8_ATTN)
         w = self.qkvg_weight
+        if is_lazy_weight(w):
+            raise RuntimeError(
+                f"step5: layer {self.layer_idx} attention weights were never "
+                "loaded; the checkpoint is missing tensors for this layer"
+            )
         if QKV_INDEXER and self.indexer is not None:
             # [q; k; z; w] as in Step4Indexer._merged_projection (w rounded to
             # bf16 first), stored [out, in]; qkvg_weight is [in, out].
@@ -1660,6 +1824,8 @@ class Step5Model(nn.Module):
             )
         if FP8_BF16_MOE:
             weights = _quantize_bf16_experts(weights)
+        if LAZY_FP8_ATTN:
+            weights = _quantize_attention_as_loaded(self.layers, weights)
 
         for name, loaded_weight in weights:
             if name.startswith("model."):
