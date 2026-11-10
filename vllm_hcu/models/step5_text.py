@@ -232,7 +232,8 @@ def _unignore_bf16_experts(quant_config: QuantizationConfig | None) -> None:
 
 
 def _place_experts(
-    weights: Iterable[tuple[str, torch.Tensor]], moe_layer_ids: list[int]
+    weights: Iterable[tuple[str, torch.Tensor]], moe_layer_ids: list[int],
+    *, per_expert: bool = False,
 ) -> Iterable[tuple[str, torch.Tensor]]:
     """EXPERT_PLACEMENT: index dim 0 of each packed expert tensor and of the
     router weight/bias with the layer's physical-to-logical map. Done on the
@@ -254,10 +255,24 @@ def _place_experts(
         if not torch.equal(row.sort().values, identity):
             raise ValueError("Step5 expert placement row is not a permutation")
     rows = dict(zip(moe_layer_ids, physical_to_logical))
+    logical_to_physical = {
+        layer: torch.argsort(row).tolist() for layer, row in rows.items()
+    } if per_expert else {}
     logger.info_once("step5: expert placement loaded from %s", EXPERT_PLACEMENT)
     for name, w in weights:
         if ".moe.experts." in name:
-            raise ValueError("Step5 expert placement needs packed experts")
+            match = re.search(r"layers\.(\d+)\.moe\.experts\.(\d+)\.", name)
+            if not per_expert or match is None:
+                raise ValueError("Step5 expert placement needs packed experts")
+            layer, expert = int(match.group(1)), int(match.group(2))
+            if layer not in logical_to_physical or expert >= len(logical_to_physical[layer]):
+                raise ValueError(f"Step5 per-expert placement mismatch: {name}")
+            # Rename payload, scale and shape metadata together. Their tensors
+            # stay unchanged; the router below uses the same physical ordering.
+            name = (name[:match.start(2)] + str(logical_to_physical[layer][expert])
+                    + name[match.end(2):])
+            yield name, w
+            continue
         m = _PLACED_TENSOR.search(name)
         if m is not None and int(m.group(1)) in rows:
             row = rows[int(m.group(1))]
@@ -1012,6 +1027,11 @@ class FusedMoEBlock(nn.Module):
         quant_config = vllm_config.quant_config
         parallel_config = vllm_config.parallel_config
 
+        if os.environ.get("VLLM_HCU_STEP5_W4A8_PROFILE"):
+            from vllm_hcu.model_executor.layers.quantization.step5_gptq_w4a8 import moe_quant_config
+
+            quant_config = moe_quant_config(vllm_config)
+
         self.hidden_size = config.hidden_size
         self.enable_eplb = parallel_config.enable_eplb
         self.n_routed_experts = config.moe_num_experts
@@ -1373,7 +1393,12 @@ class Step5Model(nn.Module):
 
         self.moe_num_experts = config.moe_num_experts
         self.skipped_dsa_weights = 0
-        if FP8_BF16_MOE:
+        self.gptq_w4a8 = False
+        if os.environ.get("VLLM_HCU_STEP5_W4A8_PROFILE"):
+            from vllm_hcu.model_executor.layers.fused_moe.step5_w4a8_policy import compressed_w4a8_config
+
+            self.gptq_w4a8 = compressed_w4a8_config(vllm_config)
+        if FP8_BF16_MOE and not self.gptq_w4a8:
             _unignore_bf16_experts(vllm_config.quant_config)
 
         # One Step4DSAState is shared by every DSA layer on this rank: the
@@ -1544,9 +1569,19 @@ class Step5Model(nn.Module):
             weights = _place_experts(
                 weights,
                 [i for i, layer in enumerate(self.layers) if layer.use_moe],
+                per_expert=self.gptq_w4a8,
             )
-        if FP8_BF16_MOE:
+        if FP8_BF16_MOE and not self.gptq_w4a8:
             weights = _quantize_bf16_experts(weights)
+
+        gptq_layers = {
+            i for i, layer in enumerate(self.layers)
+            if layer.use_moe and getattr(layer.moe.routed_experts, "_hcu_step5_gptq_kind", None) == "w4a8"
+        }
+        if gptq_layers:
+            from vllm_hcu.model_executor.layers.quantization.step5_gptq_w4a8 import checkpoint_names
+
+            weights = checkpoint_names(weights, gptq_layers)
 
         for name, loaded_weight in weights:
             if name.startswith("model."):
