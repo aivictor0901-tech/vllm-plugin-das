@@ -205,6 +205,7 @@ def apply_to_module(module: ModuleType) -> bool:
         from vllm.config import get_current_vllm_config_or_none
 
         self._hcu_dp_packed_ag = False
+        self._hcu_dp_packed_ag_announced = set()
         try:
             # Preserve the upstream opt-in collective and cleanup lifecycle.
             # Only the new packed/Fabric providers are Step5-specific.
@@ -262,6 +263,19 @@ def apply_to_module(module: ModuleType) -> bool:
                 self, input_, all_gatherv, dim=dim, sizes=sizes
             )
             if packed is not None:
+                # Announce actual dispatch dtypes once per field count. This
+                # distinguishes BF16 interface inputs from INT8 expert math.
+                if len(input_) not in self._hcu_dp_packed_ag_announced:
+                    from vllm.logger import init_logger
+
+                    init_logger(__name__).info_once(
+                        "Step5 packed AllGather active: "
+                        f"world={self.world_size} "
+                        f"shapes={[tuple(t.shape) for t in input_]} "
+                        f"dtypes={[str(t.dtype) for t in input_]}; "
+                        f"{len(input_)} tensors -> one uint8 collective"
+                    )
+                    self._hcu_dp_packed_ag_announced.add(len(input_))
                 return packed
         if ag is not None and dim == 0:
             single = isinstance(input_, torch.Tensor)

@@ -108,6 +108,14 @@ def apply_to_module(module: ModuleType) -> bool:
 
     @functools.wraps(select_backend)
     def hcu_select_unquantized_moe_backend(moe_config):
+        from vllm_hcu.model_executor.layers.quantization.ct_w4a8_step5_deepep import is_step5_ll
+        if is_step5_ll(moe_config):
+            from dataclasses import replace
+            from vllm_hcu.model_executor.layers.quantization.ct_w4a8_step5_deepep import enable_bf16_batched_passthrough
+            enable_bf16_batched_passthrough()
+            # Only this layer is unquantized. Keep the global W4A8 request intact.
+            backend, experts = select_backend(replace(moe_config, moe_backend="triton"))
+            return _normalize_backend(backend, old_enum, hcu_enum), experts
         from vllm_hcu.model_executor.layers.fused_moe import (
             lightop_w16a16_runtime,
         )
@@ -205,6 +213,17 @@ def apply_to_module(module: ModuleType) -> bool:
         experts_cls,
         routing_tables=None,
     ):
+        from vllm_hcu.model_executor.layers.quantization.ct_w4a8_step5_deepep import (
+            is_step5_ll, bounded_ll_config, ChunkedLLKernel,
+        )
+        if is_step5_ll(moe_config):
+            bounded = bounded_ll_config(moe_config)
+            kernel = make_kernel(
+                quant_config, bounded,
+                _normalize_backend(backend, old_enum, hcu_enum),
+                experts_cls, routing_tables=routing_tables,
+            )
+            return ChunkedLLKernel(kernel, moe_config)
         return make_kernel(
             quant_config,
             moe_config,

@@ -42,7 +42,7 @@ def _packed_w4a8_experts():
     required = {
         "use_int4_w4a8", "per_channel_quant", "activation", "gemm1_limit",
         "expert_map", "global_num_experts", "w1_scale", "w2_scale",
-        "routed_scaling_factor", "output_dtype",
+        "routed_scaling_factor", "output_dtype", "a1_scale",
     }
     if not required.issubset(signature(fused_experts).parameters):
         raise RuntimeError("Installed BoltOps lacks the Step5 packed W4A8 interface")
@@ -64,6 +64,16 @@ class Step5CompressedW4A8MoEMethod(FusedMoEMethodBase):
             raise ValueError("Step5 packed INT4 supports silu and swiglustep only")
         if getattr(moe, "has_bias", False):
             raise ValueError("Step5 packed INT4 does not support expert biases")
+        parallel = getattr(moe, "moe_parallel_config", None)
+        self._use_deepep = (
+            getattr(parallel, "all2all_backend", None) == "deepep_low_latency"
+            and getattr(moe, "moe_backend", "auto") in ("auto", "triton", "deep_gemm")
+        )
+        self._use_deepgemm = self._use_deepep and getattr(moe, "moe_backend", "auto") == "deep_gemm"
+        if self._use_deepep:
+            if not getattr(parallel, "use_deepep_ll_kernels", False):
+                raise ValueError("DeepEP LL is not active in the resolved MoE parallel config")
+            return
         if getattr(moe, "moe_backend", "auto") not in ("auto", "triton"):
             raise ValueError("Step5 packed INT4 requires --moe-backend auto or triton")
         parallel = getattr(moe, "moe_parallel_config", None)
@@ -95,6 +105,7 @@ class Step5CompressedW4A8MoEMethod(FusedMoEMethodBase):
                 if not weight_name.endswith("_packed"):
                     raise ValueError("Step5 INT4 weight loader expects a weight_packed tensor")
                 loaded = ct_int32_to_packed_int4(loaded)
+                layer._step5_ct_load_generation = getattr(layer, "_step5_ct_load_generation", 0) + 1
                 return _original(
                     param, loaded, weight_name.removesuffix("_packed"),
                     shard_id=shard_id, expert_id=expert_id,
@@ -119,16 +130,24 @@ class Step5CompressedW4A8MoEMethod(FusedMoEMethodBase):
     def get_fused_moe_quant_config(self, layer):
         return FusedMoEQuantConfig.make(
             torch.int8, weight_dtype="int4",
-            w1_scale=layer.w13_weight_scale, w2_scale=layer.w2_weight_scale,
+            w1_scale=(layer.w13_weight_scale / 16 if self._use_deepgemm else layer.w13_weight_scale),
+            w2_scale=(layer.w2_weight_scale / 16 if self._use_deepgemm else layer.w2_weight_scale),
             per_act_token_quant=True, per_out_ch_quant=True,
             block_shape=None,
         )
 
     def process_weights_after_loading(self, layer):
-        _packed_w4a8_experts()
+        if not self._use_deepgemm:
+            _packed_w4a8_experts()
         for name in ("w13_weight_packed", "w2_weight_packed"):
             layer._parameters.pop(name, None)
         self.moe_quant_config = self.get_fused_moe_quant_config(layer)
+        if self._use_deepep:
+            from vllm_hcu.model_executor.layers.quantization.ct_w4a8_step5_deepep import make_step5_w4a8_ll_kernel
+            self.moe_kernel = make_step5_w4a8_ll_kernel(self.moe, self.moe_quant_config, layer)
+            logger.info_once("Step5 CT W4A8: DeepEP LL + %s",
+                             "masked ASM DeepGEMM" if self._use_deepgemm else "BoltOps")
+            return
         logger.info_once(
             "Step5 CT W4A8: packed INT4 expert storage, BoltOps W4A8, "
             "original channel scales; no INT8 weight expansion"
@@ -138,6 +157,18 @@ class Step5CompressedW4A8MoEMethod(FusedMoEMethodBase):
         self, layer, x, topk_weights, topk_ids,
         shared_experts=None, shared_experts_input=None,
     ):
+        if self._use_deepep:
+            if self.moe_kernel is None:
+                raise RuntimeError("Step5 DeepEP weights/kernel have not been initialized")
+            return self.moe_kernel.apply(
+                hidden_states=x, w1=layer.w13_weight, w2=layer.w2_weight,
+                topk_weights=topk_weights, topk_ids=topk_ids,
+                activation=self.moe.activation,
+                global_num_experts=layer.global_num_experts,
+                expert_map=getattr(layer, "_expert_map", None),
+                apply_router_weight_on_input=layer.apply_router_weight_on_input,
+                shared_experts=shared_experts, shared_experts_input=shared_experts_input,
+            )
         # Shared experts and DP/TP reductions remain owned by MoERunner.
         del shared_experts, shared_experts_input
         if getattr(layer, "apply_router_weight_on_input", False):
