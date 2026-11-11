@@ -13,9 +13,12 @@ The three deltas that matter:
   reference implementation.
 * **``partial_rotary_factors`` is 1/3 on full-attention layers**, so the rotary
   dim comes from ``get_rope`` rather than a ``head_dim // 2`` special case.
-* **Only the MoE expert weights are fp8.** Every other weight in the checkpoint
-  is bf16, so ``quant_config`` is handed to ``FusedMoE`` alone. (``FP8_DENSE``
-  and ``FP8_BF16_MOE`` quantize more of them at load time.)
+* **Only the MoE expert weights are fp8.** Every other weight in the fp8
+  checkpoints is bf16, so ``quant_config`` is handed to ``FusedMoE`` alone.
+  (``FP8_DENSE`` and ``FP8_BF16_MOE`` quantize more of them at load time, and
+  ``MIXED_DENSE_INT8`` threads ``quant_config`` into attention, the dense MLPs
+  and the shared MLP for the mixed INT4/INT8 checkpoint, whose routed experts
+  are INT4 W4A8 and whose dense projections are INT8 W8A8.)
 
 Two fp8 checkpoint layouts load through this file unchanged:
 
@@ -217,6 +220,61 @@ FP8_BF16_MOE = henvs.optional_custom_op_enabled(
     os.environ.get("VLLM_HCU_STEP5_FP8_BF16_MOE", "0") == "1"
 )
 
+# The mixed INT4/INT8 checkpoint quantizes more than the routed experts:
+# attention (qkv/o/g), the dense MLPs and the shared MLP are INT8 W8A8, so the
+# checkpoint's compressed-tensors config has to reach those projections instead
+# of only FusedMoE. lm_head is INT8 there too, but it is folded back to bf16 at
+# load time (_fold_int8_lm_head). Off by default: in the fp8 checkpoints every
+# dense weight is bf16 and their ignore lists are written against checkpoint-
+# side names, so handing them a quant_config would build fp8 projections and
+# cast bf16 weights into them with no scale.
+#
+# Three settings:
+#   0        off (the fp8 checkpoints)
+#   1        build the dense projections INT8 and run W8A8
+#   dequant  build them bf16 and fold the INT8 weights back to bf16 at load
+#            time, the way lm_head is always handled
+# ``dequant`` costs ~2x the dense weight bytes and gives up the W8A8 GEMMs, but
+# it reproduces the dense path of the bf16+fp8 checkpoints exactly, so it both
+# serves as a fallback and isolates whether a numerical problem is in the INT8
+# GEMM or already in the weights and scales.
+_MIXED_DENSE_SETTING = (
+    os.environ.get("VLLM_STEP5_MIXED_DENSE_INT8", "0").strip().lower()
+)
+if _MIXED_DENSE_SETTING not in ("0", "1", "dequant"):
+    raise ValueError(
+        "VLLM_STEP5_MIXED_DENSE_INT8 must be 0, 1 or dequant, got "
+        f"{_MIXED_DENSE_SETTING!r}"
+    )
+MIXED_DENSE_INT8 = _MIXED_DENSE_SETTING in ("1", "dequant")
+MIXED_DENSE_DEQUANT = _MIXED_DENSE_SETTING == "dequant"
+
+# Keep lm_head INT8 instead of folding it to bf16, and run it through the INT8
+# skinny GEMM (skinny_lm_head_int8.py). The head otherwise runs bf16 through the
+# skinny kernel, which moves twice the bytes at the same rate hipBLASLt's W8A8
+# path achieves on an INT8 head, so both current options are ~equal. Keeping the
+# INT8 weights halves the bytes and the skinny schedule keeps the rate, worth
+# 1.10-1.24x on the TP8 shard measured under a CUDA graph.
+#
+# Requires MIXED_DENSE_INT8, since that is what makes the head's INT8 tensors
+# reach the loader at all, and the checkpoint's lm_head must actually be INT8.
+LM_HEAD_INT8_SKINNY = henvs.optional_custom_op_enabled(
+    os.environ.get("VLLM_STEP5_LM_HEAD_INT8_SKINNY", "0") == "1"
+)
+
+# Suffixes that exist only on a quantized layer. Silently dropping one would
+# leave INT8 weights loaded without their scale, so MIXED_DENSE_INT8 treats an
+# unmatched one as a load failure instead.
+_QUANT_TENSOR_SUFFIXES = (
+    ".weight_scale",
+    ".weight_scale_inv",
+    ".weight_zero_point",
+    ".weight_packed",
+    ".weight_shape",
+    ".input_scale",
+    ".input_zero_point",
+)
+
 SWA_FUSED_QK = henvs.optional_custom_op_enabled(
     os.environ.get("VLLM_HCU_STEP5_SWA_FUSED_QK", "0") == "1"
 )
@@ -259,6 +317,177 @@ def _unignore_bf16_experts(quant_config: QuantizationConfig | None) -> None:
     if len(kept) != len(ignore):
         logger.info_once("step5: quantizing the bf16 routed experts to fp8")
     quant_config.ignore = kept
+
+
+def _dense_quant_config(vllm_config: VllmConfig) -> QuantizationConfig | None:
+    """MIXED_DENSE_INT8: the checkpoint's config for the dense projections.
+
+    Returns None for every other checkpoint, which leaves those projections
+    bf16 as before. Which of them end up quantized is still decided by the
+    checkpoint's own config_groups and ignore list.
+    """
+    if not MIXED_DENSE_INT8:
+        return None
+    quant_config = vllm_config.quant_config
+    name = None if quant_config is None else quant_config.get_name()
+    if name != "compressed-tensors":
+        raise ValueError(
+            "VLLM_STEP5_MIXED_DENSE_INT8 needs a compressed-tensors checkpoint; "
+            f"this one reports {name}"
+        )
+    if FP8_DENSE or FP8_BF16_MOE or INT8_DENSE:
+        raise ValueError(
+            "VLLM_STEP5_MIXED_DENSE_INT8 takes the dense precision from the "
+            "checkpoint, while VLLM_HCU_STEP5_FP8_DENSE, "
+            "VLLM_HCU_STEP5_FP8_BF16_MOE and VLLM_HCU_STEP5_INT8_DENSE "
+            "quantize bf16 weights at load time; enable only one of them"
+        )
+    logger.info_once(
+        "step5: attention, dense MLP and shared MLP follow the checkpoint's "
+        "INT8 scheme"
+    )
+    if MIXED_DENSE_DEQUANT:
+        # Build them bf16; _fold_int8_dense turns the checkpoint's INT8 weights
+        # into bf16 on the way in.
+        logger.info_once(
+            "step5: dense INT8 weights are dequantized to bf16 instead of "
+            "running W8A8"
+        )
+        return None
+    return quant_config
+
+
+def _check_dense_int8_dtype(
+    name: str, param: torch.nn.Parameter, loaded_weight: torch.Tensor
+) -> None:
+    """MIXED_DENSE_INT8: refuse a weight whose dtype contradicts its layer.
+
+    ``Parameter.data.copy_`` casts silently, so loading a bf16 checkpoint
+    tensor into an INT8 parameter (or the reverse) produces a model that serves
+    happily and generates noise. Both directions mean the layer's quantization
+    decision disagrees with the checkpoint.
+    """
+    if param.dtype == torch.int8 and loaded_weight.dtype != torch.int8:
+        raise ValueError(
+            f"step5: {name} was built INT8 but the checkpoint tensor is "
+            f"{loaded_weight.dtype}. This layer is not quantized in this "
+            "checkpoint, so the quantization config has to list it under "
+            "'ignore' (its vLLM-side prefix, which is what get_scheme matches)."
+        )
+    if (
+        param.dtype in (torch.bfloat16, torch.float16, torch.float32)
+        and loaded_weight.dtype == torch.int8
+    ):
+        raise ValueError(
+            f"step5: {name} was built {param.dtype} but the checkpoint tensor "
+            "is INT8. This layer is quantized in this checkpoint, so either "
+            "the quantization config must target it or it needs "
+            "VLLM_STEP5_MIXED_DENSE_INT8=dequant."
+        )
+
+
+def _fold_int8_dense(
+    weights: Iterable[tuple[str, torch.Tensor]],
+) -> Iterable[tuple[str, torch.Tensor]]:
+    """MIXED_DENSE_DEQUANT: emit every INT8 ``(weight, weight_scale)`` as bf16.
+
+    Covers lm_head and the dense projections in one pass. The INT4 experts are
+    untouched: their checkpoint tensors are ``weight_packed`` INT32, so neither
+    half of the pair matches.
+
+    safetensors keys arrive sorted and ``weight`` sorts before ``weight_scale``,
+    so only a weight is ever buffered, and only until the next key. A scale
+    whose weight was not INT8 -- every routed expert -- streams straight
+    through to the expert mapping.
+    """
+    pending: dict[str, torch.Tensor] = {}
+    for name, weight in weights:
+        base, _, suffix = name.rpartition(".")
+        if suffix == "weight" and weight.dtype == torch.int8:
+            pending[base] = weight
+            continue
+        if suffix == "weight_scale" and base in pending:
+            quantized = pending.pop(base)
+            logger.info_once("step5: dense INT8 weights folded to bf16")
+            yield f"{base}.weight", _dequantize_int8_channel(
+                f"{base}.weight", quantized, weight
+            )
+            continue
+        yield name, weight
+    # INT8 weights whose scale never arrived; the loader reports them by name.
+    for base, weight in pending.items():
+        yield f"{base}.weight", weight
+
+
+def _dequantize_int8_channel(
+    name: str, weight: torch.Tensor, scale: torch.Tensor
+) -> torch.Tensor:
+    """INT8 ``[out, in]`` times a per-output-channel scale, as bf16.
+
+    Row-chunked: the head spans the full vocabulary and every rank dequantizes
+    its own copy of the checkpoint tensor, so materializing the fp32 product in
+    one go would cost several GiB per worker.
+    """
+    if weight.dtype != torch.int8:
+        raise ValueError(
+            f"{name}: INT8 dequantization needs int8 weights, got {weight.dtype}"
+        )
+    if weight.dim() != 2:
+        raise ValueError(f"{name}: expected a 2-D weight, got {tuple(weight.shape)}")
+    if scale.numel() != weight.shape[0]:
+        raise ValueError(
+            f"{name}: weight_scale holds one value per output channel; got "
+            f"{tuple(scale.shape)} for weight {tuple(weight.shape)}"
+        )
+    scale = scale.reshape(-1, 1).to(torch.float32)
+    out = torch.empty(weight.shape, dtype=torch.bfloat16, device=weight.device)
+    rows = max(1, (1 << 23) // weight.shape[1])
+    for start in range(0, weight.shape[0], rows):
+        stop = min(start + rows, weight.shape[0])
+        out[start:stop] = (
+            weight[start:stop].to(torch.float32) * scale[start:stop]
+        ).to(torch.bfloat16)
+    return out
+
+
+def _fold_int8_lm_head(
+    weights: Iterable[tuple[str, torch.Tensor]],
+) -> Iterable[tuple[str, torch.Tensor]]:
+    """MIXED_DENSE_INT8: emit the INT8 lm_head as a single bf16 weight.
+
+    lm_head stays an unquantized ``ParallelLMHead``: it has no INT8 storage (see
+    patch_qwen4_exp_ple_int8.py for what adding one costs), the skinny lm_head
+    GEMM is bf16-only, and folding keeps the checkpoint's weight values while
+    leaving the hidden states unquantized. The weight and its scale arrive in
+    checkpoint order, so whichever comes first waits in ``pending``.
+    """
+    pending: dict[str, torch.Tensor] = {}
+    for name, weight in weights:
+        if name in ("lm_head.weight", "lm_head.weight_scale"):
+            # LM_HEAD_INT8_SKINNY built INT8 storage for the head, so both
+            # tensors have a parameter to land in and must reach the loader.
+            if LM_HEAD_INT8_SKINNY and MIXED_DENSE_INT8:
+                yield name, weight
+                continue
+        if name == "lm_head.weight_scale" or (
+            name == "lm_head.weight" and weight.dtype == torch.int8
+        ):
+            pending[name] = weight
+        else:
+            yield name, weight
+            continue
+        if len(pending) == 2:
+            quantized = pending.pop("lm_head.weight")
+            scale = pending.pop("lm_head.weight_scale")
+            logger.info_once("step5: lm_head INT8 weights folded to bf16")
+            yield (
+                "lm_head.weight",
+                _dequantize_int8_channel("lm_head.weight", quantized, scale),
+            )
+    # An INT8 weight with no scale, or a scale with no weight: pass it through
+    # and let the loader report it against the parameters it actually has.
+    for name, weight in pending.items():
+        yield name, weight
 
 
 def _place_experts(
@@ -798,8 +1027,9 @@ class Step5MLP(nn.Module):
 class Step5Attention(nn.Module):
     """GQA with qk-norm, a per-head sigmoid output gate, and partial rotary.
 
-    Every weight here is bf16 in the checkpoint, so ``quant_config`` is
-    deliberately not threaded into the projections -- see the module docstring.
+    ``quant_config`` reaches the three projections only for the mixed INT4/INT8
+    checkpoint (MIXED_DENSE_INT8), where they are INT8 W8A8. Every weight here
+    is bf16 in the fp8 checkpoints -- see the module docstring.
     """
 
     def __init__(
@@ -813,6 +1043,7 @@ class Step5Attention(nn.Module):
         qkv_bias: bool = False,
         rope_theta: float | list[float] | None = 10000,
         cache_config: CacheConfig | None = None,
+        quant_config: QuantizationConfig | None = None,
         rope_scaling: dict[str, Any] | None = None,
         prefix: str = "",
         attn_type: str = AttentionType.DECODER,
@@ -874,14 +1105,14 @@ class Step5Attention(nn.Module):
                 self.total_num_heads,
                 self.total_num_kv_heads,
                 bias=qkv_bias,
-                quant_config=None,
+                quant_config=quant_config,
                 prefix=f"{prefix}.qkv_proj",
             )
             self.o_proj = RowParallelLinear(
                 self.total_num_heads * self.head_dim,
                 hidden_size,
                 bias=False,
-                quant_config=None,
+                quant_config=quant_config,
                 prefix=f"{prefix}.o_proj",
             )
 
@@ -915,9 +1146,11 @@ class Step5Attention(nn.Module):
                     hidden_size,
                     self.total_num_heads,
                     bias=False,
-                    quant_config=None,
+                    quant_config=quant_config,
                     prefix=f"{prefix}.g_proj",
                 )
+            # Skipped for a quantized qkv/g pair: _maybe_fuse_qkvg only accepts
+            # bf16/fp16 weights, so INT8 projections keep their linear methods.
             self._maybe_fuse_qkvg()
         if INT8_DENSE:
             _use_int8(self.o_proj)
@@ -1364,12 +1597,13 @@ class FusedMoEBlock(nn.Module):
             intermediate_size=config.share_expert_dim,
             hidden_act="silu",
             reduce_results=False if self.fold_shared_expert else reduce_results,
-            # The shared expert is bf16 in both checkpoints. Do not rely on the
-            # ignore list: hf_to_vllm_mapper renames it to ".moe.share_expert.",
-            # which the channel checkpoint's regex ("layers.N.share_expert.")
-            # does not match, so it would be built as fp8 and the bf16 weights
-            # cast into it with no scale.
-            quant_config=None,
+            # The shared expert is bf16 in both fp8 checkpoints and INT8 W8A8 in
+            # the mixed one. Do not rely on the ignore list either way:
+            # hf_to_vllm_mapper renames it to ".moe.share_expert.", which the
+            # channel checkpoint's regex ("layers.N.share_expert.") does not
+            # match, so it would be built as fp8 and the bf16 weights cast into
+            # it with no scale. MIXED_DENSE_INT8 opts in explicitly instead.
+            quant_config=_dense_quant_config(vllm_config),
             prefix=f"{prefix}.share_expert",
         )
         if (
@@ -1464,6 +1698,9 @@ class Step5DecoderLayer(nn.Module):
         layer_idx = extract_layer_index(prefix)
         self.layer_idx = layer_idx
         cache_config = vllm_config.cache_config
+        # INT8 W8A8 for attention and the dense MLP in the mixed checkpoint;
+        # None (bf16) everywhere else.
+        dense_quant_config = _dense_quant_config(vllm_config)
         self.fp32_residual_connection = getattr(
             config, "fp32_residual_connection", False
         )
@@ -1509,6 +1746,7 @@ class Step5DecoderLayer(nn.Module):
             qkv_bias=getattr(config, "attention_bias", False),
             head_dim=head_dim if head_dim else getattr(config, "head_dim", None),
             cache_config=cache_config,
+            quant_config=dense_quant_config,
             rope_scaling=getattr(config, "rope_scaling", None),
             sliding_window=getattr(config, "sliding_window", None),
             use_head_wise_attn_gate=getattr(config, "use_head_wise_attn_gate", False),
@@ -1549,7 +1787,7 @@ class Step5DecoderLayer(nn.Module):
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
                 hidden_act="silu",
-                quant_config=None,
+                quant_config=dense_quant_config,
                 reduce_results=True,
                 prefix=f"{prefix}.mlp",
             )
@@ -1916,6 +2154,8 @@ class Step5Model(nn.Module):
                     continue
                 param = params_dict[replaced_name]
                 weight_loader = param.weight_loader
+                if MIXED_DENSE_INT8:
+                    _check_dense_int8_dtype(replaced_name, param, loaded_weight)
                 weight_loader(param, loaded_weight, shard_id)
                 loaded_params.add(replaced_name)
                 break
@@ -1955,6 +2195,20 @@ class Step5Model(nn.Module):
                         logger.warning_once("ignore expert_bias")
                         continue
                     if local_name not in params_dict:
+                        if (
+                            MIXED_DENSE_INT8
+                            and not MIXED_DENSE_DEQUANT
+                            and local_name.endswith(_QUANT_TENSOR_SUFFIXES)
+                        ):
+                            raise ValueError(
+                                "step5: no parameter for quantization tensor "
+                                f"{local_name}; that layer was built "
+                                "unquantized, so its INT8 weights would load "
+                                "with no scale. Check that the checkpoint's "
+                                "config_groups target this module (note that "
+                                "hf_to_vllm_mapper renames '.share_expert.' to "
+                                "'.moe.share_expert.')."
+                            )
                         logger.warning_once(
                             "step5: no parameter for checkpoint tensor %s", local_name
                         )
@@ -1963,6 +2217,8 @@ class Step5Model(nn.Module):
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
                     )
+                    if MIXED_DENSE_INT8:
+                        _check_dense_int8_dtype(local_name, param, loaded_weight)
                     weight_loader(param, loaded_weight)
                     loaded_params.add(local_name)
 
@@ -1998,9 +2254,29 @@ class Step5ForCausalLM(nn.Module, SupportsPP, MixtureOfExperts):
             self.lm_head = ParallelLMHead(
                 config.vocab_size,
                 config.hidden_size,
-                quant_config=None,  # lm_head is bf16 in the checkpoint.
+                # bf16 in the fp8 checkpoints, and INT8 weights from the mixed
+                # one are folded to bf16 at load time (_fold_int8_lm_head), so
+                # the head never needs a quantized storage class -- unless
+                # LM_HEAD_INT8_SKINNY asks for one, which swaps the parameters
+                # here and leaves the INT8 tensors to the loader unmodified.
+                quant_config=None,
                 prefix=maybe_prefix(prefix, "lm_head"),
             )
+            if LM_HEAD_INT8_SKINNY and MIXED_DENSE_INT8:
+                from vllm_hcu.model_executor.layers import skinny_lm_head_int8
+
+                if skinny_lm_head_int8.install_int8_storage(self.lm_head):
+                    logger.info_once(
+                        "step5: lm_head keeps its INT8 weights, running the "
+                        "INT8 skinny GEMM for M <= %d",
+                        skinny_lm_head_int8.MAX_M,
+                    )
+                else:
+                    logger.warning_once(
+                        "step5: VLLM_STEP5_LM_HEAD_INT8_SKINNY is set but the "
+                        "head storage could not be switched to INT8; folding "
+                        "it to bf16 instead"
+                    )
             self.logits_processor = LogitsProcessor(config.vocab_size)
             self.logits_processor._step5_skinny_lm_head = True
         else:
@@ -2084,6 +2360,11 @@ class Step5ForCausalLM(nn.Module, SupportsPP, MixtureOfExperts):
             layer.experts.update_expert_map()
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        if MIXED_DENSE_DEQUANT:
+            # Covers lm_head and every dense projection in one pass.
+            weights = _fold_int8_dense(weights)
+        elif MIXED_DENSE_INT8:
+            weights = _fold_int8_lm_head(weights)
         loader = AutoWeightsLoader(self)
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 

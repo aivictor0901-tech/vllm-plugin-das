@@ -257,6 +257,16 @@ register_hcu_ci(
 )
 register_hcu_ci(
     job="contract-hcu-gfx936",
+    target="tests/kernels/test_step5_lm_head_int8_vs_bf16_timing.py",
+    est_time=120,
+    disabled=(
+        "manual non-gating GPU timing check comparing the bf16 skinny lm_head "
+        "GEMM with the INT8 W8A8 path; it prints bandwidth data instead of "
+        "asserting a budget"
+    ),
+)
+register_hcu_ci(
+    job="contract-hcu-gfx936",
     target="tests/runtime_patch/test_hcu_model_runner_v2_api.py",
     est_time=60,
 )

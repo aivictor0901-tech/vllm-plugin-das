@@ -3,6 +3,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 from __future__ import annotations
 from types import ModuleType
+
+import torch
+
 from vllm_hcu.runtime_compat.step5_patch_contract import (
     already_applied,
     remember_targets,
@@ -47,6 +50,38 @@ def apply_to_module(module: ModuleType) -> bool:
             and (self.head_dtype is None or self.head_dtype == hidden_states.dtype)
         ):
             from vllm_hcu.model_executor.layers import skinny_lm_head
+            from vllm_hcu.model_executor.layers import skinny_lm_head_int8
+
+            if embedding_bias is None and skinny_lm_head_int8.HcuLmHeadInt8Storage.matches(
+                lm_head
+            ):
+                if skinny_lm_head_int8.usable_int8(
+                    hidden_states, lm_head.weight, lm_head.weight_scale
+                ):
+                    target.logger.info_once(
+                        "lm_head: using the INT8 skinny Triton GEMM for M <= %d",
+                        skinny_lm_head_int8.MAX_M,
+                    )
+                    return skinny_lm_head_int8.skinny_w8a8_linear(
+                        hidden_states, lm_head.weight, lm_head.weight_scale.reshape(-1)
+                    )
+                # Outside the skinny range the INT8 head has no GEMM of its own
+                # here; dequantize for this call rather than running an
+                # unquantized GEMM against int8 storage. M > 64 is prefill, so
+                # the extra copy is amortized over many tokens.
+                from vllm_hcu.models.step5_text import _dequantize_int8_channel
+
+                target.logger.warning_once(
+                    "lm_head: INT8 skinny GEMM covers M <= %d only; "
+                    "dequantizing for larger batches",
+                    skinny_lm_head_int8.MAX_M,
+                )
+                head = _dequantize_int8_channel(
+                    "lm_head.weight", lm_head.weight, lm_head.weight_scale
+                )
+                return torch.nn.functional.linear(hidden_states, head).to(
+                    torch.bfloat16
+                )
 
             if (
                 embedding_bias is None
