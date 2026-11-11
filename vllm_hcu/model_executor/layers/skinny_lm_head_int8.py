@@ -48,12 +48,19 @@ _ENABLED = henvs.optional_custom_op_enabled(
     os.environ.get("VLLM_STEP5_LM_HEAD_INT8_SKINNY", "0") == "1"
 )
 MAX_M = 64
-# Each row of the weight tile is BK contiguous bytes. 128 matches the bf16
-# kernel's 256 B run at half the element size; larger values measured slower.
-_BK = 128
-# Rows per program for the activation quantize. K=4096 fits one tile, so this is
-# the only axis that needs parallelism.
-_QUANT_BM = 16
+# Each row of the weight tile is BK contiguous bytes, and on this device the
+# achieved read bandwidth depends strongly on that run length: a probe reading
+# 64 MiB reaches 0.30 TB/s at 1 KB per program, 1.16 at 4 KB and 1.38 at 8 KB.
+# bf16 at BK=128 already streams 256 B per row; int8 at the same BK streams
+# only 128 B, so the run has to be doubled to match the bf16 kernel's bytes.
+# Measured on the 16112 x 4096 shard under a CUDA graph, BK=256 or 512 beats
+# BK=128 at every M (76.3 -> 59.0 us at M=1, 82.8 -> 64.4 us at M=64).
+_BK = 256
+# Quantize block shape. The kernel used to hold a whole [BM, K] = [16, 4096]
+# fp32 tile, i.e. 256 KiB of registers per program, which spills to scratch;
+# looping over K in BK-sized chunks removes that and measured 2.0-2.9x faster
+# (22.3 -> 8.6 us at M=1, 21.5 -> 10.9 us at M=64).
+_QUANT_BK = 1024
 
 
 @triton.jit
@@ -64,24 +71,44 @@ def _quant_rows_kernel(
     M,
     K: tl.constexpr,
     BM: tl.constexpr,
+    BK: tl.constexpr,
 ):
     """Symmetric per-token INT8 quantization, BM rows per program.
 
-    lightop's Triton fallback launches one program per row with a single
-    next_power_of_2(K) tile and measures a flat ~95 us from M=1 to M=64. This
-    keeps all of K in one tile but batches rows, which is ~44 us. Both are far
-    above the ~5 us the bytes justify; the floor is the backend's launch cost.
+    Two passes over K with a bounded [BM, BK] tile. Holding all of K in one
+    tile instead needs [BM, K] fp32 registers -- 256 KiB at the old BM=16 --
+    which spills to scratch and measured 21.5-22.3 us for 8 KiB of traffic.
+    Bounding the tile and looping brought that to 7.4-10.9 us.
+
+    The first pass finds each row's absmax so the scale is known before any
+    value is written; the second re-reads the row and stores the quantized
+    form. Re-reading is cheap here (K is 8 KiB per row) compared to the
+    register pressure of keeping it resident.
     """
     pid = tl.program_id(0)
     rm = pid * BM + tl.arange(0, BM)
-    rr = tl.arange(0, K)
-    mask = (rm < M)[:, None] & (rr < K)[None, :]
-    x = tl.load(x_ptr + rm[:, None] * K + rr[None, :], mask=mask, other=0.0)
-    xf = x.to(tl.float32)
-    scale = tl.max(tl.abs(xf), axis=1) / 127.0
-    q = tl.clamp(_rint(xf / (scale[:, None] + 1e-12)), -127, 127)
-    tl.store(q_ptr + rm[:, None] * K + rr[None, :], q.to(tl.int8), mask=mask)
-    tl.store(s_ptr + rm, scale, mask=rm < M)
+    mmask = rm < M
+    amax = tl.zeros((BM,), tl.float32)
+    for k0 in range(0, K, BK):
+        rk = k0 + tl.arange(0, BK)
+        x = tl.load(
+            x_ptr + rm[:, None] * K + rk[None, :], mask=mmask[:, None], other=0.0
+        ).to(tl.float32)
+        amax = tl.maximum(amax, tl.max(tl.abs(x), axis=1))
+    scale = amax / 127.0
+    tl.store(s_ptr + rm, scale, mask=mmask)
+    inv = 1.0 / (scale + 1e-12)
+    for k0 in range(0, K, BK):
+        rk = k0 + tl.arange(0, BK)
+        xf = tl.load(
+            x_ptr + rm[:, None] * K + rk[None, :], mask=mmask[:, None], other=0.0
+        ).to(tl.float32)
+        q = tl.clamp(_rint(xf * inv[:, None]), -127, 127)
+        tl.store(
+            q_ptr + rm[:, None] * K + rk[None, :],
+            q.to(tl.int8),
+            mask=mmask[:, None],
+        )
 
 
 @triton.jit
@@ -143,10 +170,18 @@ def usable_int8(
 
 
 def _config(m: int) -> tuple[int, int, int]:
+    """(BM, BN, num_warps) for the GEMM at M rows.
+
+    Swept against BK in {128, 256, 512}, BN in {32, 64, 128, 256} and
+    num_warps in {1, 2, 4, 8}, each candidate gated on numerics before timing.
+    num_stages stayed at 1 everywhere: the kernel is weight-stream bound, so
+    the extra pipeline stage only adds register pressure (num_stages=2 finished
+    outside the top 8 at every M).
+    """
     if m <= 16:
-        return 16, 64, 2
+        return 16, 128, 2
     if m <= 32:
-        return 32, 64, 2
+        return 32, 128, 2
     return 64, 128, 4
 
 
@@ -155,8 +190,10 @@ def quantize_activations(
 ) -> None:
     """Per-token INT8 quantize ``x2`` [M, K] into ``q`` with scales ``s``."""
     m = x2.shape[0]
-    _quant_rows_kernel[(triton.cdiv(m, _QUANT_BM),)](
-        x2, q, s, m, x2.shape[1], BM=_QUANT_BM, num_warps=8, num_stages=1
+    # BM=4 with 4 warps was within 1 us of the best config at every M, so one
+    # shape serves the whole decode range instead of a per-M table.
+    _quant_rows_kernel[(triton.cdiv(m, 4),)](
+        x2, q, s, m, x2.shape[1], BM=4, BK=_QUANT_BK, num_warps=4, num_stages=1
     )
 
 

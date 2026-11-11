@@ -65,22 +65,26 @@ def apply_to_module(module: ModuleType) -> bool:
                     return skinny_lm_head_int8.skinny_w8a8_linear(
                         hidden_states, lm_head.weight, lm_head.weight_scale.reshape(-1)
                     )
-                # Outside the skinny range the INT8 head has no GEMM of its own
-                # here; dequantize for this call rather than running an
-                # unquantized GEMM against int8 storage. M > 64 is prefill, so
-                # the extra copy is amortized over many tokens.
-                from vllm_hcu.models.step5_text import _dequantize_int8_channel
+                # Above the skinny range, hand the INT8 head to hipBLASLt. Its
+                # 256x256 macro tile is what makes it lose to the skinny
+                # schedule at M <= 64, and it is exactly what suits M > 64, so
+                # the weights never have to leave INT8. Dequantizing instead
+                # would materialize a bf16 copy of the whole shard (~132 MiB on
+                # the TP8 shard) on every call, since nothing caches it.
+                from vllm_hcu.model_executor.layers.quantization.int8_runtime import (
+                    apply_int8_linear,
+                )
 
-                target.logger.warning_once(
-                    "lm_head: INT8 skinny GEMM covers M <= %d only; "
-                    "dequantizing for larger batches",
+                target.logger.info_once(
+                    "lm_head: INT8 skinny GEMM covers M <= %d; using hipBLASLt "
+                    "W8A8 for larger batches",
                     skinny_lm_head_int8.MAX_M,
                 )
-                head = _dequantize_int8_channel(
-                    "lm_head.weight", lm_head.weight, lm_head.weight_scale
-                )
-                return torch.nn.functional.linear(hidden_states, head).to(
-                    torch.bfloat16
+                return apply_int8_linear(
+                    hidden_states,
+                    lm_head.weight,
+                    lm_head.weight_scale,
+                    torch.bfloat16,
                 )
 
             if (
