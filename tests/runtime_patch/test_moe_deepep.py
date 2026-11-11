@@ -3273,6 +3273,30 @@ def test_fp8_oracle_sidecar_selection_and_format_contract(
             kFp8StaticChannelSym,
             kFp8DynamicTokenSym,
         )
+    # The Step5 mixed W4A8 checkpoint owns a separate SwigluStep7 adapter.
+    # Its scoped marker permits auto HT/LL without admitting other models.
+    config._hcu_vllm_config.model_config.architectures = [
+        "Step5ForConditionalGeneration"
+    ]
+    with pytest.raises(ValueError, match="DeepSeek-V4"):
+        module.select_fp8_moe_backend(
+            config, kFp8StaticChannelSym, kFp8DynamicTokenSym,
+        )
+    step5_name = "vllm_hcu.model_executor.layers.fused_moe.step5_deepep"
+    monkeypatch.setitem(sys.modules, step5_name, _module(
+        step5_name, Step5FP8HTExperts=SupportedExperts,
+    ))
+    config._hcu_step5_deepep_mixed_fp8 = True
+    step5_backend, step5_experts = module.select_fp8_moe_backend(
+        config, kFp8StaticChannelSym, kFp8DynamicTokenSym,
+    )
+    assert step5_backend is backend
+    assert step5_experts is SupportedExperts
+    with pytest.raises(ValueError, match="only channel-wise"):
+        module.select_fp8_moe_backend(
+            config, kFp8Static128BlockSym, kFp8Dynamic128Sym,
+        )
+    del config._hcu_step5_deepep_mixed_fp8
     config._hcu_vllm_config.model_config.architectures = [
         "DeepseekV4ForCausalLM"
     ]

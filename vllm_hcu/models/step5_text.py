@@ -1093,22 +1093,27 @@ class FusedMoEBlock(nn.Module):
         self.fuse_all_reduce, reduce_results = _step5_moe_reduce_policy(
             self.tp_size, get_dp_group().world_size
         )
+        from vllm_hcu.model_executor.layers.fused_moe.step5_w4a8_policy import uses_step5_deepep
+        self._step5_deepep = (uses_step5_deepep(vllm_config)
+                             and vllm_config.parallel_config.enable_expert_parallel
+                             and get_ep_group().world_size > 1)
         self.effective_sequence_parallel = (
-            vllm_config.compilation_config.pass_config.enable_sp and self.tp_size > 1
+            (vllm_config.compilation_config.pass_config.enable_sp or self._step5_deepep)
+            and self.tp_size > 1
         )
         # Outside SP, FusedMoE owns the shared expert (as 0.21's step4.py did): the
         # runner adds shared + routed before its single TP all-reduce -- under DP>1
         # one all-reduce per layer instead of two -- and can run the shared expert
         # on the aux stream alongside the gate, router and routed experts.
-        self.fold_shared_expert = not self.effective_sequence_parallel
-        if self.fold_shared_expert:
+        self.fold_shared_expert = not self.effective_sequence_parallel and not self._step5_deepep
+        if self.fold_shared_expert or self._step5_deepep:
             self.fuse_all_reduce = False
         self.share_expert = Step5MLP(
             config=config,
             hidden_size=self.hidden_size,
             intermediate_size=config.share_expert_dim,
             hidden_act="silu",
-            reduce_results=False if self.fold_shared_expert else reduce_results,
+            reduce_results=False if self.fold_shared_expert or self._step5_deepep else reduce_results,
             # The shared expert is bf16 in both checkpoints. Do not rely on the
             # ignore list: hf_to_vllm_mapper renames it to ".moe.share_expert.",
             # which the channel checkpoint's regex ("layers.N.share_expert.")
@@ -1169,6 +1174,25 @@ class FusedMoEBlock(nn.Module):
         """Return (shared, routed); shared is None when FusedMoE already added it."""
         hidden_dim = hidden_states.shape[-1]
         hidden_states = hidden_states.view(-1, hidden_dim)
+        if self._step5_deepep:
+            # Shared weights are TP-sharded, whereas routed experts are EP-
+            # sharded. Compute shared partials over the same full token order
+            # on every TP rank; reduce-scatter them to the routed token owners.
+            # This is independent of compiler SP: each unique token enters
+            # DeepEP once even when enable_sp=False.
+            from vllm_hcu.model_executor.layers.fused_moe.step5_deepep import shared_expert_token_slice
+            full_input = (tensor_model_parallel_all_gather(hidden_states, dim=0)
+                          if input_is_sequence_parallel and self.tp_size > 1
+                          else hidden_states)
+            shared = shared_expert_token_slice(self.share_expert(full_input), get_tp_group())
+            routed_input = (hidden_states if input_is_sequence_parallel or self.tp_size == 1
+                            else sequence_parallel_chunk(hidden_states))
+            if self.experts.is_internal_router:
+                routed = self.experts(hidden_states=routed_input, router_logits=routed_input)
+            else:
+                logits, _ = self.gate(routed_input)
+                routed = self.experts(hidden_states=routed_input, router_logits=logits)
+            return shared, routed
         if (
             self.experts.moe_config.is_sequence_parallel
             and not input_is_sequence_parallel

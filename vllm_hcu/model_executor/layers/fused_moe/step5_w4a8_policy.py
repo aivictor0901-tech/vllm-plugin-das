@@ -5,6 +5,26 @@ import os
 from vllm_hcu.runtime_compat.step5 import is_step5_config, is_step5_owner
 
 
+def uses_step5_deepep(config):
+    """Select by the actual backend, independently of a deployment geometry."""
+    parallel = getattr(config, "moe_parallel_config", None)
+    if parallel is not None:
+        return bool(
+            getattr(parallel, "use_deepep_auto_kernels", False)
+            or getattr(parallel, "all2all_backend", "") in (
+                "deepep_auto", "deepep_high_throughput", "deepep_low_latency"
+            )
+        )
+    from vllm_hcu.patch.config import get_hcu_config
+
+    return bool(
+        (getattr(config, "additional_config", None) is not None
+         and get_hcu_config(config).deepep_auto)
+        or getattr(getattr(config, "parallel_config", None), "all2all_backend", "")
+        in ("deepep_auto", "deepep_high_throughput", "deepep_low_latency")
+    )
+
+
 def validate_gptq_w4a8_scheme(scheme):
     """Accept only the channel INT4 / dynamic token INT8 storage contract."""
     def field(value, key, default=None):
@@ -52,8 +72,8 @@ def profile_for_model(config):
     phase = os.environ.get("VLLM_HCU_STEP5_W4A8_PROFILE", "")
     if not phase or not is_step5_config(config):
         return None
-    if phase not in ("prefill", "decode"):
-        raise ValueError("VLLM_HCU_STEP5_W4A8_PROFILE must be prefill or decode")
+    if phase not in ("prefill", "decode", "auto"):
+        raise ValueError("VLLM_HCU_STEP5_W4A8_PROFILE must be prefill, decode or auto")
     model = config.model_config
     hf = model.hf_config
     quantization = getattr(model, "quantization", None)
@@ -67,6 +87,16 @@ def profile_for_model(config):
             "Step5 native W4A8 requires SlimQuant or channel GPTQ W4A8 weights"
         )
     parallel = config.parallel_config
+    if getattr(config, "lora_config", None) is not None:
+        raise ValueError("Step5 native W4A8 LoRA has not been enabled")
+    if uses_step5_deepep(config):
+        # TP/DP/EP/PP sizes belong to the framework. In particular, do not
+        # require one eight-card deployment or a fixed local expert count.
+        if parallel.enable_eplb:
+            raise ValueError("Step5 packed DeepGEMM weights require static expert placement")
+        return phase
+    if phase == "auto":
+        raise ValueError("Step5 auto profile requires DeepEP auto dispatch")
     expected = (1, 8, 1) if phase == "prefill" else (4, 2, 1)
     if (
         (
@@ -79,8 +109,6 @@ def profile_for_model(config):
         or parallel.enable_eplb
     ):
         raise ValueError(f"Step5 {phase} requires static TP/DP/PP={expected}, EP8")
-    if getattr(config, "lora_config", None) is not None:
-        raise ValueError("Step5 native W4A8 LoRA has not been enabled")
     return phase
 
 
@@ -91,9 +119,13 @@ def resolve_profile(moe):
     activation = getattr(moe.activation, "value", moe.activation)
     if activation != "swiglustep":
         return None
-    if phase not in ("prefill", "decode"):
-        raise ValueError("VLLM_HCU_STEP5_W4A8_PROFILE must be prefill or decode")
+    if phase not in ("prefill", "decode", "auto"):
+        raise ValueError("VLLM_HCU_STEP5_W4A8_PROFILE must be prefill, decode or auto")
     parallel = moe.moe_parallel_config
+    if uses_step5_deepep(moe):
+        if parallel.enable_eplb:
+            raise ValueError("Step5 packed DeepGEMM weights require static expert placement")
+        return "auto"
     if (
         parallel.enable_eplb
         or parallel.all2all_backend != "allgather_reducescatter"

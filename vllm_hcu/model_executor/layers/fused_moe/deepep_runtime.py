@@ -533,7 +533,8 @@ def ht_do_dispatch(
         else (
             256
             if (
-                (quant_config.use_int8_w8a8 or quant_config.use_fp8_w8a8)
+                (quant_config.use_int8_w8a8 or quant_config.use_fp8_w8a8
+                 or getattr(quant_config, "weight_quant_dtype", None) == "int4")
                 and quant_config.is_per_act_token
                 and not quant_config.is_block_quantized
             )
@@ -543,11 +544,12 @@ def ht_do_dispatch(
     fused_scatter = bool(getattr(self, "_hcu_step5_fused_scatter_enabled", False))
     scatter_kwargs = {}
     if fused_scatter:
-        if not (has_scales and expert_alignment == 256 and num_experts in (352, 368)):
-            raise ValueError("Step5 fused scatter requires E22/E23 with EP16 per-token FP8 scales")
+        if not (has_scales and expert_alignment == 256
+                and num_experts % self.num_dispatchers_ == 0):
+            raise ValueError("Step5 fused scatter requires aligned channel quantization and uniform local experts")
         data, scales = token_data
-        if data.dtype != module.torch.float8_e4m3fn or scales.shape != (data.size(0), 1):
-            raise ValueError("Step5 fused scatter requires FP8 [M,4096] and float32 [M,1]")
+        if data.dtype not in (module.torch.float8_e4m3fn, module.torch.int8) or scales.shape != (data.size(0), 1):
+            raise ValueError("Step5 fused scatter requires INT8/FP8 [M,H] and float32 [M,1]")
         key = (id(self.buffer), ubatch_id)
         cache = self._hcu_step5_scatter_buffers
         if key not in cache:
@@ -676,10 +678,10 @@ def ht_receiver(
     ubatch_id = module.dbo_current_ubatch_id()
     if getattr(self, "_hcu_step5_fused_scatter_enabled", False):
         counts = tuple(expert_num_tokens_per_expert_list)
-        if len(counts) not in (22, 23) or any(
+        if len(counts) != num_experts // self.num_dispatchers_ or any(
             type(c) is not int or c < 0 or c % 256 for c in counts
         ):
-            raise ValueError("Step5 fused scatter requires aligned E22/E23 dispatch counts")
+            raise ValueError("Step5 fused scatter requires aligned local expert dispatch counts")
         rows = sum(counts)
         sx, ss, si, sm = self._hcu_step5_scatter_buffers[(id(self.buffer), ubatch_id)]
         for tensor in (sx, ss, si, sm):

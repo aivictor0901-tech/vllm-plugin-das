@@ -6,6 +6,27 @@ from .step5_w4a8_policy import padded_route_rows
 
 
 @triton.jit
+def activation_masked(x, q, scale, counts, CAP: tl.constexpr, I: tl.constexpr,
+                      INT8: tl.constexpr, BLOCK: tl.constexpr):
+    """Existing Step5 activation math over valid expert rows only."""
+    expert = tl.program_id(0)
+    for row in range(tl.program_id(1), tl.minimum(tl.load(counts + expert), CAP), 8):
+        col = tl.arange(0, BLOCK)
+        offset = (expert.to(tl.int64) * CAP + row) * 2 * I + col
+        gate = tl.load(x + offset, mask=col < I, other=0).to(tl.float32)
+        up = tl.load(x + offset + I, mask=col < I, other=0).to(tl.float32)
+        value = (tl.minimum(gate * tl.sigmoid(gate), 7.) *
+                 tl.minimum(tl.maximum(up, -7.), 7.)).to(tl.bfloat16).to(tl.float32)
+        maximum = tl.max(tl.abs(value), 0)
+        s = tl.where(maximum > 0, maximum / (127. if INT8 else 448.), 1.)
+        v = value / s
+        if INT8:
+            v = tl.minimum(tl.maximum(libdevice.nearbyint(v), -127.), 127.)
+        tl.store(q + (expert.to(tl.int64) * CAP + row) * I + col, v, mask=col < I)
+        tl.store(scale + expert * CAP + row, s)
+
+
+@triton.jit
 def _row_value(ptr, row, col, mask, I: tl.constexpr):
     offset = row[:, None].to(tl.int64) * (2 * I) + col[None, :]
     gate = tl.load(ptr + offset, mask=mask, other=0).to(tl.float32)
@@ -228,7 +249,9 @@ def _weighted_output(
             mask=valid & (pos >= 0) & (cols < K),
             other=0,
         ).to(tl.float32)
-        w = tl.load(weights + row * TOPK + slot)
+        # DeepEP may leave inactive Top-K slots unspecified. Mask the weight
+        # as well as the value: 0 * NaN would otherwise poison a valid row.
+        w = tl.load(weights + row * TOPK + slot, mask=valid & (pos >= 0), other=0.)
         acc += value * w
     # Match the separate BF16 routed-output/shared-add rounding boundary.
     rounded = acc.to(output.dtype.element_ty)
