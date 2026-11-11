@@ -248,6 +248,33 @@ def _is_explicitly_non_prefilling(value: object | None) -> bool:
     return isinstance(value, bool) and not value
 
 
+def step5_ll_global_token_bound(
+    parallel_config: object,
+    num_tokens: int | None,
+    num_tokens_across_dp: object | None,
+) -> int | None:
+    """Reuse the runner's CPU DP synchronization, without another collective.
+
+    Counts include the runner's agreed graph padding and are in pre-SP units.
+    A local descriptor alone is not a global bound when DP ranks differ.
+    """
+    dp_size = parallel_config.data_parallel_size
+    if num_tokens_across_dp is None:
+        return num_tokens if dp_size == 1 else None
+    device = getattr(num_tokens_across_dp, "device", None)
+    if device is not None and device.type != "cpu":
+        raise ValueError("Step5 LL requires CPU token counts from DP synchronization")
+    tolist = getattr(num_tokens_across_dp, "tolist", None)
+    sizes = tolist() if callable(tolist) else num_tokens_across_dp
+    if (
+        not isinstance(sizes, (tuple, list))
+        or len(sizes) != dp_size
+        or any(not isinstance(n, int) or n < 0 for n in sizes)
+    ):
+        raise ValueError("Step5 LL requires one nonnegative token count per DP rank")
+    return max(sizes, default=0)
+
+
 @contextmanager
 def set_forward_context(
     module: object,
@@ -348,6 +375,17 @@ def set_forward_context(
         enable_lightly_cplb=enable_lightly_cplb,
         deepep_auto_use_low_latency=deepep_auto_use_low_latency,
     )
+
+    if low_latency and getattr(
+        getattr(getattr(vllm_config, "model_config", None), "hf_config", None),
+        "model_type", None
+    ) in ("step5", "step5_vl"):
+        # LL intentionally leaves dp_metadata unset. Preserve only the host
+        # bound needed by Step5 chunking; do not re-enable DP/SP collectives.
+        # The runner supplies this for eager, PIECEWISE, FULL capture and MTP.
+        forward_context._hcu_step5_ll_global_tokens = step5_ll_global_token_bound(
+            parallel_config, num_tokens, num_tokens_across_dp
+        )
 
     try:
         with module.override_forward_context(forward_context):
