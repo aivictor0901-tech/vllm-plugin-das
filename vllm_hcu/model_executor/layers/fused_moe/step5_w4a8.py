@@ -193,6 +193,8 @@ def _make_experts_class(phase, backend="deepgemm"):
                 )
             if hidden_states.shape[0] == 0:
                 return
+            if getattr(expert_tokens_meta, "_hcu_deepep_ht_local_counts", False):
+                expert_tokens_meta._hcu_step5_compact_rows = True
             E, _, N, K, topk = self.moe_problem_size(hidden_states, w1, w2, topk_ids)
             use_small = (
                 0 < hidden_states.shape[0] <= 256
@@ -221,7 +223,13 @@ def _make_experts_class(phase, backend="deepgemm"):
             elif use_large64:
                 aligned = padded_route_rows(hidden_states.shape[0], topk, E)
             gathered = _resize_cache(workspace13.view(dtype=torch.int8), (aligned, K))
-            if use_small:
+            fused_scatter = getattr(expert_tokens_meta, "_hcu_step5_fused_scatter", None)
+            if fused_scatter is not None:
+                aq, scales, indices, inverse = fused_scatter
+                if aq.dtype != torch.int8 or aq.shape[1] != K:
+                    raise ValueError("Step5 W4A8 fused scatter requires matching INT8 expert rows")
+                aligned = aq.shape[0]
+            elif use_small:
                 aq, scales, indices, inverse, _ = small_permute(
                     hidden_states,
                     self._ensure_2d_scale(a1q_scale),
@@ -265,7 +273,7 @@ def _make_experts_class(phase, backend="deepgemm"):
             a_scale = torch.empty(
                 (aligned, 1), device=hidden_states.device, dtype=torch.float32
             )
-            if hidden_states.shape[0] >= 1024:
+            if hidden_states.shape[0] >= 1024 and N // 2 == 1536:
                 activation_persistent[(min(triton.cdiv(aligned, 8), 1024),)](
                     gateup,
                     intermediate,
@@ -324,6 +332,9 @@ def _make_experts_class(phase, backend="deepgemm"):
                 num_warps=4,
                 enable_fp_fusion=False,
             )
+            if fused_scatter is not None:
+                from .step5_deepep import finish_scatter
+                finish_scatter(expert_tokens_meta)
 
     return Step5W4A8Experts
 
@@ -331,6 +342,11 @@ def _make_experts_class(phase, backend="deepgemm"):
 def prepare_step5_w4a8(method, layer, phase):
     """Select modular W4 before model load; no legacy monolithic hook allowed."""
     import vllm.model_executor.layers.fused_moe  # noqa: F401 - initialize before HCU adapters
+    from .step5_w4a8_policy import uses_step5_deepep
+    if uses_step5_deepep(method.moe):
+        from .step5_deepep import prepare_step5_deepep
+        prepare_step5_deepep(method, layer, int4=True)
+        return
     from vllm.model_executor.layers.fused_moe.all2all_utils import (
         maybe_make_prepare_finalize,
     )
@@ -423,6 +439,21 @@ def validate_loaded_model(model):
                 weight.untyped_storage().nbytes()
             )
     declared = [m for m in model.modules() if hasattr(m, "_hcu_step5_gptq_kind")]
+    import os
+    if os.environ.get("VLLM_HCU_STEP5_W4A8_PROFILE") == "auto" or any(
+        hasattr(m, "_hcu_step5_deepep") for m in declared
+    ):
+        # PP stages own only their local layers. EP degree and padded physical
+        # matrices determine the storage; no eight-rank byte constant applies.
+        expected = {id(m) for m in declared if m._hcu_step5_gptq_kind == "w4a8"}
+        expected_bytes = sum(w.numel() * w.element_size() for m in layers
+                             for w in (m.w13_weight, m.w2_weight))
+        if ({id(m) for m in layers} != expected or len(storage) != 2 * len(layers)
+                or sum(storage.values()) != expected_bytes):
+            raise RuntimeError("Step5 DeepEP requires one packed owner per local W4 expert matrix")
+        logger.info("[step5-deepep] verified local W4 layers=%d, mixed layers=%d, packed bytes=%d",
+                    len(layers), len(declared) - len(layers), sum(storage.values()))
+        return
     expected_layers = 88
     if declared:
         expected = {id(m) for m in declared if m._hcu_step5_gptq_kind == "w4a8"}

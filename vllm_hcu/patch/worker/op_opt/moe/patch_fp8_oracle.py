@@ -174,7 +174,8 @@ def apply_to_module(module: ModuleType) -> bool:
         is_channel_fp8 = (weight_key, activation_key) == channel_fp8_scheme
         if sidecar.deepep_auto:
             architectures = _model_architectures(config)
-            if not any(architecture in architectures for architecture in (
+            step5_mixed = bool(getattr(config, "_hcu_step5_deepep_mixed_fp8", False))
+            if not step5_mixed and not any(architecture in architectures for architecture in (
                 "DeepseekV4ForCausalLM", "DeepSeekV4MTPModel",
             )):
                 raise ValueError(
@@ -200,6 +201,9 @@ def apply_to_module(module: ModuleType) -> bool:
                     "deepep_auto HCU DeepGEMM supports only channel-wise "
                     "FP8 weights with dynamic per-token FP8 activations"
                 )
+            if step5_mixed:
+                from vllm_hcu.model_executor.layers.fused_moe.step5_deepep import Step5FP8HTExperts
+                return hcu_enum.HCU_DEEPGEMM, Step5FP8HTExperts
             from vllm_hcu.model_executor.layers.fused_moe.experts.dpsk_v4_deep_gemm_moe import (
                 DeepEPDeepGemmContiguousExperts,
             )
