@@ -38,6 +38,18 @@ Model Runner V2 rejects PP with `external_launcher`.
 - The checkpoint's three BF16 expert layers are converted locally to channel
   FP8 on load. Their LL wire data stays BF16 and is quantized to E4M3FN after
   dispatch; E4M3FNUZ is never reinterpreted as E4M3FN.
+- These FP8 layers use `m_grouped_fp8_gemm_nt_contiguous` with MODE=1000
+  for Prefill and `m_grouped_fp8_gemm_nt_masked` with MODE=1000 for Decode.
+  Both Decode projections use the same mode, independently of batch size.
+  `HCU_STEP5_FP8_DECODE_MODE=1001` or `1101` is an explicit load-time
+  override; 1101 selects `masked_ll` and its matching W6 byte packer.
+  Changing this variable after weights are loaded is unsupported. The
+  gfx936 shuffled W6 format is not interchangeable with this FP8 format.
+- Original AG/RS deployments use the same FP8 GEMM policy while keeping
+  their prepare/finalize communication. Their Decode adapter constructs a
+  masked expert layout in bounded token tiles, preserving duplicate routes,
+  nonlocal experts and workspace/output aliases. The 85 INT4 expert layers
+  keep their existing HIPC path and MODE=1002.
 - DeepEP dispatch handles are paired with their matching combine. The framework
   caches compatible communication allocations; routing metadata is recomputed
   per layer. One fenced fused-scatter cache is shared by successive HT layers.

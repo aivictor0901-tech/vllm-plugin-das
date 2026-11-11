@@ -110,7 +110,7 @@ python3 -m pip install --no-deps --force-reinstall \
 `deepgemm.m_grouped_w4a8_gemm_nt_contiguous_hipc(..., config={"MODE": 1002})`。
 IFB 的真实 Prefill 和 Decode 共用这条按专家排序、64 行对齐的路径；不切换成默认 1006 所需的 128 行布局。
 权重沿用加载时唯一的 HIPC packed owner，scale 不再乘除 16。
-3 层 FP8 专家、SwiGLUStep 的 clamp=7、router 权重和 combine 协议继续由已有路径处理。
+3 层 FP8 专家使用下述独立 DeepGEMM 路径；SwiGLUStep 的 clamp=7、router 权重和 combine 协议保留。
 
 调用封装为带输出 mutation 声明和 Fake 实现的
 `torch.ops.vllm.step5_deepgemm_w4a8_gemm`，供 torch.compile 和 CUDA Graph 使用。
@@ -133,6 +133,75 @@ bash /workspace/step5-w4a8/vllm-plugin/benchmarks/step5_w4a8_pd/serve_gptq_decod
 ```bash
 bash /workspace/step5-w4a8/vllm-plugin/benchmarks/step5_w4a8_pd/build_gptq_plugin.sh
 ```
+
+## 混合 FP8 MoE 与 Decode Top-K
+
+只调整 checkpoint 中层号 88、89、90（从 0 计数）的 FP8 专家计算，85 层 W4A8 专家的 HIPC 路径保持原样。
+
+| 阶段 | FP8 DeepGEMM 接口 | 默认 MODE |
+| --- | --- | --- |
+| Prefill | `m_grouped_fp8_gemm_nt_contiguous` | 1000 |
+| Decode G1 / G2 | `m_grouped_fp8_gemm_nt_masked` | 1000 |
+
+Decode 的两次 GEMM 使用一个固定 MODE，不按当前 M 动态切换。
+原 AG/RS 按服务的 `prefill` / `decode` profile 选择权重布局；Decode 服务中的真实 Prefill
+也能使用分块 masked 路径完成计算，供 IFB 和精度验证使用。
+原 AG/RS 的 Decode 路径在本卡构造 masked expert 布局，通信仍由原 prepare/finalize 完成；
+DeepEP 路径沿用其 HT/LL dispatch/combine。`HCU_STEP5_FP8_DECODE_MODE=1101`
+可在加载权重前显式选择 `masked_ll`，同时切换到它所要求的 W6 packer；不允许在常驻权重加载后更改模式。
+
+AG/RS 的提前融合 combine 以全局 DP token 数为准：各 DP 行数相同时保留 EP 单次归约；
+行数不同时，统一交由普通 finalize 和 TP 尾部归约。
+这避免混合 Prefill/Decode 批次中，共享专家的本地执行顺序不同，导致部分 rank 进入 EP AllReduce、其他 rank 进入 DP ReduceScatter 而卡住。
+
+`HCU_STEP5_DSA_LIGHTOP_TOPK=1` 启用两个独立的 Decode 算子调用：
+
+1. `lightop.topk_transform_512` 选择逻辑 region ID，使用常驻的 identity page table，page size 为 1。
+2. Triton `_decode_pack_kernel` 对选区 ID 排序，完成物理页映射、有效项压紧、当前 region 追加和 int64 metadata 打包。
+
+当前 LightOp wheel 的 Top-K ID 不保证按逻辑顺序输出，因此排序放在 metadata 算子中，以保留原 Attention 的累加顺序。
+现有 LightOp metadata 接口的输出格式与 Step5 不同，这里保留独立的 Triton metadata。
+这是两个算子调用，LightOp 内部的 GPU kernel 数量由其实现决定。
+此开关受 custom-op 总开关控制，默认关闭；当前 checkpoint 的 K=512 使用 LightOp，其他 K 或超出接口范围的 shape 使用原选择器。
+Prefill 选区和模型的最大上下文长度保持原有行为。
+
+例如在现有 Decode 启动参数上增加：
+
+```bash
+HCU_STEP5_FP8_DECODE_MODE=1000 HCU_STEP5_DSA_LIGHTOP_TOPK=1 \
+STEP5_DP_DISPATCH=packed \
+bash benchmarks/step5_w4a8_pd/serve_gptq_decode.sh
+```
+
+## S6 Decode 验证（2026-11-12）
+
+8 卡 gfx938，TP4/DP2/EP8；输入 131072、输出 4096，fake-prefill，MTP3 synthetic
+接受率为 `[0.838992, 0.598322, 0.362686]`。沿用共同 Decode 窗口的 token/s 和
+SSE 输出块间隔 ITL；一次完整预热、一次有效正式轮，正式轮排队、抢占、JIT 均为 0。
+触发 JIT 的运行保留为无效轮，重新预热后再计数。
+
+| 路径 | BS32 token/s / ITL ms | BS64 token/s / ITL ms | GSM8K 1319 题 |
+| --- | --- | --- | --- |
+| DeepEP 基线，原 FP8 专家 kernel | 1020.53 / 87.67 | 1629.55 / 109.84 | 1269，96.21% |
+| 原 AG/RS + FP8 DeepGEMM，原 Top-K | 1512.88 / 59.12 | 2206.66 / 81.15 | 1266，95.98% |
+| 原 AG/RS + FP8 DeepGEMM，LightOp Top-K | 1600.24 / 56.02 | 2342.28 / 76.39 | 1265，95.91% |
+
+精度使用真实 Prefill、真实 MTP3 和同一套生成/评分协议，DeepEP 采用 `deepep_auto`；
+三轮均完整返回 1319 题，运行错误和长度截断为 0。两种 AG/RS 方案得分差 1 题，
+此表不表示生成文本逐 token 相同。DeepEP 基线与 AG/RS 行同时改变了通信和专家实现，
+二者的吞吐差不能全部归因于 FP8 GEMM。
+
+32 并发 prof 含全部 8 个 worker 的 5 个 Decode step 和 CPU 调用栈。
+每 rank 均为 115 次 LightOp `adaptive_topk_kernel<512, true>`、115 次独立 metadata，
+旧 DSA `_region_topk_ids_kernel` 为 0；W4A8 / FP8 DeepGEMM 分别为 850 / 30 次。
+8 卡平均 Top-K + metadata 的累计 GPU 时间由 4.51 降至 0.88 ms/step，
+占累计 GPU kernel 时间由 7.34% 降至 1.50%；该占比的分母是 kernel 累计时间。
+
+另完成 42 项 CPU 回归（含 6 个 subtest）、8 卡 AG/RS Prefill 数值校验、
+AG/RS Decode 和 DeepEP Auto HT/LL 的数值与 Decode Graph 校验，
+以及不等长 DP `284/68`、`68/284` 的 W4A8/FP8 MoE 校验。
+LightOp 选区和独立 metadata 的 36 组 GPU 校验逐项一致，包含并列分数、负数、
+分页无效项、因果边界和修改输入后的 Graph 重放。
 
 ## PR #297 优化复用
 

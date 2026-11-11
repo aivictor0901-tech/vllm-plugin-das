@@ -86,7 +86,9 @@ def _runtime(monkeypatch, *, dbo=True, sizes=(64, 64, 64, 64), rank=0,
     runner_ns = _source(MOE + "moe_runner.py", {
         "_EpFusedCombineState", "_ep_fused_rows", "_ep_fused_all_reduce",
         "_maybe_combine", "_ep_fused_combine_output",
-    }, dict(torch=torch, ep_shared_add_allowed=allowed, SharedExpertsOrder=modes,
+    }, dict(torch=torch, ep_shared_add_allowed=allowed,
+            early_ep_combine_allowed=policy.early_ep_combine_allowed,
+            SharedExpertsOrder=modes,
             get_ep_group=lambda: ep, get_dp_group=lambda: dp,
             get_tensor_model_parallel_world_size=lambda: 1,
             get_forward_context=lambda: ctx))
@@ -311,6 +313,21 @@ def test_normal_finalize_still_owns_the_early_shared_add(monkeypatch):
     result = runtime.state.finalize_hook(out)
     assert runtime.state.finish()
     torch.testing.assert_close(result, torch.full_like(shared, 11))
+
+
+@pytest.mark.parametrize("sizes", [(284, 68), (68, 284), (0, 68)])
+@pytest.mark.parametrize("rank,inline", [(0, True), (0, False), (1, True), (1, False)])
+def test_uneven_dp_ranks_all_leave_combine_to_normal_finalize(
+    monkeypatch, sizes, rank, inline,
+):
+    runtime = _runtime(monkeypatch, sizes=sizes, rank=rank, inline=inline)
+    runtime.arm(3)
+    out = torch.full((sum(sizes), 4096), 2, dtype=torch.bfloat16)
+    # Only some ranks may have inline shared output ready. None may start
+    # the early EP collective while another rank falls back to DP RS.
+    assert runtime.state.shared_add(out) is None
+    assert runtime.state.finalize_hook(out) is None
+    assert not runtime.state.finish()
 
 
 def test_unfinished_early_add_assertion_is_preserved(monkeypatch):

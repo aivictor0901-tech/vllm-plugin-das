@@ -98,7 +98,8 @@ class Step5BF16ToFP8MoEMethod(CompressedTensorsW8A8Fp8MoEMethod):
             from vllm_hcu.model_executor.layers.fused_moe.step5_deepep import prepare_step5_deepep
             prepare_step5_deepep(self, layer, int4=False)
         else:
-            super().process_weights_after_loading(layer)
+            from vllm_hcu.model_executor.layers.fused_moe.step5_fp8_agrs import prepare_step5_fp8_agrs
+            prepare_step5_fp8_agrs(self, layer)
 
 
 class Step5GPTQW4A8MoEMethod(SlimQuantW4A8Int8AiterMoEMethod):

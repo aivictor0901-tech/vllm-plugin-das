@@ -37,11 +37,9 @@ def _gemm(a: torch.Tensor, b: torch.Tensor, out: torch.Tensor,
         args = ((a, a_scale), (b, b_scale), out, layout)
         fn(*args, *([expected_m] if masked else []), config={"MODE": 1002})
     else:
-        import deepgemm
-        fn = (deepgemm.m_grouped_fp8_gemm_nt_masked if masked
-              else deepgemm.m_grouped_fp8_gemm_nt_contiguous)
-        args = ((a, a_scale), (b, b_scale), out, layout)
-        fn(*args, *([expected_m] if masked else []))
+        from .step5_fp8_gemm import grouped_fp8
+        grouped_fp8((a, a_scale), (b, b_scale), out, layout,
+                    expected_m, decode=masked)
 
 
 def _gemm_fake(a: torch.Tensor, b: torch.Tensor, out: torch.Tensor,
@@ -164,11 +162,14 @@ class Step5LLExperts(BatchedDeepGemmExperts):
 
 class Step5FP8LLExperts(Step5LLExperts):
     # Reuse the library-specific FP8 packers and logical-shape decoder.
-    _pack_channel_weights = DeepEPDeepGemmMaskedExperts._pack_channel_weights
     process_weights_after_loading = DeepEPDeepGemmMaskedExperts.process_weights_after_loading
     _can_pack_channel_weights = staticmethod(DeepEPDeepGemmMaskedExperts._can_pack_channel_weights)
     _packed_deepgemm_problem_shape = staticmethod(DeepEPDeepGemmMaskedExperts._packed_deepgemm_problem_shape)
     WEIGHT_LAYOUT = "masked"
+
+    def _pack_channel_weights(self, w13, w2):
+        from .step5_fp8_gemm import pack_decode_weight
+        return pack_decode_weight(w13), pack_decode_weight(w2)
 
 
 def finish_scatter(meta):
@@ -241,6 +242,7 @@ def prepare_step5_deepep(method, layer, int4):
     if method.moe.moe_parallel_config.enable_eplb:
         raise ValueError("Step5 packed weights require static expert placement")
     gemm_op()
+    shared_reduce_op()
     quant = method.get_fused_moe_quant_config(layer)
     prepare = maybe_make_prepare_finalize(moe=method.moe, quant_config=quant,
         routing_tables=layer._expert_routing_tables(), allow_new_interface=True,
@@ -297,11 +299,40 @@ def prepare_step5_deepep(method, layer, int4):
 
 def pad_token_rows(x, multiple):
     padding = (-x.shape[0]) % multiple
-    return torch.nn.functional.pad(x, (0, 0, 0, padding)) if padding else x
+    # Keep modulo padding in the dynamic graph. A Python ``if padding``
+    # specializes the no-pad sample and breaks vLLM's range-compiled graph
+    # when it is subsequently used for a non-divisible token count.
+    return torch.nn.functional.pad(x, (0, 0, 0, padding))
 
 
 def shared_expert_token_slice(shared, tp_group):
     """Sum TP weight shards and scatter token rows in one collective."""
     if tp_group.world_size == 1:
         return shared
-    return tp_group.reduce_scatter(pad_token_rows(shared, tp_group.world_size), dim=0)
+    return shared_reduce_op()(shared, tp_group.world_size, tp_group.unique_name)
+
+
+def _shared_reduce_impl(x: torch.Tensor, tp_size: int, group_name: str) -> torch.Tensor:
+    from vllm.distributed import get_tp_group
+    group = get_tp_group()
+    if group.world_size != tp_size or group.unique_name != group_name:
+        raise RuntimeError("Step5 shared expert TP group changed")
+    # This branch runs inside the opaque op on real shapes, not in Dynamo.
+    padded = x if x.shape[0] % tp_size == 0 else pad_token_rows(x, tp_size)
+    return group.reduce_scatter(padded, dim=0)
+
+
+def _shared_reduce_fake(x: torch.Tensor, tp_size: int, group_name: str) -> torch.Tensor:
+    rows = (x.shape[0] + tp_size - 1) // tp_size
+    return x.new_empty((rows, *x.shape[1:]))
+
+
+@lru_cache(maxsize=1)
+def shared_reduce_op():
+    try:
+        return torch.ops.vllm.step5_shared_reduce_scatter.default
+    except AttributeError:
+        from vllm.utils.torch_utils import direct_register_custom_op
+        direct_register_custom_op(op_name="step5_shared_reduce_scatter",
+            op_func=_shared_reduce_impl, mutates_args=[], fake_impl=_shared_reduce_fake)
+        return torch.ops.vllm.step5_shared_reduce_scatter.default
