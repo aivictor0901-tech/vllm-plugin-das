@@ -63,6 +63,7 @@ from vllm.utils.torch_utils import (
 )
 from vllm_hcu.platforms import envs as henvs
 from vllm_hcu.model_executor.layers.fused_moe.combine_runtime import (
+    early_ep_combine_allowed,
     ep_shared_add_allowed,
 )
 
@@ -147,6 +148,9 @@ class _EpFusedCombineState:
         # aux-stream output is not ready yet at finalize time.
         if (
             shared_experts is not None
+            and early_ep_combine_allowed(
+                get_forward_context().dp_metadata.get_chunk_sizes_across_dp_rank()
+            )
             and shared_experts._determine_shared_experts_order(shared_input)
             == SharedExpertsOrder.NO_OVERLAP
         ):
