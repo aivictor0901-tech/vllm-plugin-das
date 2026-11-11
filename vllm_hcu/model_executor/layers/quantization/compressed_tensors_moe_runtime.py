@@ -45,11 +45,14 @@ def _slimquant_w4a8_activation(method: object) -> tuple[str, float | None, float
     if activation is None:
         activation = "silu"
     if not getattr(moe, "_hcu_kimi_k3", False):
-        if str(activation) != "silu":
+        # swiglustep (Step5) runs on AITER MOE_C, which applies it through
+        # _apply_activation with the default 7.0 clamp.
+        if str(activation) not in ("silu", "swiglustep"):
             raise HcuCompressedTensorsMoeError(
-                "SlimQuant W4A8 supports only silu activation outside Kimi-K3"
+                "SlimQuant W4A8 supports only silu and swiglustep activation "
+                "outside Kimi-K3"
             )
-        return "silu", None, None
+        return str(activation), None, None
     if str(activation) != "situ":
         raise HcuCompressedTensorsMoeError(
             "Kimi-K3 SlimQuant W4A8 requires SiTU activation"
@@ -827,6 +830,10 @@ _BOLTOPS_W4A8_FUSED_EXPERTS_CONTRACT = (
     ("gemm1_limit", None),
     ("activation_situ_beta", None),
     ("activation_situ_linear_beta", None),
+    ("use_mxfp4_w4a8", False),
+    ("use_ue8m0", False),
+    ("use_mxfp8", False),
+    ("gemm1_beta", None),
 )
 
 
@@ -1125,10 +1132,11 @@ def apply_aiter_w4a8_moe(
             fused_experts_impl,
         )
         # The explicit vLLM/Triton fallback consumes unpacked signed INT4
-        # values.  Its scale convention needs the high-nibble x16
-        # compensation; AITER MOE_C must receive the raw checkpoint scale.
-        fallback_w1_scale = w1_scale * 16.0
-        fallback_w2_scale = w2_scale * 16.0
+        # values (-8..7, see _unpack_slimquant_w4a8_tensor), so the raw
+        # per-channel checkpoint scale is already correct.  A x16 factor here
+        # inflates the MoE output 16x and overflows to NaN for Step5.
+        fallback_w1_scale = w1_scale
+        fallback_w2_scale = w2_scale
         return fused_experts_impl(
             hidden_states,
             fallback_w1,
@@ -1276,6 +1284,99 @@ def apply_vllm_w4a8_moe(
         a2_scale=getattr(quant_config, "a2_scale", None),
         block_shape=None,
         routed_scaling_factor=1.0,
+    )
+
+
+@functools.lru_cache(maxsize=1)
+def _step5_boltops_packed_experts() -> Callable[..., torch.Tensor]:
+    """BoltOps fused_experts with packed-INT4 W4A8 and gated swiglustep support."""
+
+    from vllm_hcu.model_executor.layers.quantization.ct_w4a8_step5 import (
+        _packed_w4a8_experts,
+    )
+
+    return _packed_w4a8_experts()
+
+
+def prepare_step5_boltops_w4a8_moe(method: object, layer: object) -> None:
+    """Keep the checkpoint's packed INT4 experts as they are for BoltOps.
+
+    No AITER MOE_C layout is installed and nothing is expanded to INT8, so the
+    weights stay at 0.5 byte/element.  Fails at load time (not at the first
+    request) when BoltOps lacks the packed W4A8 swiglustep interface.
+    """
+
+    _step5_boltops_packed_experts()
+    _slimquant_w4a8_metadata(method, layer)
+    method._supports_int8_allgatherv_input = False
+    method.moe_quant_config = method.get_fused_moe_quant_config(layer)
+    mark_aiter_moe_native_layout(layer)
+
+
+def apply_step5_boltops_w4a8_moe(
+    method: object,
+    layer: object,
+    hidden_states: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+) -> torch.Tensor:
+    """Step5 packed INT4 W4A8 MoE through BoltOps (gfx936: AITER MOE_C GEMMs never execute).
+
+    The checkpoint scale is already the true per-channel scale for the packed
+    signed nibbles, so it is passed unchanged (the x16 used by
+    ``apply_vllm_w4a8_moe`` is wrong here).  Every token must name distinct
+    experts, which any top-k router guarantees.
+    """
+
+    if (
+        hidden_states.ndim != 2
+        or topk_weights.ndim != 2
+        or topk_ids.ndim != 2
+        or topk_weights.shape != topk_ids.shape
+        or topk_ids.shape[0] != hidden_states.shape[0]
+    ):
+        raise HcuCompressedTensorsMoeError(
+            "SlimQuant W4A8 requires matching rank-2 hidden and top-k tensors"
+        )
+    if hidden_states.dtype not in (torch.bfloat16, torch.float16):
+        raise HcuCompressedTensorsMoeError(
+            "Step5 BoltOps W4A8 requires BF16/FP16 activations"
+        )
+    w1, w2, logical_k, activation = _slimquant_w4a8_metadata(method, layer)
+    if int(hidden_states.shape[1]) != logical_k:
+        raise HcuCompressedTensorsMoeError(
+            "SlimQuant W4A8 hidden states do not match the weight logical K"
+        )
+    if hidden_states.shape[0] == 0:
+        return torch.empty_like(hidden_states)
+    quant_config = getattr(method, "moe_quant_config", None)
+    global_num_experts = getattr(
+        layer,
+        "global_num_experts",
+        getattr(getattr(method, "moe", None), "num_experts", int(w1.shape[0])),
+    )
+    expert_map = getattr(layer, "_expert_map", getattr(layer, "expert_map", None))
+    limit = None
+    if activation == "swiglustep":
+        limit = float(getattr(layer, "swiglu_limit", None) or 7.0)
+    return _step5_boltops_packed_experts()(
+        hidden_states.contiguous(),
+        w1,
+        w2,
+        topk_weights.to(torch.float32),
+        topk_ids.to(torch.int32),
+        inplace=False,
+        activation=activation,
+        is_gated=True,
+        use_int4_w4a8=True,
+        per_channel_quant=True,
+        w1_scale=_required_tensor(quant_config, "w1_scale"),
+        w2_scale=_required_tensor(quant_config, "w2_scale"),
+        expert_map=expert_map,
+        global_num_experts=int(global_num_experts),
+        output_dtype=hidden_states.dtype,
+        routed_scaling_factor=1.0,
+        gemm1_limit=limit,
     )
 
 

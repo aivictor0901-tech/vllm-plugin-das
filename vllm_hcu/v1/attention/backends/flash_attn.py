@@ -52,6 +52,7 @@ _SWA_DECODE_ENABLED = henvs.optional_custom_op_enabled(
 if _SWA_DECODE_ENABLED:
     # Import during backend initialization so Triton provider setup happens
     # before tracing/capture, while master-off never imports the provider.
+    from vllm_hcu.v1.attention.backends.swa_prefill import swa_prefill_fp8_d192
     from vllm_hcu.v1.attention.backends.swa_decode import (
         can_use_swa_decode_fp8_d192,
         swa_decode_fp8_d192,
@@ -322,10 +323,10 @@ class HcuFlashAttentionBackend(AttentionBackend):
     @staticmethod
     def get_fp8_dtype_for_flashattn(kv_cache_dtype: str) -> torch.dtype:
         if kv_cache_dtype in ("fp8", "fp8_e4m3"):
-            if torch.cuda.get_device_properties("cuda").gcnArchName.split(':')[0] == "gfx938":
+            if torch.cuda.get_device_properties("cuda").gcnArchName.split(':')[0] in ("gfx936", "gfx938"):
                 return torch.float8_e4m3fn
             else:
-                raise ValueError(f"{kv_cache_dtype} only supported on nmz")
+                raise ValueError(f"{kv_cache_dtype} requires gfx936 or gfx938")
         elif kv_cache_dtype in ("fp8_e5m2"):
             return torch.float8_e5m2
         else:
@@ -378,6 +379,13 @@ class HcuFlashAttentionBackend(AttentionBackend):
         use_mm_prefix: bool,
         device_capability: DeviceCapability,
     ) -> str | None:
+        if (
+            kv_cache_dtype in ("fp8", "fp8_e4m3")
+            and torch.cuda.get_device_properties("cuda").gcnArchName.split(":")[0] == "gfx936"
+            and (head_size != 192 or dtype != torch.bfloat16
+                 or block_size not in (None, 64, 128) or has_sink or use_mla)
+        ):
+            return "gfx936 E4M3 requires BF16 D192 SWA, page64/128, no sinks/MLA"
         if has_sink and device_capability < DeviceCapability(9, 0):
             return "sink not supported on compute capability < 9.0"
         if use_mm_prefix:
@@ -953,8 +961,26 @@ class FlashAttentionImpl(AttentionImpl):
         # The upstream query quantizer emits the platform E4M3 dtype. The
         # vendor E5M2 KV reader requires compute-dtype queries instead of
         # this mixed FP8 pair; keep native E5M2 K/V storage unchanged.
+        self._gfx936_fp8_swa = (
+            self.kv_cache_dtype in ("fp8", "fp8_e4m3")
+            and torch.cuda.get_device_properties("cuda").gcnArchName.split(":")[0] == "gfx936"
+        )
+        if self._gfx936_fp8_swa and not (
+            _SWA_DECODE_ENABLED and henvs.VLLM_HCU_USE_CUSTOM_OPS
+            and head_size == 192 and self.sliding_window[0] >= 0
+            and attn_type == AttentionType.DECODER and alibi_slopes is None
+            and logits_soft_cap == 0 and sinks is None
+            and num_heads % num_kv_heads == 0
+            and self.num_queries_per_kv == 16
+            and self.dcp_world_size == 1 and self.pcp_world_size == 1
+        ):
+            raise NotImplementedError(
+                "gfx936 E4M3 supports only D192 GQA16 causal SWA, no sinks/ALiBi/softcap, "
+                "DCP=PCP=1, native custom ops and SWA decode enabled"
+            )
         self.supports_quant_query_input = (
-            self.kv_cache_dtype != "fp8_e5m2"
+            not self._gfx936_fp8_swa
+            and self.kv_cache_dtype != "fp8_e5m2"
             and flash_attn_supports_quant_query_input()
         )
 
@@ -1079,6 +1105,34 @@ class FlashAttentionImpl(AttentionImpl):
             )
             key_cache = key_cache.view(dtype)
             value_cache = value_cache.view(dtype)
+
+        if self._gfx936_fp8_swa:
+            window = _get_native_sliding_window(
+                attn_metadata.sliding_window, self.sliding_window, attn_metadata.causal
+            )
+            if not (
+                attn_metadata.causal is True and not attn_metadata.use_cascade
+                and window is not None and window[0] >= 0 and window[1] == 0
+                and query.dtype == output.dtype == torch.bfloat16
+                and key_cache.shape[1] in (64, 128)
+                and layer._k_scale_float == layer._v_scale_float == 1.0
+            ):
+                raise NotImplementedError(
+                    "gfx936 E4M3 requires BF16 causal SWA, page64/128, unit KV scales, "
+                    "and no cascade attention"
+                )
+            args = (
+                query[:num_actual_tokens], key_cache, value_cache,
+                output[:num_actual_tokens], attn_metadata.query_start_loc,
+                attn_metadata.seq_lens, attn_metadata.block_table,
+            )
+            if attn_metadata.max_query_len <= 4:
+                logger.info_once("[HCU FLASH_ATTN PATH] gfx936 E4M3 SWA decode (BF16 compute)", scope="local")
+                swa_decode_fp8_d192(*args, self.scale, window[0])
+            else:
+                logger.info_once("[HCU FLASH_ATTN PATH] gfx936 E4M3 SWA prefill (BF16 compute)", scope="local")
+                swa_prefill_fp8_d192(*args, attn_metadata.max_query_len, self.scale, window[0])
+            return output
 
         if not attn_metadata.use_cascade:
             cu_seqlens_q = attn_metadata.query_start_loc

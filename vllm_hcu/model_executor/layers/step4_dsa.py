@@ -3175,8 +3175,14 @@ class Step4DSAState:
             # needs its head again. Keep every region closed here recoverable:
             # write it back whole and retire (not release) its row at step end.
             keep_rows: list[tuple[int, int]] = []
-            if 1 < qlen <= self.spec_query_len:
-                for j in range(nregions):
+            if 1 < qlen <= self.spec_query_len or (
+                getattr(self, "pd_keep_prefill_tail", False) and not tail
+            ):
+                # A PD consumer replays token N-1. If prefill closes its
+                # region, retain that final region's raw indexer inputs too.
+                keep_indices = (range(nregions) if 1 < qlen <= self.spec_query_len
+                                else (nregions - 1,))
+                for j in keep_indices:
                     if nbuf - j * region < region:
                         break
                     slot = slots[len(slots) - nregions + j]

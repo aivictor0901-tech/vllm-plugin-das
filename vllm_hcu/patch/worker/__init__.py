@@ -226,6 +226,7 @@ _CORE_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(_adapter("core_fix", "patch_gpt_oss_mlp_block")),
     _CallbackSpec(_adapter("core_fix", "patch_kimi_k25_vision_conv")),
     _CallbackSpec(_adapter("core_fix", "patch_glm5next_channel_fp8")),
+    _CallbackSpec(_adapter("core_fix", "patch_glm53_kda_cp")),
     _CallbackSpec(_adapter("core_fix", "patch_qwen3_5_mamba_state_dtype")),
     _CallbackSpec(_adapter("core_fix", "patch_qwen3_5_mtp_shared_gate")),
     _CallbackSpec(_adapter("core_fix", "patch_qwen3_dflash_nn_layout")),
@@ -244,6 +245,7 @@ _CORE_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(_adapter("core_fix", "patch_qwen4_exp_ple_prefetch")),
     _CallbackSpec(_adapter("core_fix", "patch_qwen4_exp_ple_cudagraph")),
     _CallbackSpec(_adapter("core_fix", "patch_rocm_mla_sparse_metadata")),
+    _CallbackSpec(_adapter("core_fix", "patch_step5_ct_w4a8")),
 )
 
 
@@ -273,6 +275,7 @@ _OP_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(_adapter("op_opt", "patch_kimi_k3_cpu_metadata")),
     _CallbackSpec(_adapter("op_opt", "patch_kimi_k3_eplb_model")),
     _CallbackSpec(_adapter("op_opt", "patch_kimi_k3_reference_paths")),
+    _CallbackSpec(_adapter("op_opt", "patch_kimi_k3_pp_aux")),
     _CallbackSpec(_adapter("op_opt", "patch_kimi_k3_mla_gate")),
     # Must be applied after reference_paths: it wraps the
     # forward_attn_residual that adapter installs and captures it as the
@@ -307,6 +310,8 @@ _OP_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(_adapter("op_opt", "patch_compressed_tensors_moe_w8a8_fp8")),
     _CallbackSpec(_adapter("op_opt", "patch_compressed_tensors_moe_w4a8")),
     _CallbackSpec(_adapter("op_opt", "patch_compressed_tensors_moe_wna16")),
+    _CallbackSpec(_adapter("op_opt", "patch_compressed_tensors_moe_w4a8_int8")),
+    _CallbackSpec(_adapter("op_opt", "patch_step5_compressed_tensors_w4a8")),
 )
 
 

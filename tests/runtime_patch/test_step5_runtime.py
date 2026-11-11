@@ -26,6 +26,7 @@ ADAPTERS = (
     "vllm_hcu.patch.worker.framework_opt.patch_step5_moe_combine",
     "vllm_hcu.patch.worker.framework_opt.patch_step5_token_fp8",
     "vllm_hcu.patch.worker.framework_opt.patch_step5_skinny_lm_head",
+    "vllm_hcu.patch.worker.op_opt.patch_step5_compressed_tensors_w4a8",
     "vllm_hcu.patch.worker.framework_opt.patch_step5_eplb_communicator",
     "vllm_hcu.patch.worker.framework_opt.patch_step5_eplb_transfer",
     "vllm_hcu.patch.worker.framework_opt.patch_step5_eplb_async_worker",
@@ -540,7 +541,16 @@ def test_quantization_import_before_worker_dispatch_keeps_combine_hook_owned():
 
     env = os.environ.copy()
     env["VLLM_HCU_EP_FUSED_COMBINE"] = "1"
-    script = "from vllm_hcu.patch.platform import apply_platform_patches; apply_platform_patches(); import vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors; from vllm_hcu.model_executor.layers.fused_moe import combine_runtime; assert callable(combine_runtime._combine_hook); from vllm_hcu.patch import IMPORT_COORDINATOR; assert not any(r.patch_id == 'worker.framework_opt.step5_moe_combine' for r in IMPORT_COORDINATOR.registrations())"
+    script = (
+        "from vllm_hcu.patch.platform import apply_platform_patches; apply_platform_patches(); "
+        "import vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors; "
+        "from vllm_hcu.model_executor.layers.fused_moe import combine_runtime, moe_runner; "
+        "assert combine_runtime._combine_hook is None; "
+        "moe_runner._install_step5_combine_hooks(); "
+        "assert callable(combine_runtime._combine_hook); "
+        "from vllm_hcu.patch import IMPORT_COORDINATOR; "
+        "assert not any(r.patch_id == 'worker.framework_opt.step5_moe_combine' for r in IMPORT_COORDINATOR.registrations())"
+    )
     result = subprocess.run(
         [sys.executable, "-c", script], env=env, capture_output=True, text=True
     )

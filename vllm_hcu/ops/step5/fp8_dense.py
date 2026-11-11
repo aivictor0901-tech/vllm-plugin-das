@@ -13,6 +13,13 @@ On gfx938 it beats the bf16 hipBLASLt GEMM at every decode and prefill size of
 these shapes (M=64: o_proj 29.5 -> 16.2 us, MLP down 39.5 -> 18.0 us; M>=2k:
 1.6-1.7x), except that N not divisible by 256 hits a ~70 us slow path, so N is
 padded to a multiple of 256 with zero rows and the caller drops the pad columns.
+
+gfx936 has no fp8 W8A8 hipBLASLt kernels (library_gfx936 ships only int8 ones;
+the fp8 call finds no algorithm and then faults), so there the same scheme runs
+in int8: weights and activations are quantized to int8 with the same per-channel
+and per-token absmax scales. VLLM_HCU_STEP5_DENSE_QUANT=auto|fp8|int8 selects it
+(auto: int8 on gfx936, fp8 elsewhere). The GEMM dispatches on the activation
+dtype, and the quantizers on the weight dtype, so traced code reads no global.
 """
 
 import os
@@ -23,7 +30,45 @@ from vllm.utils.torch_utils import direct_register_custom_op
 from vllm_hcu.platforms import envs as henvs
 
 FP8_MAX = 448.0
+INT8_MAX = 127.0
 N_ALIGN = 256
+_DENSE_QUANT_ENV = "VLLM_HCU_STEP5_DENSE_QUANT"
+_dense_dtype: torch.dtype | None = None
+
+
+def dense_dtype() -> torch.dtype:
+    """Quantized dtype of the Step5 dense linears; resolved once per process.
+
+    Call it from construction/load code (it may query the device), not from
+    code under torch.compile.
+    """
+    global _dense_dtype
+    if _dense_dtype is None:
+        mode = os.environ.get(_DENSE_QUANT_ENV, "auto").strip().lower()
+        if mode == "auto":
+            arch = torch.cuda.get_device_properties(
+                torch.cuda.current_device()
+            ).gcnArchName.split(":")[0]
+            mode = "int8" if arch == "gfx936" else "fp8"
+        if mode not in ("fp8", "int8"):
+            raise ValueError(f"{_DENSE_QUANT_ENV} must be auto, fp8 or int8, got {mode!r}")
+        _dense_dtype = torch.int8 if mode == "int8" else torch.float8_e4m3fn
+    return _dense_dtype
+
+
+def int8_dense() -> bool:
+    return dense_dtype() is torch.int8
+
+
+def _quantize(x: torch.Tensor, scale: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    """``x / scale`` as ``dtype`` (fp8 e4m3 or int8), saturating."""
+    if dtype is torch.int8:
+        return (x / scale).round().clamp(-INT8_MAX, INT8_MAX).to(torch.int8)
+    return (x / scale).clamp(-FP8_MAX, FP8_MAX).to(dtype)
+
+
+def _qmax(dtype: torch.dtype) -> float:
+    return INT8_MAX if dtype is torch.int8 else FP8_MAX
 _TUNED_DENSE = henvs.optional_custom_op_enabled(
     os.environ.get("HCU_STEP5_DENSE_TUNING", "0") == "1"
 )
@@ -31,29 +76,33 @@ _TUNED_DENSE = henvs.optional_custom_op_enabled(
 
 @torch.no_grad()
 def quantize_weight_fp8(w_kn: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """bf16 ``[K, N]`` -> (fp8 ``[Np, K]`` contiguous, fp32 scale ``[Np, 1]``).
+    """bf16 ``[K, N]`` -> (fp8/int8 ``[Np, K]`` contiguous, fp32 scale ``[Np, 1]``).
 
-    Np is N rounded up to N_ALIGN; pad rows are zero with scale 1.
+    Np is N rounded up to N_ALIGN; pad rows are zero with scale 1. The dtype is
+    ``dense_dtype()``.
     """
     K, N = w_kn.shape
+    dtype = dense_dtype()
     n_pad = -N % N_ALIGN
-    q = torch.zeros(N + n_pad, K, device=w_kn.device, dtype=torch.float8_e4m3fn)
+    q = torch.zeros(N + n_pad, K, device=w_kn.device, dtype=dtype)
     scale = torch.ones(N + n_pad, 1, device=w_kn.device, dtype=torch.float32)
     # Chunked over N so the fp32 temporaries stay small.
     for n0 in range(0, N, 1024):
         w = w_kn[:, n0 : n0 + 1024].t().float()
-        s = (w.abs().amax(dim=1, keepdim=True) / FP8_MAX).clamp_min(1e-12)
-        q[n0 : n0 + w.shape[0]] = (w / s).clamp(-FP8_MAX, FP8_MAX).to(q.dtype)
+        s = (w.abs().amax(dim=1, keepdim=True) / _qmax(dtype)).clamp_min(1e-12)
+        q[n0 : n0 + w.shape[0]] = _quantize(w, s, dtype)
         scale[n0 : n0 + w.shape[0]] = s
     return q, scale
 
 
-def quant_per_token_fp8(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """bf16 ``[M, K]`` -> (fp8 ``[M, K]``, fp32 scale ``[M, 1]``), in torch ops so
-    that Inductor fuses it into whatever produced x."""
+def quant_per_token_fp8(
+    x: torch.Tensor, dtype: torch.dtype = torch.float8_e4m3fn
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """bf16 ``[M, K]`` -> (fp8/int8 ``[M, K]``, fp32 scale ``[M, 1]``), in torch
+    ops so that Inductor fuses it into whatever produced x."""
     xf = x.float()
-    s = (xf.abs().amax(dim=-1, keepdim=True) / FP8_MAX).clamp_min(1e-12)
-    return (xf / s).clamp(-FP8_MAX, FP8_MAX).to(torch.float8_e4m3fn), s
+    s = (xf.abs().amax(dim=-1, keepdim=True) / _qmax(dtype)).clamp_min(1e-12)
+    return _quantize(xf, s, dtype), s
 
 
 def _step5_fp8_gemm(
@@ -63,7 +112,9 @@ def _step5_fp8_gemm(
     N = wq.shape[0]
     if M == 0:
         return torch.empty(0, N, device=xq.device, dtype=torch.bfloat16)
-    if henvs.optional_custom_op_enabled(_TUNED_DENSE):
+    if henvs.optional_custom_op_enabled(_TUNED_DENSE) and (
+        xq.dtype is torch.float8_e4m3fn
+    ):
         from .fp8_dense_tuned import tuned_fp8_gemm
 
         out = tuned_fp8_gemm(xq, xs, wq, ws)
@@ -100,7 +151,7 @@ def fp8_linear(
     With ``n=None`` the pad columns are kept (for callers that split anyway).
     """
     lead = x.shape[:-1]
-    xq, xs = quant_per_token_fp8(x.reshape(-1, x.shape[-1]))
+    xq, xs = quant_per_token_fp8(x.reshape(-1, x.shape[-1]), wq.dtype)
     out = torch.ops.vllm.step5_fp8_gemm(xq, xs, wq, ws)
     if n is not None and n != wq.shape[0]:
         out = out[:, :n]

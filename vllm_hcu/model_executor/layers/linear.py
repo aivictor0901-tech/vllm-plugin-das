@@ -5,6 +5,7 @@
 
 import os
 import itertools
+import contextlib
 from abc import abstractmethod
 from collections.abc import Callable, Iterable
 
@@ -50,6 +51,46 @@ from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
+
+# Placeholder weight storage. Inside ``lazy_weight_storage()`` an unquantized
+# linear allocates one element expanded to the full weight shape (stride 0), so
+# the layer reports its real shape but holds no memory. The owner materializes
+# the weight with ``materialize_lazy_weight`` right before its loader runs.
+_LAZY_WEIGHT_STORAGE = False
+
+
+@contextlib.contextmanager
+def lazy_weight_storage(enabled: bool = True):
+    global _LAZY_WEIGHT_STORAGE
+    previous = _LAZY_WEIGHT_STORAGE
+    _LAZY_WEIGHT_STORAGE = previous or enabled
+    try:
+        yield
+    finally:
+        _LAZY_WEIGHT_STORAGE = previous
+
+
+def _empty_weight(*shape: int, dtype: torch.dtype) -> torch.Tensor:
+    if _LAZY_WEIGHT_STORAGE:
+        return torch.empty(1, dtype=dtype).expand(*shape)
+    return torch.empty(*shape, dtype=dtype)
+
+
+def is_lazy_weight(weight: torch.Tensor) -> bool:
+    """Whether ``weight`` is a placeholder from ``lazy_weight_storage``."""
+    return weight.dim() > 0 and weight.numel() > 1 and all(
+        stride == 0 for stride in weight.stride()
+    )
+
+
+def materialize_lazy_weight(weight: Parameter) -> bool:
+    """Give a placeholder weight real storage. Returns False if it had some."""
+    if not is_lazy_weight(weight):
+        return False
+    weight.data = torch.empty(
+        tuple(weight.shape), dtype=weight.dtype, device=weight.device
+    )
+    return True
 
 WEIGHT_LOADER_V2_SUPPORTED = [
     "UnquantizedLinearMethod",
@@ -229,7 +270,7 @@ class UnquantizedLinearMethod(LinearMethodBase):
         weight_loader = extra_weight_attrs.pop("weight_loader")
         if henvs.VLLM_USE_NN:
             weight = ModelWeightParameter(
-                data=torch.empty(
+                data=_empty_weight(
                     input_size_per_partition,
                     sum(output_partition_sizes),
                     dtype=params_dtype,
@@ -240,7 +281,7 @@ class UnquantizedLinearMethod(LinearMethodBase):
             )
         else:
             weight = ModelWeightParameter(
-                data=torch.empty(
+                data=_empty_weight(
                     sum(output_partition_sizes),
                     input_size_per_partition,
                     dtype=params_dtype,
