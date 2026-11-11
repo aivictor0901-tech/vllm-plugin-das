@@ -235,6 +235,10 @@ def apply_to_module(module: ModuleType) -> bool:
                 activation_key,
                 allow_vllm_cutlass,
             )
+        if getattr(config, "_hcu_step5_deepep_mixed_fp8", False):
+            # Fixed HT/LL uses the same Step5-specific load adapter as auto.
+            from vllm_hcu.model_executor.layers.fused_moe.step5_deepep import Step5FP8HTExperts
+            return hcu_enum.HCU_DEEPGEMM, Step5FP8HTExperts
         activation_format = (
             target.mk.FusedMoEActivationFormat.BatchedExperts
             if config.moe_parallel_config.use_batched_activation_format

@@ -11,6 +11,7 @@ import torch.distributed as dist
 root=Path(sys.argv[1]);root.mkdir(parents=True,exist_ok=True)
 rank=int(os.environ['LOCAL_RANK'])
 tp=int(os.getenv('STEP5_TEST_TP','4'));pp=int(os.getenv('STEP5_TEST_PP','1'));dp=8//tp//pp
+backend=os.getenv('STEP5_TEST_BACKEND','deepep_auto')
 record=dict(rank=rank,tp=tp,dp=dp,pp=pp,passed=False,tests=[])
 def save():(root/f'block-rank-{rank}.json').write_text(json.dumps(record,indent=2))
 try:
@@ -26,7 +27,7 @@ try:
         pipeline_parallel_size=pp,enable_expert_parallel=True,
         distributed_executor_backend='mp' if pp>1 else 'external_launcher',
         max_model_len=1024,max_num_batched_tokens=128,max_num_seqs=16,
-        disable_custom_all_reduce=True,all2all_backend='deepep_auto',moe_backend='deep_gemm',
+        disable_custom_all_reduce=True,all2all_backend=backend,moe_backend='deep_gemm',
         **(dict(data_parallel_rank=rank//(tp*pp)) if dp>1 else {}))
     cfg=args.create_engine_config()
     # The production Step3p7 multimodal wrapper constructs its text model
@@ -133,15 +134,16 @@ try:
                     with context(prefill):result=run().clone()
                 finally:
                     for obj,name,original in reversed(restore):setattr(obj,name,original)
-                dispatch='dispatch' if prefill else 'low_latency_dispatch'
-                combine='combine' if prefill else 'low_latency_combine'
+                use_ll=backend=='deepep_low_latency' or (backend=='deepep_auto' and not prefill)
+                dispatch='low_latency_dispatch' if use_ll else 'dispatch'
+                combine='low_latency_combine' if use_ll else 'combine'
                 assert sum(e['op']==dispatch for e in events)==1,events
                 assert sum(e['op']==combine for e in events)==1,events
                 assert not any(e['op'].startswith('dp.') or e['op'].endswith('all_reduce')
                                or e['op'].endswith('dispatch_router_logits') for e in events),events
                 assert next(e['rows'] for e in events if e['op']==dispatch)==(x.shape[0]+tp-1)//tp
                 record['tests'].append(dict(stage='communication_audit',layer=layer_id,
-                    phase='HT' if prefill else 'LL',events=events));save()
+                    phase='LL' if use_ll else 'HT',events=events));save()
                 return result
             def compare(a,b,limit=.025):
                 aa,bb=a.cpu().float(),b.cpu().float();delta=aa-bb

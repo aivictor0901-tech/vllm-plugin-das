@@ -165,6 +165,9 @@ class Step5LLExperts(BatchedDeepGemmExperts):
 class Step5FP8LLExperts(Step5LLExperts):
     # Reuse the library-specific FP8 packers and logical-shape decoder.
     _pack_channel_weights = DeepEPDeepGemmMaskedExperts._pack_channel_weights
+    process_weights_after_loading = DeepEPDeepGemmMaskedExperts.process_weights_after_loading
+    _can_pack_channel_weights = staticmethod(DeepEPDeepGemmMaskedExperts._can_pack_channel_weights)
+    _packed_deepgemm_problem_shape = staticmethod(DeepEPDeepGemmMaskedExperts._packed_deepgemm_problem_shape)
     WEIGHT_LAYOUT = "masked"
 
 

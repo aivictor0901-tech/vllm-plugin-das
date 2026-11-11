@@ -3292,6 +3292,21 @@ def test_fp8_oracle_sidecar_selection_and_format_contract(
     )
     assert step5_backend is backend
     assert step5_experts is SupportedExperts
+    monkeypatch.setattr(
+        patch_fp8_oracle, "_sidecar_config",
+        lambda config: SimpleNamespace(deepep_auto=False, moe_backend="deep_gemm"),
+    )
+    config.moe_backend = "deep_gemm"
+    fixed_backend, fixed_experts = module.select_fp8_moe_backend(
+        config, kFp8StaticChannelSym, kFp8DynamicTokenSym,
+    )
+    assert fixed_backend is backend
+    assert fixed_experts is SupportedExperts
+    config.moe_backend = "auto"
+    monkeypatch.setattr(
+        patch_fp8_oracle, "_sidecar_config",
+        lambda config: SimpleNamespace(deepep_auto=True, moe_backend="auto"),
+    )
     with pytest.raises(ValueError, match="only channel-wise"):
         module.select_fp8_moe_backend(
             config, kFp8Static128BlockSym, kFp8Dynamic128Sym,

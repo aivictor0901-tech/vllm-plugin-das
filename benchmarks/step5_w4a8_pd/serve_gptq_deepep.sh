@@ -63,7 +63,7 @@ args=("${SERVER_PYTHON:-python3}" -m vllm.entrypoints.cli.main serve "$model"
     --quantization compressed-tensors
     --tensor-parallel-size "${TP:-4}" --data-parallel-size "${DP:-2}"
     --pipeline-parallel-size "${PP:-1}" --enable-expert-parallel
-    --all2all-backend deepep_auto --moe-backend deep_gemm
+    --all2all-backend "${ALL2ALL_BACKEND:-deepep_auto}" --moe-backend deep_gemm
     --max-num-batched-tokens "${CHUNK_SIZE:-8192}"
     --max-model-len "${MAX_MODEL_LEN:-139264}" --max-num-seqs "${MAX_NUM_SEQS:-64}"
     --max-cudagraph-capture-size "${MAX_CUDAGRAPH_CAPTURE_SIZE:-256}"

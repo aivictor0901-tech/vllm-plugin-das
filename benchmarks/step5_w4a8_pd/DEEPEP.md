@@ -4,6 +4,10 @@
 pure decode, using the scheduler's globally synchronized phase. It keeps the
 existing AG/RS launch recipes available separately.
 
+Set `ALL2ALL_BACKEND=deepep_low_latency` to pin a Decode service to LL, or
+`deepep_high_throughput` to pin HT. Fixed LL supports the mixed FP8 layers too;
+the `STEP5_TEST_BACKEND` variable selects these modes in the block probe.
+
 ```bash
 MODEL_PATH=/model/step-5-preview-channel-w4a8-GPTQ \
 TP=4 DP=2 PP=1 CHUNK_SIZE=8192 \
