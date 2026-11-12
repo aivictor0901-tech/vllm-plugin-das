@@ -3,6 +3,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 from __future__ import annotations
 from types import ModuleType
+
+import torch
+
 from vllm_hcu.runtime_compat.step5_patch_contract import (
     already_applied,
     remember_targets,
@@ -47,6 +50,42 @@ def apply_to_module(module: ModuleType) -> bool:
             and (self.head_dtype is None or self.head_dtype == hidden_states.dtype)
         ):
             from vllm_hcu.model_executor.layers import skinny_lm_head
+            from vllm_hcu.model_executor.layers import skinny_lm_head_int8
+
+            if embedding_bias is None and skinny_lm_head_int8.HcuLmHeadInt8Storage.matches(
+                lm_head
+            ):
+                if skinny_lm_head_int8.usable_int8(
+                    hidden_states, lm_head.weight, lm_head.weight_scale
+                ):
+                    target.logger.info_once(
+                        "lm_head: using the INT8 skinny Triton GEMM for M <= %d",
+                        skinny_lm_head_int8.MAX_M,
+                    )
+                    return skinny_lm_head_int8.skinny_w8a8_linear(
+                        hidden_states, lm_head.weight, lm_head.weight_scale.reshape(-1)
+                    )
+                # Above the skinny range, hand the INT8 head to hipBLASLt. Its
+                # 256x256 macro tile is what makes it lose to the skinny
+                # schedule at M <= 64, and it is exactly what suits M > 64, so
+                # the weights never have to leave INT8. Dequantizing instead
+                # would materialize a bf16 copy of the whole shard (~132 MiB on
+                # the TP8 shard) on every call, since nothing caches it.
+                from vllm_hcu.model_executor.layers.quantization.int8_runtime import (
+                    apply_int8_linear,
+                )
+
+                target.logger.info_once(
+                    "lm_head: INT8 skinny GEMM covers M <= %d; using hipBLASLt "
+                    "W8A8 for larger batches",
+                    skinny_lm_head_int8.MAX_M,
+                )
+                return apply_int8_linear(
+                    hidden_states,
+                    lm_head.weight,
+                    lm_head.weight_scale,
+                    torch.bfloat16,
+                )
 
             if (
                 embedding_bias is None
