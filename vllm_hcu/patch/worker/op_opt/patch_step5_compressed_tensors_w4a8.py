@@ -301,6 +301,12 @@ def apply_to_module(module: ModuleType) -> bool:
     @functools.wraps(original)
     def hcu_get_moe_method(quant_config, layer, layer_name):
         if _is_step5_channel_w4a8(quant_config, layer, layer_name):
+            parallel = getattr(layer.moe_config, "moe_parallel_config", None)
+            if getattr(parallel, "all2all_backend", None) == "deepep_low_latency":
+                # The core_fix selector owns the Step5 packed INT4 LL kernel.
+                # The legacy BoltOps path leaves moe_kernel unset and sends
+                # MoERunner through unsupported dispatch_router_logits.
+                return original(quant_config, layer, layer_name)
             method_cls = _step5_method_class()
             return method_cls(quant_config, layer.moe_config)
         return original(quant_config, layer, layer_name)
