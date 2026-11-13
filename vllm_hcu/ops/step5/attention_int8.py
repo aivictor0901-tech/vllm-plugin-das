@@ -7,8 +7,8 @@ writes BF16 before LightOp quantizes the row. Keep that BF16 rounding boundary
 inside the fused kernel. Eager PyTorch additionally rounds sigmoid to BF16 and
 is a different reference; the model must retain its original eager path.
 
-This operation produces only an INT8 activation and its FP32 per-token scale.
-The owner still executes the existing native hipBLASLt o_proj and TP reduction.
+The gate and normalization producers preserve their BF16 rounding boundaries.
+Their owners retain the native hipBLASLt projections and TP reduction.
 """
 from __future__ import annotations
 
@@ -101,4 +101,74 @@ def gate_quant_int8(x: torch.Tensor, gate: torch.Tensor) -> tuple[torch.Tensor, 
     return torch.ops.vllm.step5_attention_gate_quant_int8(x, gate)
 
 
-__all__ = ["ATTN_INT8_MAX_M", "gate_quant_int8", "usable_gate_quant_int8"]
+
+def usable_norm_quant_int8(x: torch.Tensor, weight: torch.Tensor) -> bool:
+    """Metadata guard for the FP32 Step5 residual and Gemma weight."""
+    return (
+        x.is_cuda and x.ndim == 2 and x.dtype == torch.float32
+        and x.is_contiguous() and x.shape[1] == 4096
+        and 0 <= x.shape[0] <= ATTN_INT8_MAX_M
+        and weight.is_cuda and weight.dtype == torch.float32
+        and weight.ndim == 1 and weight.numel() == x.shape[1]
+        and weight.is_contiguous() and weight.device == x.device
+        # Dynamo cannot trace storage_offset() as a scalar graph output.
+        # The native entry validates alignment during compiled execution.
+        and (
+            torch.compiler.is_compiling()
+            or (x.storage_offset() % 8 == 0 and weight.storage_offset() % 8 == 0)
+        )
+    )
+
+
+def _norm_quant_int8(
+    x: torch.Tensor, weight: torch.Tensor, epsilon: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if x.shape[0] == 0:
+        return _norm_quant_int8_fake(x, weight, epsilon)
+    try:
+        from lightop.norm import gemma_rms_norm_per_token_int8_quant
+    except (ImportError, AttributeError) as exc:
+        raise RuntimeError(
+            "Step5 fused Norm+INT8 requires "
+            "lightop.norm.gemma_rms_norm_per_token_int8_quant"
+        ) from exc
+    normalized, quantized, scale, _ = gemma_rms_norm_per_token_int8_quant(
+        x, weight, epsilon,
+    )
+    return normalized, quantized, scale
+
+
+def _norm_quant_int8_fake(
+    x: torch.Tensor, weight: torch.Tensor, epsilon: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return (
+        torch.empty(x.shape, dtype=torch.bfloat16, device=x.device),
+        torch.empty(x.shape, dtype=torch.int8, device=x.device),
+        torch.empty((x.shape[0], 1), dtype=torch.float32, device=x.device),
+    )
+
+
+direct_register_custom_op(
+    op_name="step5_attention_norm_quant_int8", op_func=_norm_quant_int8,
+    mutates_args=[], fake_impl=_norm_quant_int8_fake,
+)
+
+
+def norm_quant_int8(
+    x: torch.Tensor, weight: torch.Tensor, epsilon: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return BF16 norm and its single INT8 quantization for the BLAS consumer.
+
+    The LightOp producer retains the Gemma FP32 computation and BF16 rounding
+    before calculating INT8 bytes and FP32 per-token scales. The FP32 residual
+    remains owned by the caller and is not modified.
+    """
+    if not usable_norm_quant_int8(x, weight):
+        raise ValueError("unsupported Step5 fused Norm+INT8 dtype, layout or dimensions")
+    return torch.ops.vllm.step5_attention_norm_quant_int8(x, weight, epsilon)
+
+
+__all__ = [
+    "ATTN_INT8_MAX_M", "gate_quant_int8", "usable_gate_quant_int8",
+    "norm_quant_int8", "usable_norm_quant_int8",
+]

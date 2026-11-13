@@ -188,6 +188,12 @@ QKV_INDEXER = henvs.optional_custom_op_enabled(
     os.environ.get("VLLM_HCU_STEP5_QKV_INDEXER", "0") == "1"
 )
 
+# Explicitly opt in to load-time INT8 quantization of the BF16 DSA indexer.
+# This appends its q/k/z/w rows to QKVG and shares its dynamic input quantizer.
+INT8_QKV_INDEXER = henvs.optional_custom_op_enabled(
+    os.environ.get("VLLM_STEP5_INT8_QKV_INDEXER", "0") == "1"
+)
+
 # Quantize the bf16 routed experts (layers 88-90) to fp8 per output channel at
 # load time, the scheme of the other layers' checkpoint experts, so they run the
 # same fp8 MoE path instead of the bf16 Triton experts. Channel (compressed-
@@ -224,6 +230,11 @@ INT8_QKVG_PAD256 = henvs.optional_custom_op_enabled(
 # while avoiding the intermediate gated-output allocation and readback.
 INT8_ATTN_GATE_QUANT = henvs.optional_custom_op_enabled(
     os.environ.get("VLLM_STEP5_INT8_ATTN_GATE_QUANT", "1") == "1"
+)
+
+# The LightOp producer emits BF16 norm and its single INT8 quantization.
+INT8_ATTN_NORM_QUANT = henvs.optional_custom_op_enabled(
+    os.environ.get("VLLM_STEP5_INT8_ATTN_NORM_QUANT", "0") == "1"
 )
 
 # Keep the main head in INT8 storage, with skinny decode GEMM or native W8A8.
@@ -1289,6 +1300,80 @@ class Step5Attention(nn.Module):
         sg.data = scales[nq:nq + ng].view(sg.shape)
         self.qkvg_int8_weight, self.qkvg_int8_scale = fused, scales
 
+    def _quantize_int8_indexer(self) -> None:
+        """Append load-time channel-INT8 indexer rows after linear finalization."""
+        if not INT8_QKV_INDEXER or self.indexer is None:
+            return
+        if getattr(self, "_int8_indexer_fused", False):
+            return
+        if (
+            not MIXED_DENSE_INT8 or MIXED_DENSE_DEQUANT
+            or self.qkvg_int8_weight is None
+        ):
+            raise ValueError(
+                "Step5 INT8 indexer fusion requires mixed INT8 QKVG and custom ops"
+            )
+
+        projections = (
+            self.sparse_indexer_q, self.sparse_indexer_k,
+            self.sparse_indexer_z, self.sparse_indexer_w,
+        )
+        k = self.qkvg_int8_weight.shape[1]
+        if any(
+            layer.weight.ndim != 2 or layer.weight.shape[1] != k
+            or layer.weight.device != self.qkvg_int8_weight.device
+            or not layer.weight.is_floating_point()
+            for layer in projections
+        ):
+            raise ValueError("Step5 INT8 indexer has incompatible q/k/z/w weights")
+
+        # Match the original merged projection: even checkpoint FP32 w is
+        # rounded to activation BF16 before it participates in a GEMM.
+        with torch.no_grad():
+            indexer = torch.cat(
+                [layer.weight.detach().to(torch.bfloat16) for layer in projections],
+                dim=0,
+            ).float()
+            if not bool(torch.isfinite(indexer).all()):
+                raise ValueError("Step5 INT8 indexer weights must be finite")
+            indexer_scale = indexer.abs().amax(dim=1, keepdim=True).clamp_min(1e-12) / 127.0
+            indexer_q = torch.round(indexer / indexer_scale).clamp_(-127, 127).to(torch.int8)
+
+            # Discard any old QKVG padding; the indexer begins immediately
+            # after the logical QKV+gate rows, never in a new gap.
+            nq = self.q_size + 2 * self.kv_size
+            logical_qkvg = nq + self.num_heads
+            self.idx_off, self.idx_n = logical_qkvg, indexer_q.shape[0]
+            logical_n = self.idx_off + self.idx_n
+            align = 256 if INT8_QKVG_PAD256 else 16
+            n = ((logical_n + align - 1) // align) * align
+            fused = torch.zeros((n, k), dtype=torch.int8, device=indexer_q.device)
+            scales = torch.ones((n, 1), dtype=torch.float32, device=indexer_q.device)
+            fused[:logical_qkvg].copy_(self.qkvg_int8_weight[:logical_qkvg])
+            scales[:logical_qkvg].copy_(self.qkvg_int8_scale[:logical_qkvg])
+            fused[self.idx_off:logical_n].copy_(indexer_q)
+            scales[self.idx_off:logical_n].copy_(indexer_scale)
+
+            # Rebind the original Parameter owners too, so the superseded
+            # QKVG allocation does not remain alive through their views.
+            for layer, start, end in (
+                (self.qkv_proj, 0, nq),
+                (self.g_proj, nq, logical_qkvg),
+            ):
+                layer.weight.data = fused[start:end]
+                layer.weight_scale.data = scales[start:end].view(layer.weight_scale.shape)
+            self.qkvg_int8_weight, self.qkvg_int8_scale = fused, scales
+            self.indexer.pre_projected = True
+            self.indexer._merged_w = None
+            self.indexer._param_cache = None
+            for layer in projections:
+                _free_weight(layer.weight)
+            self._int8_indexer_fused = True
+        logger.info(
+            "Step5 layer %s: QKVG/indexer fused INT8, logical N=%s, padded N=%s",
+            self.layer_idx, logical_n, n,
+        )
+
     def _quantize_qkvg(self) -> None:
         from vllm_hcu.ops.step5.fp8_dense import quantize_weight_fp8
 
@@ -1320,7 +1405,10 @@ class Step5Attention(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
+        x_and_scale_quanted: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
+        if x_and_scale_quanted is not None and self.qkvg_int8_weight is None:
+            raise ValueError("prequantized Step5 attention requires INT8 QKVG weights")
         if self.qkvg_int8_weight is not None:
             from vllm_hcu.model_executor.layers.quantization.int8_runtime import (
                 apply_int8_linear,
@@ -1329,6 +1417,7 @@ class Step5Attention(nn.Module):
             qkvg = apply_int8_linear(
                 hidden_states, self.qkvg_int8_weight, self.qkvg_int8_scale,
                 torch.bfloat16,
+                x_and_scale_quanted=x_and_scale_quanted,
             )
             nqkv = self.q_size + 2 * self.kv_size
             qkv = qkvg[..., :nqkv]
@@ -1818,6 +1907,28 @@ class Step5DecoderLayer(nn.Module):
             combined = tensor_model_parallel_all_reduce(combined)
         return combined
 
+    def _norm_attention_input(
+        self, residual: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        if not (
+            INT8_ATTN_NORM_QUANT and MIXED_DENSE_INT8
+            and not MIXED_DENSE_DEQUANT
+            and self.compute_dtype == torch.bfloat16
+            and self.self_attn.qkvg_int8_weight is not None
+            and torch.compiler.is_compiling()
+        ):
+            return None
+        from vllm_hcu.ops.step5.attention_int8 import (
+            norm_quant_int8, usable_norm_quant_int8,
+        )
+
+        weight = self.input_layernorm.weight
+        if not usable_norm_quant_int8(residual, weight):
+            return None
+        return norm_quant_int8(
+            residual, weight, self.input_layernorm.variance_epsilon,
+        )
+
     def forward(
         self, positions: torch.Tensor, hidden_states: torch.Tensor
     ) -> torch.Tensor:
@@ -1833,8 +1944,18 @@ class Step5DecoderLayer(nn.Module):
             hidden_states = self.post_attention_layernorm(hidden_states)
             return self._forward_ffn(hidden_states) + residual
 
-        hidden_states = self.input_layernorm(residual).to(self.compute_dtype)
-        hidden_states = self.self_attn(positions=positions, hidden_states=hidden_states)
+        norm_quanted = self._norm_attention_input(residual)
+        if norm_quanted is None:
+            hidden_states = self.input_layernorm(residual).to(self.compute_dtype)
+            hidden_states = self.self_attn(
+                positions=positions, hidden_states=hidden_states,
+            )
+        else:
+            hidden_states, x_q, x_scale = norm_quanted
+            hidden_states = self.self_attn(
+                positions=positions, hidden_states=hidden_states,
+                x_and_scale_quanted=(x_q, x_scale),
+            )
         hidden_states = self._cast_for_residual(hidden_states) + residual
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states).to(
@@ -2306,6 +2427,13 @@ class Step5ForCausalLM(nn.Module, SupportsPP, MixtureOfExperts):
         self.num_local_physical_experts = example_layer.n_local_physical_experts
         self.num_routed_experts = example_layer.n_routed_experts
         self.num_redundant_experts = example_layer.n_redundant_experts
+
+    def process_weights_after_loading(self) -> None:
+        """Finalize opt-in fused indexer weights after every linear is loaded."""
+        if INT8_QKV_INDEXER:
+            for module in self.model.modules():
+                if isinstance(module, Step5Attention):
+                    module._quantize_int8_indexer()
 
     def forward(
         self,
