@@ -274,6 +274,8 @@ def _moe_forward(
     topk_ids: torch.Tensor | None,
     layer_name: _layer_name_type,
     hidden_dim_unpadded: int,
+    shared_input_quanted: torch.Tensor | None = None,
+    shared_input_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     layer = get_layer_from_name(_resolve_layer_name(layer_name))
     return layer._forward_impl(
@@ -285,6 +287,8 @@ def _moe_forward(
         scale=scale,
         topk_weights=topk_weights,
         topk_ids=topk_ids,
+        shared_input_quanted=shared_input_quanted,
+        shared_input_scale=shared_input_scale,
     )
 
 
@@ -299,6 +303,8 @@ def _moe_forward_fake(
     topk_ids: torch.Tensor | None,
     layer_name: _layer_name_type,
     hidden_dim_unpadded: int,
+    shared_input_quanted: torch.Tensor | None = None,
+    shared_input_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     # `hidden_dim_unpadded > 0` only on the TRT-LLM MXFP4 path, where the
     # real kernel writes narrower than `hidden_states.shape[-1]`. Plumbed
@@ -320,6 +326,8 @@ def _moe_forward_shared(
     topk_ids: torch.Tensor | None,
     layer_name: _layer_name_type,
     hidden_dim_unpadded: int,
+    shared_input_quanted: torch.Tensor | None = None,
+    shared_input_scale: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     layer = get_layer_from_name(_resolve_layer_name(layer_name))
     shared_output, fused_output = layer._forward_impl(
@@ -331,6 +339,8 @@ def _moe_forward_shared(
         scale=scale,
         topk_weights=topk_weights,
         topk_ids=topk_ids,
+        shared_input_quanted=shared_input_quanted,
+        shared_input_scale=shared_input_scale,
     )
     if layer._ep_fused_combine:
         # Already a fresh all-reduce output that aliases no input.
@@ -353,6 +363,8 @@ def _moe_forward_shared_fake(
     topk_ids: torch.Tensor | None,
     layer_name: _layer_name_type,
     hidden_dim_unpadded: int,
+    shared_input_quanted: torch.Tensor | None = None,
+    shared_input_scale: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     # `fused_out`: see `_moe_forward_fake` for hidden_dim_unpadded semantics.
     # `shared_out`: matches `shared_experts_input` if provided (latent MoE),
@@ -1047,6 +1059,8 @@ class MoERunner(MoERunnerInterface):
         scale: torch.Tensor | None = None,
         topk_weights: torch.Tensor | None = None,
         topk_ids: torch.Tensor | None = None,
+        shared_input_quanted: torch.Tensor | None = None,
+        shared_input_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Invoke the fused moe layer.
 
@@ -1075,6 +1089,9 @@ class MoERunner(MoERunnerInterface):
             )
         if quanted_hidden_states is not None and scale is None:
             raise ValueError("HCU pre-quantized MoE input requires scale")
+
+        if (shared_input_quanted is None) != (shared_input_scale is None):
+            raise ValueError("shared INT8 input requires both payload and scale")
 
         # Apply transform for routed experts (e.g., latent projection
         # for latent MoE)
@@ -1107,6 +1124,8 @@ class MoERunner(MoERunnerInterface):
             self.moe_config.hidden_dim_unpadded
             if self._quant_method.has_unpadded_output
             else 0,
+            shared_input_quanted,
+            shared_input_scale,
         )
 
         #
@@ -1359,6 +1378,8 @@ class MoERunner(MoERunnerInterface):
         scale: torch.Tensor | None = None,
         topk_weights: torch.Tensor | None = None,
         topk_ids: torch.Tensor | None = None,
+        shared_input_quanted: torch.Tensor | None = None,
+        shared_input_scale: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Entry point called by the custom op to run the MoE computation.
 
@@ -1393,6 +1414,20 @@ class MoERunner(MoERunnerInterface):
             if quanted_hidden_states is not None and scale is not None
             else None
         )
+        # These tensors belong only to the shared expert, before dispatch.
+        # They must never select the routed-expert prequantized execution path.
+        if shared_input_quanted is not None:
+            from vllm_hcu.model_executor.layers.quantization.int8_runtime import (
+                _validate_quantized_input,
+            )
+            if shared_experts_input is None:
+                raise ValueError("prequantized shared input has no shared consumer")
+            _validate_quantized_input(
+                shared_experts_input, shared_input_quanted, shared_input_scale,
+            )
+            shared_experts_x_and_scale_quanted = (
+                shared_input_quanted, shared_input_scale,
+            )
         transport_x_and_scale_quanted = None
         if use_int8_allgatherv:
             from vllm_hcu.patch.worker.framework_opt.patch_agrs_int8 import (
@@ -1425,7 +1460,15 @@ class MoERunner(MoERunnerInterface):
                 self._maybe_fuse_gate_weights()
                 router_logits = F.linear(hidden_states, self._combined_gate_weight)
             else:
-                router_logits, gate_aux = self.gate(hidden_states)
+                if shared_input_quanted is not None and getattr(
+                    self.gate, "accepts_shared_quanted_input", False
+                ):
+                    router_logits, gate_aux = self.gate(
+                        hidden_states,
+                        x_and_scale_quanted=shared_experts_x_and_scale_quanted,
+                    )
+                else:
+                    router_logits, gate_aux = self.gate(hidden_states)
                 if gate_aux is not None and getattr(
                     self.gate, "returns_fused_shared_activation", False
                 ):
