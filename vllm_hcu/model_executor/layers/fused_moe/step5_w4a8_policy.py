@@ -2,6 +2,7 @@
 """Dependency-light selection policy; unrelated models retain their old backend."""
 
 import os
+import re
 from vllm_hcu.runtime_compat.step5 import is_step5_config, is_step5_owner
 
 
@@ -25,17 +26,19 @@ def uses_step5_deepep(config):
     )
 
 
-def validate_gptq_w4a8_scheme(scheme):
-    """Accept only the channel INT4 / dynamic token INT8 storage contract."""
-    def field(value, key, default=None):
-        item = value.get(key, default) if isinstance(value, dict) else getattr(value, key, default)
-        return getattr(item, "value", item)
+def _scheme_field(value, key, default=None):
+    item = value.get(key, default) if isinstance(value, dict) else getattr(value, key, default)
+    return getattr(item, "value", item)
+
+
+def _validate_channel_int_scheme(scheme, bits, storage_format):
+    field = _scheme_field
 
     w = scheme.get("weights")
     a = scheme.get("input_activations")
     if not (
-        scheme.get("format") == "pack-quantized"
-        and field(w, "num_bits") == 4
+        scheme.get("format") == storage_format
+        and field(w, "num_bits") == bits
         and field(w, "type") == "int"
         and field(w, "strategy") == "channel"
         and field(w, "symmetric") is True
@@ -47,9 +50,56 @@ def validate_gptq_w4a8_scheme(scheme):
         and field(a, "strategy") == "token"
         and field(a, "symmetric") is True
         and field(a, "dynamic") is True
+        and field(a, "group_size") in (None, -1)
+        and field(a, "actorder") is None
         and scheme.get("output_activations") is None
     ):
-        raise ValueError("Step5 GPTQ requires symmetric channel INT4 weights and dynamic token INT8 activations")
+        raise ValueError(
+            f"Step5 requires {storage_format} symmetric channel INT{bits} "
+            "weights and dynamic token INT8 activations"
+        )
+
+
+def validate_gptq_w4a8_scheme(scheme):
+    """Accept only the channel INT4 / dynamic token INT8 storage contract."""
+    _validate_channel_int_scheme(scheme, 4, "pack-quantized")
+
+
+def validate_dense_w8a8_scheme(scheme):
+    """Dense INT8 is stored directly, not in the experts' packed INT4 ABI."""
+    _validate_channel_int_scheme(scheme, 8, "int-quantized")
+
+
+def _validate_mixed_targets(group, bits):
+    """Keep the native INT4 expert adapter scoped to routed expert targets.
+
+    A broad ``Linear`` target is valid for a legacy INT4-only checkpoint, but
+    is ambiguous in a mixed checkpoint. Actual per-expert resolution is still
+    checked by Step5GPTQW4A8Config.get_quant_method; this check must not turn a
+    dense INT8 group into an INT4 expert scheme or silently accept an unrelated
+    quantization group.
+    """
+    targets = group.get("targets", [])
+    if not targets:
+        raise ValueError("Step5 mixed INT4/INT8 groups need explicit module targets")
+    for target in targets:
+        if not isinstance(target, str):
+            raise ValueError("Step5 mixed quantization targets must be strings")
+        if target.startswith("re:"):
+            try:
+                re.compile(target[3:])
+            except re.error as exc:
+                raise ValueError(f"Invalid Step5 quantization target: {target}") from exc
+        # Both checkpoint names and vLLM mapped names retain these namespaces.
+        scope = target.replace(r"\.", ".")
+        expert = "moe.experts" in scope
+        dense = any(name in scope for name in (
+            "lm_head", "self_attn", "mlp", "share_expert", "shared_head"
+        ))
+        if (bits == 4 and not expert) or (bits == 8 and (expert or not dense)):
+            raise ValueError(
+                f"Step5 mixed INT{bits} target has the wrong module scope: {target}"
+            )
 
 
 def compressed_w4a8_config(config):
@@ -63,8 +113,23 @@ def compressed_w4a8_config(config):
     groups = raw.get("config_groups", {})
     if not groups:
         return False
+    bits = {_scheme_field(group.get("weights"), "num_bits")
+            for group in groups.values()}
+    # An INT8-only checkpoint does not select the native INT4 MoE adapter.
+    if 4 not in bits:
+        return False
+    mixed = bits != {4}
     for group in groups.values():
-        validate_gptq_w4a8_scheme(dict(group, format=group.get("format", raw.get("format"))))
+        group = dict(group, format=group.get("format", raw.get("format")))
+        weight_bits = _scheme_field(group.get("weights"), "num_bits")
+        if weight_bits == 4:
+            validate_gptq_w4a8_scheme(group)
+        elif weight_bits == 8:
+            validate_dense_w8a8_scheme(group)
+        else:
+            raise ValueError("Step5 mixed checkpoint supports only INT4 experts and INT8 dense weights")
+        if mixed:
+            _validate_mixed_targets(group, weight_bits)
     return True
 
 
