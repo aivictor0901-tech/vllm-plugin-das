@@ -19,8 +19,9 @@ def validate_config(config) -> None:
     if not is_step5_config(config):
         raise ValueError("step5_pd requires a Step5 model.")
     parallel = config.parallel_config
-    for name in ("pipeline_parallel_size", "prefill_context_parallel_size",
-                 "decode_context_parallel_size"):
+    # PP is allowed: each producer stage owns a layer subset, pushes the DSA
+    # tails for those layers only, and the consumer unions the responses.
+    for name in ("prefill_context_parallel_size", "decode_context_parallel_size"):
         if getattr(parallel, name, 1) != 1:
             raise ValueError(f"step5_pd requires {name}=1.")
     if config.cache_config.enable_prefix_caching:
@@ -49,6 +50,11 @@ class Step5StateTransfer:
         self.caches = caches
         self.received = {}
         self.views = {}
+        # The DSA summary is one proxy vector per region, with no KV-group axis
+        # (sparse_indexer_num_k_heads=1), so it is identical on every TP rank.
+        # These synthetic regions must therefore be copied whole to each
+        # consumer rank instead of being sliced by tp_ratio.
+        self.replicated_regions: set[str] = set()
         ratio = worker._physical_blocks_per_logical_kv_block
         for name, indexer in self.layers.items():
             cache = caches[name]
@@ -62,6 +68,7 @@ class Step5StateTransfer:
             view = summary.reshape(count, rpp, 1, state.geometry.proxy_dim).permute(0, 2, 1, 3)
             key = name + ".step5_summary_v1"
             self.views[key] = view
+            self.replicated_regions.add(key)
             worker._layer_specs[key] = FullAttentionSpec(
                 block_size=rpp * ratio, num_kv_heads=1,
                 head_size=state.geometry.proxy_dim // 2, dtype=torch.float8_e4m3fn,
@@ -100,7 +107,13 @@ class Step5StateTransfer:
         return tails
 
     def restore(self, groups, prompt_tokens, tails):
-        """Called on D's worker thread, never on the networking event loop."""
+        """Called on D's worker thread, never on the networking event loop.
+
+        With producer PP>1, ``tails`` arrives unioned from every stage: each
+        stage captured the layers it owns and ``capture`` always emits an
+        entry per owned layer, so the union still covers ``self.layers``
+        exactly. The completeness check therefore stays strict.
+        """
         import torch
 
         if set(tails) != set(self.layers):

@@ -467,8 +467,14 @@ def _compute_sender_transfer_plan(
     local_kv_block_len: int,
     remote_kv_block_len: int,
     producer_cache_replicated: bool,
+    is_replicated_region: bool = False,
 ) -> tuple[bool, int, int, int]:
     """Plan one producer-rank to one consumer-rank copy for heterogeneous TP."""
+    if is_replicated_region:
+        # Identical payload on every producer TP rank: every consumer rank
+        # takes the whole region, exactly like a replicated producer cache.
+        return True, 0, 0, local_kv_block_len
+
     tp_ratio = transfer_topo.tp_ratio(remote_tp_size)
 
     if tp_ratio == 1:
@@ -518,12 +524,17 @@ def _validate_asymmetric_region_lengths(
     transfer_topo: TransferTopology,
     remote_tp_size: int,
     producer_cache_replicated: bool,
+    replicated_regions: frozenset[str] | set[str] = frozenset(),
 ) -> str | None:
     """Validate transfer-region metadata for a fixed producer/consumer pair.
 
     This checks registered KV regions, not per-request block counts. A region
     corresponds to one registered KV tensor, or one K/V half after expansion
     for layouts that store K and V together.
+
+    ``replicated_regions`` names regions whose payload is identical on every
+    producer TP rank (Step5 DSA summaries). They are copied whole rather than
+    sliced by tp_ratio, so their lengths must simply be equal.
     """
     if len(local_regions) != len(remote_regions):
         return (
@@ -547,6 +558,15 @@ def _validate_asymmetric_region_lengths(
     for idx, (local_region, remote_region) in enumerate(
         zip(local_regions, remote_regions)
     ):
+        if local_region.layer_name in replicated_regions:
+            if local_region.kv_block_len != remote_region.kv_block_len:
+                return (
+                    "Step5 replicated KV region length mismatch at region "
+                    f"{idx} ({local_region.layer_name}): "
+                    f"local={local_region.kv_block_len}, "
+                    f"remote={remote_region.kv_block_len}."
+                )
+            continue
         if tp_ratio == 1:
             if local_region.kv_block_len != remote_region.kv_block_len:
                 return (
@@ -1765,12 +1785,14 @@ class MooncakeConnectorWorker:
 
         pending_reqs: dict[ReqId, SendBlockMeta] = {}
         step5_state = getattr(self, "_step5_state", None)
+        # Heterogeneous TP (e.g. P=TP1 -> D=TP4) is handled by
+        # handshake_target_ranks() and the transfer-plan tp_ratio math, so the
+        # protocol version and MTP depth are the only fields that must agree.
         if (meta.step5_pd_version != (1 if step5_state else 0)
                 or (step5_state and (
-                    meta.remote_tp_size != self.tp_size
-                    or meta.step5_mtp_tokens != self.vllm_config.speculative_config.num_speculative_tokens
+                    meta.step5_mtp_tokens != self.vllm_config.speculative_config.num_speculative_tokens
                 ))):
-            await reject_metadata("Step5 P/D requires matching protocol versions, TP sizes and MTP steps.")
+            await reject_metadata("Step5 P/D requires matching protocol versions and MTP steps.")
             return
         if meta.remote_tp_size <= 0 or not 0 <= meta.remote_tp_rank < meta.remote_tp_size:
             await reject_metadata(
@@ -1838,6 +1860,7 @@ class MooncakeConnectorWorker:
             transfer_topo=self.transfer_topo,
             remote_tp_size=meta.remote_tp_size,
             producer_cache_replicated=self._producer_cache_is_replicated(),
+            replicated_regions=self._step5_replicated_regions(),
         )
         if validation_err is not None:
             await reject_metadata(validation_err)
@@ -2052,6 +2075,8 @@ class MooncakeConnectorWorker:
         lengths = []
         err_reqs: list[ReqId] = []
         err_msg: str | None = None
+        # Step5 summary regions are TP-invariant copies, not TP-sharded slices.
+        replicated_regions = self._step5_replicated_regions()
         remote_session = f"{agent_meta.remote_hostname}:{agent_meta.remote_port}"
         for d_req_id, send_meta in ready_reqs:
             _, remote_block_ids_per_group = agent_meta.req_blocks[d_req_id]
@@ -2206,6 +2231,9 @@ class MooncakeConnectorWorker:
                     remote_kv_block_len=remote_region.kv_block_len,
                     remote_tp_rank=agent_meta.remote_tp_rank,
                     remote_tp_size=agent_meta.remote_tp_size,
+                    is_replicated_region=(
+                        local_region.layer_name in replicated_regions
+                    ),
                 )
                 if not should_transfer:
                     # Replicated KV cache: only one producer rank in the TP group
@@ -2561,7 +2589,10 @@ class MooncakeConnectorWorker:
         step5_state = getattr(self, "_step5_state", None)
         if step5_state:
             for req_id in finished_recving_reqs:
-                groups, tokens, tails = step5_state.received.pop(req_id)
+                entry = step5_state.received.pop(req_id)
+                groups, tokens, tails = (
+                    entry["groups"], entry["tokens"], entry["tails"],
+                )
                 if any(groups):
                     step5_state.restore(groups, tokens, tails)
 
@@ -2679,12 +2710,24 @@ class MooncakeConnectorWorker:
             step5_state = getattr(self, "_step5_state", None)
             if step5_state:
                 tails = response.step5_tails.get(req_id)
-                if (tails is None and any(pull_meta.local_block_ids)) or pull_meta.pull_tasks_count != 1:
-                    self._kv_load_error = "Step5 P/D requires one complete, matching TP peer response."
+                if (tails is None and any(pull_meta.local_block_ids)) or pull_meta.pull_tasks_count < 1:
+                    self._kv_load_error = "Step5 P/D requires every matching TP/PP peer response."
                     return
-                step5_state.received[req_id] = (
-                    pull_meta.local_block_ids, pull_meta.step5_prompt_tokens, tails,
-                )
+                # A producer with PP>1 answers once per stage, each covering only
+                # its own layers, so the tails are unioned rather than replaced.
+                entry = step5_state.received.get(req_id)
+                if entry is None:
+                    step5_state.received[req_id] = entry = {
+                        "groups": pull_meta.local_block_ids,
+                        "tokens": pull_meta.step5_prompt_tokens,
+                        "tails": {},
+                    }
+                elif entry["tokens"] != pull_meta.step5_prompt_tokens:
+                    self._kv_load_error = (
+                        "Step5 P/D producer stages disagree on the prompt length."
+                    )
+                    return
+                entry["tails"].update(tails or {})
             # No race because we are in async loop.
             pull_meta.pull_tasks_count -= 1
             if pull_meta.pull_tasks_count == 0:
@@ -2769,10 +2812,10 @@ class MooncakeConnectorWorker:
         remote_pcp_size, remote_layer_split = self._remote_pcp_info.get(
             remote_engine_id, (1, False)
         )
-        if getattr(self, "_step5_state", None) and (
-            self._tp_size[remote_engine_id] != self.tp_size or remote_pcp_size != 1
-        ):
-            self._fail_pull_metas(pull_metas, "Step5 P/D requires matching TP and PCP=1.")
+        # TP may differ from the producer (P=TP1 -> D=TP4); tp_ratio drives the
+        # slice planning. Only context parallelism stays unsupported.
+        if getattr(self, "_step5_state", None) and remote_pcp_size != 1:
+            self._fail_pull_metas(pull_metas, "Step5 P/D requires PCP=1.")
             return
         if remote_pcp_size > 1:
             if not remote_layer_split:
@@ -2799,8 +2842,11 @@ class MooncakeConnectorWorker:
             worker_addrs.extend(pp_to_addr[pp_rank] for pp_rank in pp_ranks)
 
         count = len(worker_addrs)
-        if getattr(self, "_step5_state", None) and count != 1:
-            self._fail_pull_metas(pull_metas, "Step5 P/D requires PP=1 and exactly one matching TP peer.")
+        # With producer PP>1 each consumer TP rank pulls from one producer stage
+        # per remote PP rank, so several peers are legitimate. Zero is still an
+        # error: the pairing found nothing to ask.
+        if getattr(self, "_step5_state", None) and count < 1:
+            self._fail_pull_metas(pull_metas, "Step5 P/D found no matching producer peer.")
             return
         logger.debug(
             "Receiving Mooncake KV for engine %s from producer virtual TP "
@@ -2947,12 +2993,17 @@ class MooncakeConnectorWorker:
             num_blocks_per_layer=num_blocks_per_layer,
         )
 
+    def _step5_replicated_regions(self) -> set[str]:
+        step5_state = getattr(self, "_step5_state", None)
+        return step5_state.replicated_regions if step5_state else set()
+
     def _get_sender_transfer_plan(
         self,
         local_kv_block_len: int,
         remote_kv_block_len: int,
         remote_tp_rank: int,
         remote_tp_size: int,
+        is_replicated_region: bool = False,
     ) -> tuple[bool, int, int, int]:
         return _compute_sender_transfer_plan(
             transfer_topo=self.transfer_topo,
@@ -2961,6 +3012,7 @@ class MooncakeConnectorWorker:
             local_kv_block_len=local_kv_block_len,
             remote_kv_block_len=remote_kv_block_len,
             producer_cache_replicated=self._producer_cache_is_replicated(),
+            is_replicated_region=is_replicated_region,
         )
 
     def _log_debug_cache_registration(
