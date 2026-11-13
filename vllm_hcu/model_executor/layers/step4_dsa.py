@@ -156,6 +156,14 @@ PREFILL_FP8_INDEXER = henvs.optional_custom_op_enabled(
     os.environ.get("VLLM_STEP4_DSA_PREFILL_FP8_INDEXER", "1") == "1"
 )
 
+# Bound the score tensor itself by selecting each query chunk before scoring
+# the next. Unlike INDEXER_Q_CHUNK this also bounds the top-k workspace.
+# Uses the existing reference scorers/selectors; 0 keeps the original path.
+MEMORY_TRACE = os.environ.get("VLLM_STEP5_MEMORY_TRACE", "0") == "1"
+PREFILL_PLAN_CHUNK = int(os.environ.get("VLLM_STEP4_DSA_PREFILL_PLAN_CHUNK", "0"))
+if PREFILL_PLAN_CHUNK < 0:
+    raise ValueError("VLLM_STEP4_DSA_PREFILL_PLAN_CHUNK must be nonnegative")
+
 # Decode score width, in regions, for the CUDA-graph-captured path. A graph
 # replays the launch arguments it recorded, so the [rows, regions] score tensor
 # and the selector's scan bound must be the same on every step rather than
@@ -2038,6 +2046,13 @@ class Step4DSAImpl(AttentionImpl[Step4DSAMetadata]):
                 f"forward step. The indexer op and the attention op have been "
                 f"reordered, and attending to a stale region set would be silent."
             )
+
+        # The local reference owns the tensors until the attention kernels have
+        # been enqueued on this stream. Keeping the consumed prefill plan on all
+        # 23 layers retains ~2.9 GiB at 8192 tokens / 4 KV groups / topk=512.
+        # Preserve capture-time ownership for graph replay as before.
+        if attn_metadata.num_prefills > 0 and not torch.cuda.is_current_stream_capturing():
+            layer.step4_sparse_plan = None
 
         num_kv_groups = self.num_kv_heads
         nd, ndt = attn_metadata.num_decodes, attn_metadata.num_decode_tokens
@@ -4148,7 +4163,12 @@ class Step4Indexer:
             hidden_states[:num_tokens], positions[:num_tokens], num_tokens
         )
         self._update_summaries(sched, index_k, index_z)
-        prefill_logits, decode_logits, width = self._score(md, sched, index_q, weights)
+        chunk_prefill = PREFILL_PLAN_CHUNK > 0 and md.num_prefills > 0 and not (
+            DENSE_EQUIV or sched.spec
+        )
+        prefill_logits, decode_logits, width = self._score(
+            md, sched, index_q, weights, skip_prefill=chunk_prefill
+        )
 
         topk = max(width, 1) if DENSE_EQUIV else self.geometry.topk
         attn.step4_sparse_plan = build_plan(
@@ -4162,6 +4182,27 @@ class Step4Indexer:
             decode_table=sched.tok_table if sched.spec else None,
             step_cache=state.step_cache,
         )
+        if chunk_prefill:
+            attn.step4_sparse_plan.prefill, prefill_width = self._score_prefill_chunked(
+                md, sched, index_q, weights, chunk_size=PREFILL_PLAN_CHUNK
+            )
+            width = max(width, prefill_width)
+        if MEMORY_TRACE and md.num_prefills > 0 and self.slot in (
+            state.first_slot, state.num_layers - 1
+        ):
+            free, _ = torch.cuda.mem_get_info()
+            logger.info(
+                "DSA_MEMORY rank=%s slot=%s tokens=%s regions=%s plan_chunk=%s "
+                "allocated=%.3fGiB reserved=%.3fGiB peak_allocated=%.3fGiB "
+                "inactive_split=%.3fGiB device_free=%.3fGiB",
+                torch.distributed.get_rank() if torch.distributed.is_initialized() else 0,
+                self.slot, num_tokens, width, PREFILL_PLAN_CHUNK,
+                torch.cuda.memory_allocated() / 2**30,
+                torch.cuda.memory_reserved() / 2**30,
+                torch.cuda.max_memory_allocated() / 2**30,
+                torch.cuda.memory_stats().get("inactive_split_bytes.all.current", 0) / 2**30,
+                free / 2**30,
+            )
         state.finish_layer()
         return width
 
@@ -4550,6 +4591,8 @@ class Step4Indexer:
         sched: Step4DSASchedule,
         index_q: torch.Tensor,
         weights: torch.Tensor,
+        *,
+        skip_prefill: bool = False,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None, int]:
         """Per-request indexer scores, in the selector's group-major row order.
 
@@ -4596,7 +4639,7 @@ class Step4Indexer:
                 device=device,
             )
         prefill_logits = None
-        if md.num_prefills > 0:
+        if md.num_prefills > 0 and not skip_prefill:
             # Only columns below a row's causal horizon are ever read by the
             # selector and the scorer writes all of them, so the zero fill is a
             # dead 128-256 MB store per layer -- except under DENSE_EQUIV, which
@@ -4624,6 +4667,8 @@ class Step4Indexer:
             if plan.nscore == 0:
                 continue
             decode = plan.row < num_decodes
+            if skip_prefill and not decode:
+                continue
             if PREFILL_FP8_INDEXER and not decode and INDEXER_Q_CHUNK == 0:
                 if prefill_q8 is None:
                     # One cast for all prefill rows; exact, q is already e4m3-valued.
@@ -4662,6 +4707,97 @@ class Step4Indexer:
                 )
 
         return prefill_logits, decode_logits, max(width_decode, width_prefill)
+
+    def _score_prefill_chunked(
+        self,
+        md: Step4DSAMetadata,
+        sched: Step4DSASchedule,
+        index_q: torch.Tensor,
+        weights: torch.Tensor,
+        *,
+        chunk_size: int,
+    ) -> tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], int]:
+        """Run the existing scorers and reference selector in bounded query chunks.
+
+        Selection is independent per query. Preserve request identity, absolute
+        causal positions, and the group-major output expected by attention.
+        Only the selected region IDs survive each chunk, not the full scores.
+        """
+        if chunk_size <= 0:
+            raise ValueError("prefill plan chunk size must be positive")
+        groups = self.num_kv_groups
+        ndt = md.num_decode_tokens
+        tokens = md.num_actual_tokens - ndt
+        topk = self.geometry.topk
+        device = index_q.device
+        packed = torch.empty((groups, tokens, topk + 1), dtype=torch.int32, device=device)
+        logical = torch.empty_like(packed)
+        counts = torch.empty((groups, tokens), dtype=torch.int32, device=device)
+        requests = torch.empty_like(counts)
+        assert md.positions is not None
+        positions = md.positions[ndt:md.num_actual_tokens].to(torch.int32)
+        weights = self._prescaled(weights)
+        summary = self.state.summary[self.slot]
+        width = 0
+        for plan in sched.requests:
+            if plan.row < md.num_decodes:
+                continue
+            width = max(width, plan.nscore)
+            first = plan.tok_start - ndt
+            requests[:, first:first + plan.qlen] = plan.row
+            keys = summary[plan.score_slots] if plan.nscore else None
+            if keys is not None and not PREFILL_FP8_INDEXER:
+                keys = keys.to(index_q.dtype)
+            for begin in range(0, plan.qlen, chunk_size):
+                count = min(chunk_size, plan.qlen - begin)
+                src = plan.tok_start + begin
+                dst = first + begin
+                scores = torch.empty(
+                    (groups * count, max(plan.nscore, 1)), dtype=torch.float32, device=device
+                )
+                if plan.nscore:
+                    if PREFILL_FP8_INDEXER:
+                        prefill_indexer_logits(
+                            index_q[src:src + count].to(torch.float8_e4m3fn),
+                            weights[src:src + count],
+                            keys,
+                            first_position=plan.past + begin,
+                            region_size=REGION_BLOCK_SIZE,
+                            out=scores,
+                            # gfx936: Q128 spills 299 registers (1196 bytes
+                            # private scratch/thread); Q32 has no spills and
+                            # produces bit-identical visible scores.
+                            block_q=32,
+                        )
+                    else:
+                        indexer_logits(
+                            index_q[src:src + count].contiguous(),
+                            weights[src:src + count].contiguous(),
+                            keys,
+                            out=scores,
+                            quantize_keys=False,
+                            q_prerounded=True,
+                        )
+                # With no complete history the selector only appends the
+                # current partial region, so it never reads the empty scores.
+                chunk_requests = requests[:, dst:dst + count].reshape(-1).contiguous()
+                selected, selected_counts, selected_logical = prefill_sparse_meta(
+                    scores,
+                    positions[dst:dst + count].repeat(groups),
+                    md.block_table,
+                    chunk_requests,
+                    topk=topk,
+                    region_size=REGION_BLOCK_SIZE,
+                    regions_per_page=self.state.regions_per_page,
+                    return_logical_ids=True,
+                )
+                packed[:, dst:dst + count].copy_(selected.view(groups, count, topk + 1))
+                logical[:, dst:dst + count].copy_(selected_logical.view(groups, count, topk + 1))
+                counts[:, dst:dst + count].copy_(selected_counts.view(groups, count))
+                del scores, selected, selected_counts, selected_logical, chunk_requests
+            del keys
+        _maybe_dump_prefill_plan(packed.flatten(0, 1), counts.flatten(), positions)
+        return (packed.flatten(0, 1), counts.flatten(), logical.flatten(0, 1), requests.flatten()), width
 
     def _score_decode(
         self,

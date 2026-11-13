@@ -42,6 +42,22 @@ def test_compressed_tensors_w4a8_conversion_round_trips_signed_int4():
     torch.testing.assert_close(_unpack_slimquant(hcu_packed), logical)
 
 
+
+@pytest.mark.parametrize("noncontiguous", [False, True])
+def test_conversion_preserves_all_int4_values_and_input(noncontiguous):
+    logical = torch.arange(-8, 8, dtype=torch.int8).repeat(8, 4)
+    checkpoint = pack_to_int32(logical, num_bits=4)
+    if noncontiguous:
+        checkpoint = checkpoint.t().contiguous().t()
+        assert not checkpoint.is_contiguous()
+    before = checkpoint.clone()
+    converted = compressed_tensors_w4a8_to_slimquant(checkpoint)
+    torch.testing.assert_close(_unpack_slimquant(converted), logical)
+    torch.testing.assert_close(checkpoint, before)
+    assert converted.is_contiguous()
+    assert converted.numel() * converted.element_size() == checkpoint.numel() * 4
+    assert converted.view(torch.uint8)[0, 0].item() == 0x89
+
 def test_factory_routes_only_step5_channel_w4a8(monkeypatch):
     import vllm.config
     from vllm.platforms import current_platform
