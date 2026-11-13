@@ -6477,10 +6477,12 @@ def test_moe_runner_and_shared_experts_cold_replacement_contract():
             "hidden_states", "router_logits", "shared_experts_input", "input_ids",
             "quanted_hidden_states", "scale", "topk_weights", "topk_ids",
             "layer_name", "hidden_dim_unpadded",
+            "shared_input_quanted", "shared_input_scale",
         )
         assert tuple(inspect.signature(runner_module.MoERunner.forward).parameters) == (
             "self", "hidden_states", "router_logits", "input_ids",
             "quanted_hidden_states", "scale", "topk_weights", "topk_ids",
+            "shared_input_quanted", "shared_input_scale",
         )
 
         class QuantMethod:

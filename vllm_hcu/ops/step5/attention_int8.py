@@ -168,7 +168,50 @@ def norm_quant_int8(
     return torch.ops.vllm.step5_attention_norm_quant_int8(x, weight, epsilon)
 
 
+def usable_add_norm_quant_int8(
+    x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor,
+) -> bool:
+    return (
+        usable_norm_quant_int8(residual, weight)
+        and x.dtype in (torch.float32, torch.bfloat16)
+        and x.shape == residual.shape and x.device == residual.device
+        and x.is_contiguous()
+        and (torch.compiler.is_compiling() or x.storage_offset() % 8 == 0)
+    )
+
+
+def _add_norm_quant_int8(
+    x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, epsilon: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    from lightop.norm import gemma_rms_norm_per_token_int8_quant
+
+    return gemma_rms_norm_per_token_int8_quant(x, weight, epsilon, residual)
+
+
+def _add_norm_quant_int8_fake(
+    x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, epsilon: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    return (*_norm_quant_int8_fake(x, weight, epsilon),
+            torch.empty(x.shape, dtype=torch.float32, device=x.device))
+
+
+direct_register_custom_op(
+    op_name="step5_add_norm_quant_int8", op_func=_add_norm_quant_int8,
+    mutates_args=[], fake_impl=_add_norm_quant_int8_fake,
+)
+
+
+def add_norm_quant_int8(
+    x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, epsilon: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return BF16 norm, INT8/scale and a fresh, unrounded FP32 residual sum."""
+    if not usable_add_norm_quant_int8(x, residual, weight):
+        raise ValueError("unsupported Step5 residual Add+Norm+INT8 inputs")
+    return torch.ops.vllm.step5_add_norm_quant_int8(x, residual, weight, epsilon)
+
+
 __all__ = [
     "ATTN_INT8_MAX_M", "gate_quant_int8", "usable_gate_quant_int8",
     "norm_quant_int8", "usable_norm_quant_int8",
+    "add_norm_quant_int8", "usable_add_norm_quant_int8",
 ]

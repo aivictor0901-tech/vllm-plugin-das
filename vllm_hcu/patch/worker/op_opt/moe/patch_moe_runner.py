@@ -48,21 +48,25 @@ def apply_to_module(module: ModuleType) -> bool:
             "hidden_states", "router_logits", "shared_experts_input", "input_ids",
             "quanted_hidden_states", "scale", "topk_weights", "topk_ids",
             "layer_name", "hidden_dim_unpadded",
+            "shared_input_quanted", "shared_input_scale",
         ),
         "_moe_forward_fake": (
             "hidden_states", "router_logits", "shared_experts_input", "input_ids",
             "quanted_hidden_states", "scale", "topk_weights", "topk_ids",
             "layer_name", "hidden_dim_unpadded",
+            "shared_input_quanted", "shared_input_scale",
         ),
         "_moe_forward_shared": (
             "hidden_states", "router_logits", "shared_experts_input", "input_ids",
             "quanted_hidden_states", "scale", "topk_weights", "topk_ids",
             "layer_name", "hidden_dim_unpadded",
+            "shared_input_quanted", "shared_input_scale",
         ),
         "_moe_forward_shared_fake": (
             "hidden_states", "router_logits", "shared_experts_input", "input_ids",
             "quanted_hidden_states", "scale", "topk_weights", "topk_ids",
             "layer_name", "hidden_dim_unpadded",
+            "shared_input_quanted", "shared_input_scale",
         ),
     }
     for name, names in expected.items():
@@ -75,6 +79,7 @@ def apply_to_module(module: ModuleType) -> bool:
     if _names(runner.forward) != (
         "self", "hidden_states", "router_logits", "input_ids",
         "quanted_hidden_states", "scale", "topk_weights", "topk_ids",
+        "shared_input_quanted", "shared_input_scale",
     ):
         raise PatchCompatibilityError("HCU MoERunner.forward schema is incompatible")
     setattr(module, _MARKER, True)

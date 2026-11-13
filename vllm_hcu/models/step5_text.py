@@ -673,6 +673,7 @@ class BF16FP32RouterLinear(ReplicatedLinear):
 
     # The second result is an activation, unlike ReplicatedLinear's extra bias.
     returns_fused_shared_activation = True
+    accepts_shared_quanted_input = True
 
     def __init__(self, input_size: int, output_size: int, prefix: str = ""):
         super().__init__(
@@ -749,7 +750,8 @@ class BF16FP32RouterLinear(ReplicatedLinear):
             )
 
     def _forward_fused_shared(
-        self, x2: torch.Tensor
+        self, x2: torch.Tensor,
+        x_and_scale_quanted: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor] | None:
         if self._fused_shared_int8:
             from vllm_hcu.ops.step5.router_shared_int8 import usable_router_shared_int8
@@ -772,6 +774,7 @@ class BF16FP32RouterLinear(ReplicatedLinear):
                 scale,
                 mlp.limit,
                 workspace=self._rsg_int8_workspace,
+                x_and_scale_quanted=x_and_scale_quanted,
             )
         from vllm_hcu.ops.step5.router_gemm import RSG_MAX_M
 
@@ -795,7 +798,10 @@ class BF16FP32RouterLinear(ReplicatedLinear):
         )
         return logits, act
 
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
+    def forward(
+        self, x: torch.Tensor,
+        x_and_scale_quanted: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         w = self.weight
         if self._fused_shared is not None:
             # A prior eligible call may have left a cache that must never be
@@ -806,7 +812,7 @@ class BF16FP32RouterLinear(ReplicatedLinear):
             if self._fused_shared is not None:
                 # Return the activation explicitly so Dynamo records the
                 # cross-module dataflow.
-                fused = self._forward_fused_shared(x2)
+                fused = self._forward_fused_shared(x2, x_and_scale_quanted)
                 if fused is not None:
                     out, shared_act = fused
                     return out.view(*x.shape[:-1], w.shape[1]), shared_act
@@ -1003,10 +1009,18 @@ class Step5MLP(nn.Module):
         output, _ = self.down_proj(activation)
         return output
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, hidden_states: torch.Tensor,
+        x_and_scale_quanted: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> torch.Tensor:
         intermediate_act = self.pop_fused_router_activation(hidden_states)
         if intermediate_act is None:
-            gate_up, _ = self.gate_up_proj(hidden_states)
+            if x_and_scale_quanted is None:
+                gate_up, _ = self.gate_up_proj(hidden_states)
+            else:
+                gate_up, _ = self.gate_up_proj._forward_with_hcu_quanted(
+                    hidden_states, x_and_scale_quanted,
+                )
             intermediate_act = self.act_fn(gate_up)
         return self.forward_fused_router_activation(intermediate_act)
 
@@ -1703,10 +1717,19 @@ class FusedMoEBlock(nn.Module):
         self,
         hidden_states: torch.Tensor,
         input_is_sequence_parallel: bool = False,
+        shared_x_and_scale_quanted: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor | None, torch.Tensor]:
         """Return (shared, routed); shared is None when FusedMoE already added it."""
         hidden_dim = hidden_states.shape[-1]
         hidden_states = hidden_states.view(-1, hidden_dim)
+        shared_kwargs = {}
+        if shared_x_and_scale_quanted is not None:
+            if not self.fold_shared_expert or input_is_sequence_parallel:
+                raise ValueError("shared Norm+INT8 requires an unsharded shared input")
+            shared_kwargs = dict(
+                shared_input_quanted=shared_x_and_scale_quanted[0],
+                shared_input_scale=shared_x_and_scale_quanted[1],
+            )
         if self._step5_deepep:
             # Shared weights are TP-sharded, whereas routed experts are EP-
             # sharded. Compute shared partials over the same full token order
@@ -1736,10 +1759,16 @@ class FusedMoEBlock(nn.Module):
         )
         if self.experts.is_internal_router:
             routed_output = self.experts(
-                hidden_states=hidden_states, router_logits=hidden_states
+                hidden_states=hidden_states, router_logits=hidden_states,
+                **shared_kwargs,
             )
         else:
-            router_logits, fused_shared_act = self.gate(hidden_states)
+            if isinstance(self.gate, BF16FP32RouterLinear):
+                router_logits, fused_shared_act = self.gate(
+                    hidden_states, x_and_scale_quanted=shared_x_and_scale_quanted,
+                )
+            else:
+                router_logits, fused_shared_act = self.gate(hidden_states)
             if fused_shared_act is not None:
                 self.share_expert.fused_act = (
                     torch.cuda.current_stream().cuda_stream,
@@ -1747,7 +1776,8 @@ class FusedMoEBlock(nn.Module):
                     fused_shared_act,
                 )
             routed_output = self.experts(
-                hidden_states=hidden_states, router_logits=router_logits
+                hidden_states=hidden_states, router_logits=router_logits,
+                **shared_kwargs,
             )
         return shared_output, routed_output
 
@@ -1880,11 +1910,13 @@ class Step5DecoderLayer(nn.Module):
         input_is_sequence_parallel: bool = False,
         residual: torch.Tensor | None = None,
         orig_num_tokens: int | None = None,
+        shared_x_and_scale_quanted: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         if not self.use_moe:
             return self.mlp(hidden_states)
         shared_output, routed_output = self.moe(
-            hidden_states, input_is_sequence_parallel=input_is_sequence_parallel
+            hidden_states, input_is_sequence_parallel=input_is_sequence_parallel,
+            shared_x_and_scale_quanted=shared_x_and_scale_quanted,
         )
         if self.moe.experts.moe_config.is_sequence_parallel:
             combined = self._cast_for_residual(shared_output) + self._cast_for_residual(
@@ -1908,8 +1940,8 @@ class Step5DecoderLayer(nn.Module):
         return combined
 
     def _norm_attention_input(
-        self, residual: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        self, x: torch.Tensor, residual: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None:
         if not (
             INT8_ATTN_NORM_QUANT and MIXED_DENSE_INT8
             and not MIXED_DENSE_DEQUANT
@@ -1919,20 +1951,23 @@ class Step5DecoderLayer(nn.Module):
         ):
             return None
         from vllm_hcu.ops.step5.attention_int8 import (
-            norm_quant_int8, usable_norm_quant_int8,
+            add_norm_quant_int8, norm_quant_int8,
+            usable_add_norm_quant_int8, usable_norm_quant_int8,
         )
 
         weight = self.input_layernorm.weight
-        if not usable_norm_quant_int8(residual, weight):
+        epsilon = self.input_layernorm.variance_epsilon
+        if residual is not None:
+            if not usable_add_norm_quant_int8(x, residual, weight):
+                return None
+            return add_norm_quant_int8(x, residual, weight, epsilon)
+        if not usable_norm_quant_int8(x, weight):
             return None
-        return norm_quant_int8(
-            residual, weight, self.input_layernorm.variance_epsilon,
-        )
+        return (*norm_quant_int8(x, weight, epsilon), x)
 
     def forward(
         self, positions: torch.Tensor, hidden_states: torch.Tensor
     ) -> torch.Tensor:
-        orig_num_tokens = hidden_states.shape[0]
         residual = hidden_states
         if not self.fp32_residual_connection:
             hidden_states = self.input_layernorm(hidden_states)
@@ -1944,30 +1979,62 @@ class Step5DecoderLayer(nn.Module):
             hidden_states = self.post_attention_layernorm(hidden_states)
             return self._forward_ffn(hidden_states) + residual
 
-        norm_quanted = self._norm_attention_input(residual)
+        ffn_output, residual = self.forward_residual(positions, hidden_states)
+        return self._cast_for_residual(ffn_output) + residual
+
+    def forward_residual(
+        self, positions: torch.Tensor, hidden_states: torch.Tensor,
+        residual: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Keep the FFN contribution separate until the next input norm.
+
+        Public layer.forward and pipeline boundaries still materialize their
+        original FP32 sum. Only the internal FP32 decode loop carries the pair.
+        """
+        orig_num_tokens = hidden_states.shape[0]
+        norm_quanted = self._norm_attention_input(hidden_states, residual)
         if norm_quanted is None:
+            residual = (hidden_states if residual is None else
+                        self._cast_for_residual(hidden_states) + residual)
             hidden_states = self.input_layernorm(residual).to(self.compute_dtype)
             hidden_states = self.self_attn(
                 positions=positions, hidden_states=hidden_states,
             )
         else:
-            hidden_states, x_q, x_scale = norm_quanted
+            hidden_states, x_q, x_scale, residual = norm_quanted
             hidden_states = self.self_attn(
                 positions=positions, hidden_states=hidden_states,
                 x_and_scale_quanted=(x_q, x_scale),
             )
-        hidden_states = self._cast_for_residual(hidden_states) + residual
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states).to(
-            self.compute_dtype
-        )
+
+        shared_quanted = None
+        if (
+            INT8_ATTN_NORM_QUANT and torch.compiler.is_compiling()
+            and self.compute_dtype == torch.bfloat16 and self.use_moe
+            and self.moe.fold_shared_expert
+            and _can_fuse_int8_shared_expert(self.moe.share_expert)
+        ):
+            from vllm_hcu.ops.step5.attention_int8 import (
+                add_norm_quant_int8, usable_add_norm_quant_int8,
+            )
+            weight = self.post_attention_layernorm.weight
+            if usable_add_norm_quant_int8(hidden_states, residual, weight):
+                hidden_states, x_q, x_scale, residual = add_norm_quant_int8(
+                    hidden_states, residual, weight,
+                    self.post_attention_layernorm.variance_epsilon,
+                )
+                shared_quanted = (x_q, x_scale)
+        if shared_quanted is None:
+            residual = self._cast_for_residual(hidden_states) + residual
+            hidden_states = self.post_attention_layernorm(residual).to(self.compute_dtype)
         ffn_output = self._forward_ffn(
             hidden_states,
             input_is_sequence_parallel=False,
             residual=None,
             orig_num_tokens=orig_num_tokens,
+            shared_x_and_scale_quanted=shared_quanted,
         )
-        return self._cast_for_residual(ffn_output) + residual
+        return ffn_output, residual
 
 
 @support_torch_compile
@@ -2083,9 +2150,24 @@ class Step5Model(nn.Module):
         if self.fp32_residual_connection:
             hidden_states = hidden_states.float()
 
-        for i in range(self.start_layer, self.end_layer):
-            layer = self.layers[i]
-            hidden_states = layer(positions, hidden_states)
+        if (
+            self.fp32_residual_connection and INT8_ATTN_NORM_QUANT
+            and MIXED_DENSE_INT8 and not MIXED_DENSE_DEQUANT
+            and self.compute_dtype == torch.bfloat16
+            and torch.compiler.is_compiling()
+            and get_pp_group().world_size == 1
+        ):
+            residual = None
+            for i in range(self.start_layer, self.end_layer):
+                hidden_states, residual = self.layers[i].forward_residual(
+                    positions, hidden_states, residual,
+                )
+            if residual is not None:
+                hidden_states = hidden_states.to(torch.float32) + residual
+        else:
+            for i in range(self.start_layer, self.end_layer):
+                layer = self.layers[i]
+                hidden_states = layer(positions, hidden_states)
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors(
