@@ -11,6 +11,19 @@ class HcuInt8LinearError(RuntimeError):
     """The explicitly enabled HCU INT8 kernel cannot execute safely."""
 
 
+def _validate_quantized_input(input, x_q, x_scale):
+    if x_q.shape != input.shape or x_scale.shape != (*input.shape[:-1], 1):
+        raise HcuInt8LinearError(
+            "HCU W8A8 quantized input/scale shapes do not match the activation"
+        )
+    if x_q.dtype is not torch.int8 or x_scale.dtype is not torch.float32:
+        raise HcuInt8LinearError(
+            "HCU W8A8 requires an int8 activation and float32 per-token scale"
+        )
+    if x_q.device != input.device or x_scale.device != input.device:
+        raise HcuInt8LinearError("HCU W8A8 inputs, weights and scales must share a device")
+
+
 def weight8bit_nt_kpack2_marlin2(
     weight: torch.Tensor,
     k_tile: int = 16,
@@ -85,57 +98,24 @@ def apply_int8_linear(
             f"{input.ndim} and {weight.ndim}"
         )
 
-    try:
-        from vllm_hcu.platforms import envs as henvs
-    except Exception as exc:
-        raise HcuInt8LinearError("HCU environment flags are unavailable") from exc
-
-    use_fused_input = (
-        bool(henvs.VLLM_HCU_USE_CUSTOM_OPS)
-        and (
-            bool(henvs.VLLM_HCU_USE_FUSED_SILU_MUL_QUANT)
-            or bool(henvs.VLLM_HCU_USE_FUSED_RMS_QUANT)
-        )
-        and x_and_scale_quanted is not None
-    )
-    if use_fused_input:
-        if (
-            not isinstance(x_and_scale_quanted, tuple)
-            or len(x_and_scale_quanted) != 2
-            or not all(isinstance(item, torch.Tensor) for item in x_and_scale_quanted)
-        ):
-            raise HcuInt8LinearError(
-                "fused HCU W8A8 input must be a (quantized_tensor, scale) tuple"
-            )
-        x_q, x_scale = x_and_scale_quanted
-    else:
-        try:
-            from lightop.quant import per_token_quant_int8
-        except (ImportError, AttributeError) as exc:
-            raise HcuInt8LinearError(
-                "HCU W8A8 linear requires lightop.quant.per_token_quant_int8"
-            ) from exc
-        x_q, x_scale = per_token_quant_int8(input)
-
-    if x_q.shape != input.shape or x_scale.shape != (*input.shape[:-1], 1):
+    # Validate storage and geometry before any activation quantization. Empty
+    # token owners in DeepEP must still reject malformed checkpoint metadata,
+    # but must not launch a quantizer or a zero-M hipBLASLt GEMM.
+    n, k = weight.shape
+    if k <= 0 or input.shape[-1] != k:
         raise HcuInt8LinearError(
-            "HCU W8A8 quantized input/scale shapes do not match the activation"
-        )
-    if x_q.dtype is not torch.int8 or x_scale.dtype is not torch.float32:
-        raise HcuInt8LinearError(
-            "HCU W8A8 requires an int8 activation and float32 per-token scale"
+            "HCU W8A8 quantized input/scale shapes: "
+            f"K mismatch, activation K={input.shape[-1]}, weight K={k}"
         )
     if weight.dtype is not torch.int8 or weight_scale.dtype is not torch.float32:
         raise HcuInt8LinearError(
             "HCU W8A8 requires int8 weights and float32 weight scales"
         )
-
-    m = input.numel() // input.shape[-1]
-    n, k = weight.shape
-    if x_q.shape[-1] != k:
-        raise HcuInt8LinearError(
-            f"HCU W8A8 K mismatch: activation K={x_q.shape[-1]}, weight K={k}"
-        )
+    if weight_scale.numel() != n:
+        raise HcuInt8LinearError("HCU W8A8 requires one weight scale per output channel")
+    if weight.device != input.device or weight_scale.device != input.device:
+        raise HcuInt8LinearError("HCU W8A8 inputs, weights and scales must share a device")
+    m = input.numel() // k
     out_dtype = (
         params_dtype
         if params_dtype in (torch.bfloat16, torch.float16)
@@ -145,6 +125,34 @@ def apply_int8_linear(
         raise HcuInt8LinearError(
             f"HCU W8A8 bias dtype {bias.dtype} does not match output {out_dtype}"
         )
+
+    # An explicit prequantized pair is a data contract, not a producer feature
+    # flag. In particular QKV/gate may share it without RMS/SILU fusion being
+    # enabled. Never silently discard it and quantize the same input again.
+    if x_and_scale_quanted is not None:
+        if (
+            not isinstance(x_and_scale_quanted, tuple)
+            or len(x_and_scale_quanted) != 2
+            or not all(isinstance(item, torch.Tensor) for item in x_and_scale_quanted)
+        ):
+            raise HcuInt8LinearError(
+                "fused HCU W8A8 input must be a (quantized_tensor, scale) tuple"
+            )
+        x_q, x_scale = x_and_scale_quanted
+        _validate_quantized_input(input, x_q, x_scale)
+
+    if m == 0:
+        return input.new_empty((*input.shape[:-1], n), dtype=out_dtype)
+
+    if x_and_scale_quanted is None:
+        try:
+            from lightop.quant import per_token_quant_int8
+        except (ImportError, AttributeError) as exc:
+            raise HcuInt8LinearError(
+                "HCU W8A8 linear requires lightop.quant.per_token_quant_int8"
+            ) from exc
+        x_q, x_scale = per_token_quant_int8(input)
+        _validate_quantized_input(input, x_q, x_scale)
 
     try:
         from lightop.gemm_ops import hipblaslt_w8a8_gemm
@@ -156,7 +164,7 @@ def apply_int8_linear(
     x_q_2d = x_q.reshape(m, k).contiguous()
     x_scale_2d = x_scale.reshape(m, 1).contiguous()
     weight = weight.contiguous()
-    weight_scale = weight_scale.contiguous()
+    weight_scale = weight_scale.reshape(n, 1).contiguous()
     try:
         status, output = hipblaslt_w8a8_gemm(
             x_q_2d,

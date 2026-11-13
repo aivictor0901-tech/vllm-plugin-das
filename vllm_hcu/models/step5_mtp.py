@@ -7,6 +7,7 @@ Adapted from water18-0910 implementation for vLLM 0.28 compatibility.
 
 from collections.abc import Iterable
 from copy import copy
+import re
 
 import torch
 import torch.nn as nn
@@ -21,16 +22,23 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.interfaces import MixtureOfExperts
 from vllm.model_executor.models.utils import (
+    WeightsMapper,
     get_spec_layer_idx_from_weight_name,
     maybe_prefix,
 )
 from vllm.sequence import IntermediateTensors
 
-from .step5_text import Step5DecoderLayer
+from .step5_text import (
+    MIXED_DENSE_INT8,
+    Step5DecoderLayer,
+    _QUANT_TENSOR_SUFFIXES,
+    _check_dense_int8_dtype,
+    _fp32_gemma_rms_norm,
+    _validate_int8_loaded_scales,
+)
 
 logger = init_logger("vllm.step5.step5_mtp")
 
@@ -61,9 +69,47 @@ def _get_mtp_config(vllm_config: VllmConfig) -> PretrainedConfig:
     return hf_config
 
 
-def _fp32_gemma_rms_norm(hidden_size: int, eps: float) -> GemmaRMSNorm:
-    """Create a fp32 GemmaRMSNorm for Step5 MTP."""
-    return GemmaRMSNorm(hidden_size, eps)
+def _get_mtp_quant_config(
+    quant_config: QuantizationConfig | None, prefix: str
+) -> QuantizationConfig | None:
+    """Map this head's checkpoint targets without changing the target model."""
+    if (
+        not MIXED_DENSE_INT8
+        or quant_config is None
+        or quant_config.get_name() != "compressed-tensors"
+    ):
+        return quant_config
+
+    # Checkpoint MTP layers use absolute layer indices but omit ``mtp_block``.
+    # Keep the real runtime prefix for attention/cache identities and map only
+    # this layer's explicit targets (including ignore entries) through vLLM.
+    layer_idx = prefix.rsplit(".layers.", 1)[-1]
+    if not layer_idx.isdecimal():
+        raise ValueError(f"Invalid Step5 MTP layer prefix: {prefix}")
+    # The VL target's native mapper has already renamed its literal targets
+    # to language_model.model.* before the same config reaches the MTP loader.
+    source = rf"(?:language_model\.)?{re.escape(f'model.layers.{layer_idx}')}"
+    mapper = WeightsMapper(orig_to_new_regex={
+        re.compile(rf"^{source}\.(self_attn|mlp)\."):
+            rf"{prefix}.mtp_block.\1.",
+        re.compile(rf"^{source}\.transformer\.shared_head\.output$"):
+            f"{prefix}.shared_head.head",
+        re.compile(rf"^{source}\.(enorm|hnorm|eh_proj)$"):
+            rf"{prefix}.\1",
+    })
+    # Do not let two differently configured literal targets silently collapse
+    # to one runtime name when applying the standard compressed-tensors mapper.
+    mapped_targets = {}
+    for target, scheme in quant_config.target_scheme_map.items():
+        mapped = (mapper._map_name(target) if "." in target
+                  and not target.startswith("re:") else target)
+        if mapped in mapped_targets and mapped_targets[mapped] != scheme:
+            raise ValueError(f"Conflicting Step5 MTP quantization targets: {mapped}")
+        mapped_targets[mapped] = scheme
+
+    layer_quant_config = copy(quant_config)
+    layer_quant_config.apply_vllm_mapper(mapper)
+    return layer_quant_config
 
 
 class Step5MTPSharedHead(nn.Module):
@@ -106,7 +152,7 @@ class Step5MultiTokenPredictorLayer(nn.Module):
         self.fp32_residual_connection = getattr(
             config, "fp32_residual_connection", False
         )
-        quant_config = vllm_config.quant_config
+        quant_config = _get_mtp_quant_config(vllm_config.quant_config, prefix)
         self.enorm = _fp32_gemma_rms_norm(config.hidden_size, config.rms_norm_eps)
         self.hnorm = _fp32_gemma_rms_norm(config.hidden_size, config.rms_norm_eps)
         self.eh_proj = nn.Linear(config.hidden_size * 2, config.hidden_size, bias=False)
@@ -120,6 +166,7 @@ class Step5MultiTokenPredictorLayer(nn.Module):
         # Preserve the checkpoint's absolute layer index for all per-layer
         # settings and quantization prefixes. Do not mutate the shared config.
         decoder_config = copy(vllm_config)
+        decoder_config.quant_config = quant_config
         decoder_config.model_config = copy(vllm_config.model_config)
         decoder_config.model_config.hf_config = config
         self.mtp_block = Step5DecoderLayer(
@@ -308,6 +355,21 @@ class Step5MTP(nn.Module, MixtureOfExperts):
         ]
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
+        int8_weights: set[tuple[str, str | int | None]] = set()
+        int8_scales: set[tuple[str, str | int | None]] = set()
+
+        def load_parameter(name, param, loaded_weight, shard_id=None):
+            if MIXED_DENSE_INT8:
+                _check_dense_int8_dtype(name, param, loaded_weight)
+            weight_loader = getattr(param, "weight_loader", default_weight_loader)
+            if shard_id is None:
+                weight_loader(param, loaded_weight)
+            else:
+                weight_loader(param, loaded_weight, shard_id)
+            if param.dtype == torch.int8 and name.endswith(".weight"):
+                int8_weights.add((name.removesuffix(".weight"), shard_id))
+            elif name.endswith(".weight_scale"):
+                int8_scales.add((name.removesuffix(".weight_scale"), shard_id))
 
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
@@ -332,8 +394,7 @@ class Step5MTP(nn.Module, MixtureOfExperts):
                     continue
 
                 param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
+                load_parameter(name, param, loaded_weight, shard_id)
                 break
             else:
                 # Handle other weights
@@ -349,14 +410,30 @@ class Step5MTP(nn.Module, MixtureOfExperts):
                 if "embed_tokens" in name:
                     name = "model.embed_tokens.weight"
                 if name not in params_dict:
+                    if MIXED_DENSE_INT8 and (
+                        loaded_weight.dtype == torch.int8
+                        or name.endswith(_QUANT_TENSOR_SUFFIXES)
+                    ):
+                        raise ValueError(
+                            f"step5 MTP: no parameter for quantized checkpoint "
+                            f"tensor {name}; check the MTP block/shared-head "
+                            "quantization target mapping"
+                        )
                     logger.warning_once(
                         "Skipping unexpected MTP checkpoint weight: %s", name
                     )
                     continue
                 param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
+                load_parameter(name, param, loaded_weight)
             loaded_params.add(name)
+
+        if MIXED_DENSE_INT8 and (missing_scales := int8_weights - int8_scales):
+            raise ValueError(
+                "step5 MTP: missing INT8 weight_scale for checkpoint "
+                f"projection/shard {sorted(missing_scales, key=str)}"
+            )
+        if MIXED_DENSE_INT8:
+            _validate_int8_loaded_scales(self, loaded_params)
 
         # Report embed_tokens as loaded
         loaded_params.update(
