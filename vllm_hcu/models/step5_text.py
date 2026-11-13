@@ -120,7 +120,6 @@ from vllm.model_executor.models.utils import (
     WeightsMapper,
     extract_layer_index,
     is_pp_missing_parameter,
-    make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
     sequence_parallel_chunk,
@@ -1954,8 +1953,21 @@ class Step5Model(nn.Module):
         else:
             self.norm = PPMissingLayer()
 
-        self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
-            ["hidden_states"], config.hidden_size
+    def make_empty_intermediate_tensors(
+        self, batch_size: int, dtype: torch.dtype, device: torch.device
+    ) -> IntermediateTensors:
+        # vLLM's V2 runner passes model_config.dtype here and copies received
+        # PP activations into this buffer. Step5 carries its residual in FP32
+        # across layers, including the PP boundary; a BF16 buffer would silently
+        # round it before the next stage converts it back to FP32.
+        return IntermediateTensors(
+            {
+                "hidden_states": torch.zeros(
+                    (batch_size, self.config.hidden_size),
+                    dtype=torch.float32 if self.fp32_residual_connection else dtype,
+                    device=device,
+                )
+            }
         )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:

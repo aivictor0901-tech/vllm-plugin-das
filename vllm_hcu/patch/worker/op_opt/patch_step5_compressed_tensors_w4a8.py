@@ -39,11 +39,14 @@ def compressed_tensors_w4a8_to_slimquant(packed: torch.Tensor) -> torch.Tensor:
     if packed.ndim != 2:
         raise ValueError(f"expected rank-2 packed weights, got {tuple(packed.shape)}")
 
-    words = packed.unsqueeze(-1)
-    shifts = torch.arange(8, device=packed.device, dtype=torch.int32) * 4
-    nibbles = ((words >> shifts) & 0xF) ^ 0x8
-    bytes_ = ((nibbles[..., 0::2] << 4) | nibbles[..., 1::2]).to(torch.uint8)
-    return bytes_.flatten(-2).contiguous().view(torch.int8)
+    # Reuse the packed loader's byte-wise conversion. Expanding every nibble
+    # to INT32 creates an 8x temporary and costly CPU OpenMP work per expert.
+    # Both paths consume the same signed, high-nibble-first W4A8 byte layout.
+    from vllm_hcu.model_executor.layers.quantization.ct_w4a8_step5 import (
+        ct_int32_to_packed_int4,
+    )
+
+    return ct_int32_to_packed_int4(packed)
 
 
 @functools.lru_cache(maxsize=1)

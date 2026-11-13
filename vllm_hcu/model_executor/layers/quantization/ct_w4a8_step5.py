@@ -26,6 +26,18 @@ def ct_int32_to_packed_int4(packed: torch.Tensor) -> torch.Tensor:
     """Re-encode CT INT32 storage as signed nibble pairs, with identical bytesize."""
     if packed.dtype != torch.int32 or packed.ndim not in (2, 3):
         raise ValueError("Expected 2-D or 3-D compressed-tensors INT32 weights")
+    if packed.device.type == "cpu":
+        # Checkpoints arrive on CPU. Byte-wise NumPy ufuncs avoid launching an
+        # OpenMP team for each tiny repacking step, without changing Torch's
+        # process-wide thread setting. Every operation creates a new array:
+        # the memory-mapped checkpoint must remain untouched.
+        import numpy as np
+
+        raw = packed.contiguous().numpy().view(np.uint8)
+        signed_pairs = np.bitwise_xor(raw, np.uint8(0x88))
+        result = (signed_pairs << np.uint8(4)) | (signed_pairs >> np.uint8(4))
+        return torch.from_numpy(result.view(np.int8))
+
     signed_pairs = packed.contiguous().view(torch.uint8).bitwise_xor(0x88)
     return ((signed_pairs << 4) | (signed_pairs >> 4)).view(torch.int8)
 
