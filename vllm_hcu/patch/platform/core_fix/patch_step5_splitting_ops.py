@@ -48,7 +48,10 @@ def apply_to_module(module: ModuleType) -> bool:
                 os.environ.get("VLLM_HCU_STEP5_SWA_FUSED_QK", "0") == "1"
             )
             requested_ops = []
-            if fused_gate and swa_fused_qk:
+            int8_epilogue = henvs.optional_custom_op_enabled(
+                os.environ.get("VLLM_HCU_STEP5_SWA_INT8_EPILOGUE", "0") == "1"
+            )
+            if (fused_gate or int8_epilogue) and swa_fused_qk:
                 requested_ops.append("vllm::step5_swa_attention_gate_quant")
             if swa_fused_qk:
                 requested_ops.append("vllm::step5_swa_qk_norm_rope_cache")
