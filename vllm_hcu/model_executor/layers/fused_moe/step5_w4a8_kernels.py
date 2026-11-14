@@ -153,9 +153,9 @@ def _small_route_gather(
         tl.store(out_scale + position, tl.load(scale + token * SCALE_STRIDE))
 
 
-def small_permute(a, scale, ids, mapping, experts, out, global_experts=352):
+def small_permute(a, scale, ids, mapping, experts, out, global_experts=352, alignment=64):
     routes = ids.numel()
-    bound = padded_route_rows(ids.shape[0], ids.shape[1], experts)
+    bound = padded_route_rows(ids.shape[0], ids.shape[1], experts, alignment)
     assert out.shape == (bound, a.shape[1]) and 0 < routes <= 2048
     indices = torch.empty((bound,), device=a.device, dtype=torch.int32)
     inverse = torch.empty_like(ids)
@@ -168,7 +168,7 @@ def small_permute(a, scale, ids, mapping, experts, out, global_experts=352):
         routes,
         global_experts,
         experts,
-        64,
+        alignment,
         bound,
         triton.next_power_of_2(routes),
         triton.next_power_of_2(experts + 1),
@@ -187,7 +187,7 @@ def small_permute(a, scale, ids, mapping, experts, out, global_experts=352):
         triton.next_power_of_2(a.shape[1]),
         num_warps=4,
     )
-    return out, scales, indices, inverse, 64
+    return out, scales, indices, inverse, alignment
 
 
 @triton.jit
