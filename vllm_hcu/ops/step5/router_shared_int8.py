@@ -36,6 +36,7 @@ def _router_shared_int8_kernel(
     NR: tl.constexpr, I: tl.constexpr, LIMIT: tl.constexpr,
     BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
     SPLIT_K: tl.constexpr,
+    DEFER_SHARED: tl.constexpr = False,
 ):
     pid = tl.program_id(0)
     pid_k = tl.program_id(1)
@@ -92,27 +93,28 @@ def _router_shared_int8_kernel(
         tl.store(base + tile, acc_g)
         tl.store(base + BM * BN + tile, acc_u)
         tl.debug_barrier()
-        done = tl.atomic_add(counters_ptr + pid, 1, sem="acq_rel", scope="gpu")
-        if done == SPLIT_K - 1:
-            tg = tl.zeros((BM, BN), tl.int32)
-            tu = tl.zeros((BM, BN), tl.int32)
-            for s in tl.static_range(SPLIT_K):
-                b2 = partials_ptr + (s * num_tiles + pid) * 2 * BM * BN
-                tg += tl.load(b2 + tile)
-                tu += tl.load(b2 + BM * BN + tile)
-            xs = tl.load(xs_ptr + rm, mask=mmask, other=0.0)
-            gs = tl.load(wgs_ptr + rn, mask=nmask, other=0.0)
-            us = tl.load(wgs_ptr + I + rn, mask=nmask, other=0.0)
-            # Native W8A8 first multiplies the two FP32 scales. Preserve this
-            # order and its BF16 rounding boundary, including halfway cases.
-            gate = (tg.to(tl.float32) * (xs[:, None] * gs[None, :])).to(tl.bfloat16).to(tl.float32)
-            up = (tu.to(tl.float32) * (xs[:, None] * us[None, :])).to(tl.bfloat16).to(tl.float32)
-            y = tl.minimum(tl.sigmoid(gate) * gate, LIMIT) * tl.minimum(
-                tl.maximum(up, -LIMIT), LIMIT
-            )
-            tl.store(act_ptr + rm[:, None] * I + rn[None, :], y.to(tl.bfloat16),
-                     mask=mmask[:, None] & nmask[None, :])
-            tl.atomic_xchg(counters_ptr + pid, 0, sem="relaxed", scope="gpu")
+        if not DEFER_SHARED:
+            done = tl.atomic_add(counters_ptr + pid, 1, sem="acq_rel", scope="gpu")
+            if done == SPLIT_K - 1:
+                tg = tl.zeros((BM, BN), tl.int32)
+                tu = tl.zeros((BM, BN), tl.int32)
+                for s in tl.static_range(SPLIT_K):
+                    b2 = partials_ptr + (s * num_tiles + pid) * 2 * BM * BN
+                    tg += tl.load(b2 + tile)
+                    tu += tl.load(b2 + BM * BN + tile)
+                xs = tl.load(xs_ptr + rm, mask=mmask, other=0.0)
+                gs = tl.load(wgs_ptr + rn, mask=nmask, other=0.0)
+                us = tl.load(wgs_ptr + I + rn, mask=nmask, other=0.0)
+                # Native W8A8 first multiplies the two FP32 scales. Preserve this
+                # order and its BF16 rounding boundary, including halfway cases.
+                gate = (tg.to(tl.float32) * (xs[:, None] * gs[None, :])).to(tl.bfloat16).to(tl.float32)
+                up = (tu.to(tl.float32) * (xs[:, None] * us[None, :])).to(tl.bfloat16).to(tl.float32)
+                y = tl.minimum(tl.sigmoid(gate) * gate, LIMIT) * tl.minimum(
+                    tl.maximum(up, -LIMIT), LIMIT
+                )
+                tl.store(act_ptr + rm[:, None] * I + rn[None, :], y.to(tl.bfloat16),
+                         mask=mmask[:, None] & nmask[None, :])
+                tl.atomic_xchg(counters_ptr + pid, 0, sem="relaxed", scope="gpu")
 
 
 def make_router_shared_int8_workspace(
@@ -202,13 +204,88 @@ direct_register_custom_op(
 )
 
 
+def _shared_int8_epilogue(
+    input: torch.Tensor, xscale: torch.Tensor | None = None,
+    wscale: torch.Tensor | None = None, router_columns: int = 352, limit: float = 7.0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    from lightop.moe import shared_gateup_int8_epilogue
+
+    return shared_gateup_int8_epilogue(
+        input, xscale, wscale, router_columns, limit,
+    )
+
+
+def _shared_int8_epilogue_fake(input, xscale=None, wscale=None, router_columns=352, limit=7.0):
+    rows = xscale.shape[0] if input.dtype == torch.int32 else input.shape[0]
+    return (
+        input.new_empty((rows, 384), dtype=torch.int8),
+        input.new_empty((rows, 1), dtype=torch.float32),
+    )
+
+
+direct_register_custom_op(
+    op_name="step5_shared_int8_epilogue", op_func=_shared_int8_epilogue,
+    mutates_args=[], fake_impl=_shared_int8_epilogue_fake,
+)
+
+
+def _router_shared_int8_quant(
+    x: torch.Tensor, w_router: torch.Tensor, w_gate_up: torch.Tensor,
+    weight_scale: torch.Tensor, partials: torch.Tensor, counters: torch.Tensor,
+    limit: float, xq: torch.Tensor | None = None, xs: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    from lightop.quant import per_token_quant_int8
+
+    m, k = x.shape
+    nr = w_router.shape[1]
+    logits = x.new_empty((m, nr), dtype=torch.float32)
+    if m == 0:
+        q, scale = _shared_int8_epilogue_fake(x, limit=limit)
+        return logits, q, scale
+    if xq is None:
+        xq, xs = per_token_quant_int8(x)
+    tiles = triton.cdiv(m, _BM) * (triton.cdiv(nr, _BN) + 6)
+    # The original GEMM tiles/layout are unchanged. Its shared epilogue is
+    # replaced by the same full-row LightOp operation used after hipBLASLt.
+    _router_shared_int8_kernel[(tiles, _SPLIT_K)](
+        x, xq, xs, w_router, w_gate_up, weight_scale,
+        logits, x, partials, counters, m, k, x.stride(0), w_router.stride(0),
+        NR=nr, I=384, LIMIT=limit, BM=_BM, BN=_BN, BK=_BK, SPLIT_K=_SPLIT_K,
+        DEFER_SHARED=True, num_warps=_WARPS, num_stages=_STAGES,
+    )
+    q, scale = torch.ops.vllm.step5_shared_int8_epilogue(
+        partials, xs, weight_scale, nr, limit,
+    )
+    return logits, q, scale
+
+
+def _router_shared_int8_quant_fake(
+    x, w_router, w_gate_up, weight_scale, partials, counters, limit, xq=None, xs=None,
+):
+    return (
+        x.new_empty((x.shape[0], w_router.shape[1]), dtype=torch.float32),
+        x.new_empty((x.shape[0], 384), dtype=torch.int8),
+        x.new_empty((x.shape[0], 1), dtype=torch.float32),
+    )
+
+
+direct_register_custom_op(
+    op_name="step5_router_shared_int8_quant", op_func=_router_shared_int8_quant,
+    mutates_args=["partials", "counters"], fake_impl=_router_shared_int8_quant_fake,
+)
+
+
 def router_shared_swiglustep_int8(
     x: torch.Tensor, w_router: torch.Tensor, w_gate_up: torch.Tensor,
     weight_scale: torch.Tensor, limit: float,
     workspace: tuple[torch.Tensor, torch.Tensor] | None = None,
     x_and_scale_quanted: tuple[torch.Tensor, torch.Tensor] | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return FP32 router logits and BF16 activation from checkpoint INT8 weights.
+    quantized_output: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor | tuple[torch.Tensor, torch.Tensor]]:
+    """Return FP32 router logits and shared activation from checkpoint INT8 weights.
+
+    The default activation is BF16. With quantized_output=True, return its
+    INT8 payload and full-row FP32 scale after preserving BF16 rounding.
 
     A model layer supplies its own workspace. Direct eager callers may omit it;
     direct graph callers must prepare it before capture, avoiding a zero-fill
@@ -241,6 +318,13 @@ def router_shared_swiglustep_int8(
         or partials.numel() < _SPLIT_K * tiles * 2 * _BM * _BN
     ):
         raise ValueError("invalid private router/shared INT8 workspace")
+    if quantized_output:
+        if I != 384:
+            raise ValueError("shared INT8 epilogue requires the384-wide TP4 shard")
+        logits, q, scale = torch.ops.vllm.step5_router_shared_int8_quant(
+            x, w_router, w_gate_up, weight_scale, partials, counters, float(limit), xq, xs,
+        )
+        return logits, (q, scale)
     return torch.ops.vllm.step5_router_shared_int8(
         x, w_router, w_gate_up, weight_scale, partials, counters, float(limit), xq, xs
     )

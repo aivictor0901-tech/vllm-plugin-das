@@ -290,10 +290,12 @@ class SharedExperts(torch.nn.Module):
         activation = take(hidden_states)
         if activation is None:
             return False
-        assert activation.device == hidden_states.device
-        assert activation.shape[0] == hidden_states.shape[0]
+        tensors = activation if isinstance(activation, tuple) else (activation,)
+        assert all(value.device == hidden_states.device for value in tensors)
+        assert all(value.shape[0] == hidden_states.shape[0] for value in tensors)
         self._stream.wait_stream(current_stream())
-        activation.record_stream(self._stream)
+        for value in tensors:
+            value.record_stream(self._stream)
         with torch.cuda.stream(self._stream):
             self._output[index] = project(activation)
         self._output_pending_on_stream[index] = True

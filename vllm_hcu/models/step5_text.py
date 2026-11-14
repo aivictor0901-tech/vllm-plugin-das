@@ -723,7 +723,11 @@ class BF16FP32RouterLinear(ReplicatedLinear):
             self._fused_shared = [mlp]
             self._fused_shared_int8 = True
             mlp.enable_fused_router_shared(RSG_INT8_MAX_M)
-            self._rsg_int8 = router_shared_swiglustep_int8
+            self._rsg_int8 = (
+                functools.partial(router_shared_swiglustep_int8, quantized_output=True)
+                if getattr(mlp, "_shared_output_int8", False)
+                else router_shared_swiglustep_int8
+            )
             if self.weight.is_cuda:
                 self._rsg_int8_workspace = make_router_shared_int8_workspace(
                     self.weight.device,
@@ -951,7 +955,9 @@ class Step5MLP(nn.Module):
         # functionalization the router and the shared expert see different
         # buffers holding the same values. The stream check rejects a stale
         # entry when the shared expert runs on the aux stream before the router.
-        self.fused_act: tuple[int, torch.Size, torch.Tensor] | None = None
+        self.fused_act: tuple[
+            int, torch.Size, torch.Tensor | tuple[torch.Tensor, torch.Tensor]
+        ] | None = None
         self._fused_router_shared_max_m: int | None = None
         self.limit = None
         layer_idx = extract_layer_index(prefix)
@@ -964,6 +970,16 @@ class Step5MLP(nn.Module):
         ):
             self.limit = swiglu_limits_shared[layer_idx]
             self.act_fn = SwigluStepAndMul(limit=self.limit)
+
+        supports = getattr(self.down_proj.quant_method, "supports_quanted_inputs", None)
+        self._shared_output_int8 = (
+            os.getenv("VLLM_HCU_STEP5_SHARED_INT8_EPILOGUE", "0") == "1"
+            and MIXED_DENSE_INT8 and not MIXED_DENSE_DEQUANT
+            and ".share_expert" in prefix and self.limit is not None
+            and self.gate_up_proj.output_size_per_partition == 768
+            and getattr(self.down_proj, "input_is_parallel", False)
+            and callable(supports) and supports()
+        )
 
     def enable_fused_router_shared(self, max_m: int) -> None:
         """Keep short fused-router batches on the stream that made the act."""
@@ -980,7 +996,7 @@ class Step5MLP(nn.Module):
         )
 
     def cache_fused_router_activation(
-        self, hidden_states: torch.Tensor, activation: torch.Tensor
+        self, hidden_states: torch.Tensor, activation: torch.Tensor | tuple[torch.Tensor, torch.Tensor]
     ) -> None:
         """Consume the explicit router result in the internal MoE path."""
         self.fused_act = (
@@ -991,7 +1007,7 @@ class Step5MLP(nn.Module):
 
     def pop_fused_router_activation(
         self, hidden_states: torch.Tensor
-    ) -> torch.Tensor | None:
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | None:
         """Take a fresh activation on its producer stream, before any handoff."""
         fused, self.fused_act = self.fused_act, None
         if (
@@ -1003,10 +1019,19 @@ class Step5MLP(nn.Module):
         return None
 
     def forward_fused_router_activation(
-        self, activation: torch.Tensor
+        self, activation: torch.Tensor | tuple[torch.Tensor, torch.Tensor]
     ) -> torch.Tensor:
         """The shared down projection reads only this independent activation."""
-        output, _ = self.down_proj(activation)
+        if isinstance(activation, tuple):
+            q, scale = activation
+            # Native W8A8 consumes q/scale; this tensor carries only the logical
+            # shape and output dtype. It does not dequantize or reread q.
+            logical_input = q.new_empty(q.shape, dtype=torch.bfloat16)
+            output, _ = self.down_proj._forward_with_hcu_quanted(
+                logical_input, (q, scale),
+            )
+        else:
+            output, _ = self.down_proj(activation)
         return output
 
     def forward(
@@ -1021,7 +1046,14 @@ class Step5MLP(nn.Module):
                 gate_up, _ = self.gate_up_proj._forward_with_hcu_quanted(
                     hidden_states, x_and_scale_quanted,
                 )
-            intermediate_act = self.act_fn(gate_up)
+            if getattr(self, "_shared_output_int8", False):
+                from vllm_hcu.ops.step5 import router_shared_int8  # registers the custom op
+
+                intermediate_act = torch.ops.vllm.step5_shared_int8_epilogue(
+                    gate_up, None, None, 352, float(self.limit),
+                )
+            else:
+                intermediate_act = self.act_fn(gate_up)
         return self.forward_fused_router_activation(intermediate_act)
 
 
