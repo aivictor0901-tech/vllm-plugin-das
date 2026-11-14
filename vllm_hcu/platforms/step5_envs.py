@@ -15,6 +15,9 @@ def is_dsa_disabled() -> bool:
 # These names were exported by the old adapter but have no runtime consumers.
 # Do not translate them into different optimizations with different semantics.
 IGNORED_ENVIRONMENT_VARIABLES = {
+    "VLLM_HCU_STEP5_LIGHTOP_INT8_PERMUTE": lambda: (
+        os.getenv("VLLM_HCU_STEP5_LIGHTOP_INT8_PERMUTE", "0") == "1"
+    ),
     "VLLM_STEP5_DSA_INDEX_TP_SIZE": "Indexer sharding follows the model TP layout.",
     "VLLM_STEP5_ENABLE_QKVG_PROJ": (
         "Use VLLM_HCU_STEP5_FUSE_QKVG to control QKV/gate projection fusion."
