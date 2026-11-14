@@ -1241,6 +1241,9 @@ class Step5Attention(nn.Module):
                 max_position=max_position,
                 params_dtype=torch.get_default_dtype(),
                 num_attention_heads=total_num_attention_heads or self.total_num_heads,
+                use_lightop_spec_indexer=(
+                    os.getenv("VLLM_STEP5_LIGHTOP_SPEC_INDEXER", "0") == "1"
+                ),
             )
 
         self.max_position_embeddings = max_position
