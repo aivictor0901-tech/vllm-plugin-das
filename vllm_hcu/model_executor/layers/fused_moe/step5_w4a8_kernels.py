@@ -191,26 +191,49 @@ def small_permute(a, scale, ids, mapping, experts, out, global_experts=352, alig
 
 
 @triton.jit
+def _activation_row(gateup, quant, scales, row, I: tl.constexpr, BLOCK: tl.constexpr):
+    col = tl.arange(0, BLOCK)
+    g = tl.load(gateup + row * (2 * I) + col, col < I, other=0).to(tl.float32)
+    u = tl.load(gateup + row * (2 * I) + I + col, col < I, other=0).to(tl.float32)
+    y = (
+        (tl.minimum(g * tl.sigmoid(g), 7.0) * tl.minimum(tl.maximum(u, -7.0), 7.0))
+        .to(tl.bfloat16)
+        .to(tl.float32)
+    )
+    maximum = tl.max(tl.where(col < I, tl.abs(y), 0), 0)
+    scale = tl.where(maximum > 0, maximum / 127.0, 1.0)
+    q = tl.minimum(tl.maximum(libdevice.nearbyint(y / scale), -127.0), 127.0).to(tl.int8)
+    tl.store(quant + row * I + col, q, col < I)
+    tl.store(scales + row, scale)
+
+
+@triton.jit
 def _activation(gateup, quant, scales, experts, I: tl.constexpr, BLOCK: tl.constexpr):
     row = tl.program_id(0)
-    col = tl.arange(0, BLOCK)
     if tl.load(experts + row) >= 0:
-        g = tl.load(gateup + row * (2 * I) + col, col < I, other=0).to(tl.float32)
-        u = tl.load(gateup + row * (2 * I) + I + col, col < I, other=0).to(tl.float32)
-        y = (
-            (tl.minimum(g * tl.sigmoid(g), 7.0) * tl.minimum(tl.maximum(u, -7.0), 7.0))
-            .to(tl.bfloat16)
-            .to(tl.float32)
-        )
-        maximum = tl.max(tl.where(col < I, tl.abs(y), 0), 0)
-        scale = tl.where(maximum > 0, maximum / 127.0, 1.0)
-        q = tl.minimum(tl.maximum(libdevice.nearbyint(y / scale), -127.0), 127.0).to(
-            tl.int8
-        )
-        tl.store(quant + row * I + col, q, col < I)
-        tl.store(scales + row, scale)
+        _activation_row(gateup, quant, scales, row, I, BLOCK)
     else:
         tl.store(scales + row, 1.0)
+
+
+@triton.jit
+def _activation_routes(
+    gateup, quant, scales, inverse, experts,
+    ROWS: tl.constexpr, ROUTES: tl.constexpr, I: tl.constexpr,
+    BLOCK: tl.constexpr, PAD_BLOCK: tl.constexpr,
+):
+    route = tl.program_id(0)
+    if route < ROUTES:
+        row = tl.load(inverse + route).to(tl.int32)
+        if row >= 0:
+            _activation_row(gateup, quant, scales, row, I, BLOCK)
+    else:
+        # This CTA writes only invalid rows, disjoint from every valid-route
+        # CTA. Preserve the scale=1 ABI without an additional fill kernel.
+        for start in range(tl.cdiv(ROWS, PAD_BLOCK)):
+            pad_row = start * PAD_BLOCK + tl.arange(0, PAD_BLOCK)
+            invalid = tl.load(experts + pad_row, pad_row < ROWS, other=0) < 0
+            tl.store(scales + pad_row, 1.0, (pad_row < ROWS) & invalid)
 
 
 @triton.jit
