@@ -39,12 +39,13 @@ def _deepgemm_gemm(
     input_scale: torch.Tensor,
     weight_scale: torch.Tensor,
     expert_ids: torch.Tensor,
+    mode: int = 1002,
 ) -> None:
     # Weights already have their single-owner HIPC layout. Scales have already
     # been converted by the checkpoint loader; never repack or rescale here.
     _require_deepgemm_kernel()(
         (input, input_scale), (weight, weight_scale), output, expert_ids,
-        config={"MODE": 1002},
+        config={"MODE": mode},
     )
 
 
@@ -55,6 +56,7 @@ def _deepgemm_gemm_fake(
     input_scale: torch.Tensor,
     weight_scale: torch.Tensor,
     expert_ids: torch.Tensor,
+    mode: int = 1002,
 ) -> None:
     # The output is caller-owned. Keep this free of data-dependent shape guards
     # so FakeTensor and unbacked symbolic batch sizes can trace the operation.
