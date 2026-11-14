@@ -10,6 +10,7 @@ error against an exact reference on the same FP8 bytes.
 import torch
 
 from vllm.triton_utils import tl, triton
+from triton.language.extra import libdevice
 
 _BLOCK_N = 32
 _CHUNK = 64
@@ -264,17 +265,25 @@ def swa_decode_fp8_d192(
 
 @triton.jit
 def _gate_quant_store(x, t, gate_ptr, stride_gt, xq_ptr, xs_ptr,
-                      NH: tl.constexpr, D: tl.constexpr, BD: tl.constexpr):
+                      NH: tl.constexpr, D: tl.constexpr, BD: tl.constexpr,
+                      INT8_OUTPUT: tl.constexpr = False):
     # x: [NH, BD] fp32 (bf16-representable), columns >= D are zero.
     offs_h = tl.arange(0, NH)
     offs_d = tl.arange(0, BD)
     d_ok = offs_d < D
     g = tl.load(gate_ptr + t.to(tl.int64) * stride_gt + offs_h).to(tl.float32)
     x = x * tl.sigmoid(g)[:, None]
-    amax = tl.max(tl.max(tl.abs(x), axis=1), axis=0)
-    # 1/448 rounded to fp32, as Inductor folds the division.
-    scale = tl.maximum(amax * 0.002232142857142857, 1e-12)
-    xq = tl.minimum(tl.maximum(x / scale, -448.0), 448.0).to(tl.float8e4nv)
+    if INT8_OUTPUT:
+        # Preserve both boundaries: combine -> BF16, gate -> BF16 -> INT8.
+        x = x.to(tl.bfloat16).to(tl.float32)
+        amax = tl.maximum(tl.max(tl.max(tl.abs(x), axis=1), axis=0), 1e-10)
+        scale = amax / 127.0
+        xq = libdevice.nearbyint(x * (127.0 / amax)).to(tl.int8)
+    else:
+        amax = tl.max(tl.max(tl.abs(x), axis=1), axis=0)
+        # 1/448 rounded to fp32, as Inductor folds the division.
+        scale = tl.maximum(amax * 0.002232142857142857, 1e-12)
+        xq = tl.minimum(tl.maximum(x / scale, -448.0), 448.0).to(tl.float8e4nv)
     dst = xq_ptr + t.to(tl.int64) * (NH * D) + offs_h[:, None] * D + offs_d[None, :]
     tl.store(dst, xq, mask=d_ok[None, :])
     tl.store(xs_ptr + t, scale)
@@ -285,7 +294,7 @@ def _zero_row(t, xq_ptr, xs_ptr, NH: tl.constexpr, D: tl.constexpr, BD: tl.const
     offs_h = tl.arange(0, NH)
     offs_d = tl.arange(0, BD)
     dst = xq_ptr + t.to(tl.int64) * (NH * D) + offs_h[:, None] * D + offs_d[None, :]
-    tl.store(dst, tl.zeros([NH, BD], tl.float32).to(tl.float8e4nv),
+    tl.store(dst, tl.zeros([NH, BD], tl.float32),
              mask=(offs_d < D)[None, :])
     tl.store(xs_ptr + t, 1.0)
 
@@ -301,6 +310,7 @@ def _swa_combine_gate_quant_kernel(
     QL_MAX: tl.constexpr,
     NUM_SPLITS: tl.constexpr,
     SEQS_P2: tl.constexpr,
+    INT8_OUTPUT: tl.constexpr = False,
 ):
     # One program per token row (all heads): merge the split partials (single
     # pass, online rescaling, so all split loads are issued up front), round to
@@ -339,7 +349,7 @@ def _swa_combine_gate_quant_kernel(
         m_run = m_new
     acc = acc / tl.where(l_sum > 0, l_sum, 1.0)[:, None]
     x = acc.to(tl.bfloat16).to(tl.float32)
-    _gate_quant_store(x, t, gate_ptr, stride_gt, xq_ptr, xs_ptr, NH, 192, 256)
+    _gate_quant_store(x, t, gate_ptr, stride_gt, xq_ptr, xs_ptr, NH, 192, 256, INT8_OUTPUT)
 
 
 @triton.jit
@@ -397,12 +407,14 @@ def swa_decode_fp8_d192_gate_quant(
     gate: torch.Tensor,
     xq: torch.Tensor,
     xs: torch.Tensor,
-    num_warps: int = 8,
+    num_warps: int | None = None,
 ) -> None:
     """swa_decode_fp8_d192 whose combine also applies the per-head sigmoid
     gate and quantizes each token row to fp8 (xq [T, NH * 192], xs [T, 1])."""
     num_heads = q.shape[1]
     num_seqs = cu_seqlens_q.shape[0] - 1
+    if num_warps is None:
+        num_warps = 8
     m_ws, l_ws, o_ws, group, ql_max, num_splits = _swa_split(
         q, k, v, cu_seqlens_q, seqused_k, block_table, softmax_scale, window_left
     )
@@ -411,5 +423,7 @@ def swa_decode_fp8_d192_gate_quant(
         gate, gate.stride(0), xq, xs,
         NH=num_heads, GROUP=group, QL_MAX=ql_max, NUM_SPLITS=num_splits,
         SEQS_P2=max(triton.next_power_of_2(num_seqs), 2),
+        INT8_OUTPUT=xq.dtype == torch.int8,
         num_warps=num_warps,
+        enable_fp_fusion=xq.dtype != torch.int8,
     )

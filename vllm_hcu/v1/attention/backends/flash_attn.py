@@ -1446,7 +1446,8 @@ class FlashAttentionImpl(AttentionImpl):
         ):
             return False
         logger.info_once(
-            "[HCU FLASH_ATTN PATH] swa_decode_fp8_d192 + gate/fp8 quant epilogue",
+            "[HCU FLASH_ATTN PATH] swa_decode_fp8_d192 + gate/%s quant epilogue",
+            "int8" if xq.dtype == torch.int8 else "fp8",
             scope="local",
         )
         swa_decode_fp8_d192_gate_quant(

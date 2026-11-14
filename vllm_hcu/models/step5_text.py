@@ -1231,6 +1231,10 @@ class Step5Attention(nn.Module):
         if self.int8_gate_quant:
             # AOT graph loading needs the operator/schema before any forward.
             from vllm_hcu.ops.step5 import attention_int8 as _attention_int8  # noqa: F401
+        self.swa_int8_epilogue = (
+            self.int8_gate_quant and self.swa_fused_qk
+            and _get_step5_swa_fused().INT8_EPILOGUE
+        )
 
         # Step-5 uses 1/3 on full-attention layers, so take the rotary width from
         # get_rope (int(head_size * factor)) instead of assuming 1 or 1/2.
@@ -1454,13 +1458,15 @@ class Step5Attention(nn.Module):
             extra_dims = None
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         if self.swa_fused_qk:
+            int8_epilogue = self.swa_int8_epilogue and torch.compiler.is_compiling()
             attn_output = _get_step5_swa_fused().forward(
                 self,
                 positions,
                 qkv,
                 v,
                 k,
-                gate=extra_dims if self.fused_gate else None,
+                gate=extra_dims if self.fused_gate or int8_epilogue else None,
+                int8_output=int8_epilogue,
             )
             return self._gate_o_proj(attn_output, extra_dims, hidden_states)
         q_by_head = q.view(*q.shape[:-1], q.shape[-1] // self.head_dim, self.head_dim)
@@ -1492,6 +1498,13 @@ class Step5Attention(nn.Module):
     ) -> torch.Tensor:
         if isinstance(attn_output, tuple):
             # Already gated and quantized (step5_swa_fused, fused_gate).
+            if attn_output[0].dtype == torch.int8:
+                # Only metadata is read from input; the explicit pair owns
+                # the payload/scale and the provider retains BF16 output.
+                output, _ = self.o_proj._forward_with_hcu_quanted(
+                    attn_output[0], attn_output
+                )
+                return output
             output, _ = self.o_proj(attn_output)
             return output
         if self.fused_gate and extra_dims is not None:

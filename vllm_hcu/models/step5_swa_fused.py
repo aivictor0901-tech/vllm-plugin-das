@@ -42,6 +42,9 @@ SWA_FUSED_QK = henvs.optional_custom_op_enabled(
 FUSED_GATE = henvs.optional_custom_op_enabled(
     os.environ.get("VLLM_HCU_STEP5_FUSED_GATE", "0") == "1"
 )
+INT8_EPILOGUE = henvs.optional_custom_op_enabled(
+    os.environ.get("VLLM_HCU_STEP5_SWA_INT8_EPILOGUE", "0") == "1"
+)
 OP_NAME = "step5_swa_qk_norm_rope_cache"
 GATED_OP_NAME = "step5_swa_attention_gate_quant"
 
@@ -373,6 +376,19 @@ def _gated_op_impl(
 
     output = torch.empty(query.shape, dtype=torch.bfloat16, device=query.device)
     layer.impl.forward(layer, query, key, value, kv_cache, attn_metadata, output=output)
+    if xq.dtype == torch.int8:
+        from vllm_hcu.ops.step5.attention_int8 import _gate_quant_int8_kernel
+
+        valid = attn_metadata.num_actual_tokens
+        if valid:
+            _gate_quant_int8_kernel[(valid,)](
+                output, gate, xq, xs, gate.stride(0), NH=gate.shape[1],
+                D=192, B=xq.shape[1] // 3, num_warps=2, num_stages=1,
+            )
+        if valid < xq.shape[0]:
+            xq[valid:].zero_()
+            xs[valid:].fill_(1.0)
+        return
     gate_quant_fp8(
         output.view(output.shape[0], -1),
         gate,
@@ -382,11 +398,23 @@ def _gated_op_impl(
     )
 
 
-if SWA_FUSED_QK and FUSED_GATE:
+def _gated_op_fake(
+    query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
+    gate: torch.Tensor, xq: torch.Tensor, xs: torch.Tensor,
+    layer_name: LayerNameType,
+    kv_cache_dummy_dep: torch.Tensor | None = None,
+) -> None:
+    # Caller-owned outputs retain their metadata. Tracing must not look up a
+    # real attention context or touch the KV cache.
+    return None
+
+
+if SWA_FUSED_QK and (FUSED_GATE or INT8_EPILOGUE):
     direct_register_custom_op(
         op_name=GATED_OP_NAME,
         op_func=_gated_op_impl,
         mutates_args=["xq", "xs"],
+        fake_impl=_gated_op_fake,
     )
 
 
@@ -411,7 +439,7 @@ def can_use(attn_module) -> bool:
     )
 
 
-def forward(attn_module, positions, qkv, v_view, k_view, gate=None):
+def forward(attn_module, positions, qkv, v_view, k_view, gate=None, int8_output=False):
     """q/k/v from the fused op, then attention without the separate cache write.
 
     With ``gate`` (FUSED_GATE), returns the gated, fp8-quantized o_proj input
@@ -442,7 +470,7 @@ def forward(attn_module, positions, qkv, v_view, k_view, gate=None):
         xq = torch.empty(
             num_tokens,
             attn_module.num_heads * head_dim,
-            dtype=torch.float8_e4m3fn,
+            dtype=torch.int8 if int8_output else torch.float8_e4m3fn,
             device=qkv.device,
         )
         xs = torch.empty(num_tokens, 1, dtype=torch.float32, device=qkv.device)
