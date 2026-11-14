@@ -3,6 +3,7 @@
 Selected by the normal SlimQuant method only for the explicit Step5 profile.
 """
 
+import os
 import torch
 import triton
 from vllm.logger import init_logger
@@ -12,6 +13,7 @@ from functools import lru_cache
 from .step5_w4a8_policy import padded_route_rows, w4a8_execution_plan
 from .step5_w4a8_kernels import (
     _activation,
+    _activation_routes,
     _weighted_output,
     activation_persistent,
     small_permute,
@@ -38,6 +40,7 @@ def _no_reload(*args, **kwargs):
 @lru_cache(maxsize=4)
 def _make_experts_class(phase, backend="deepgemm"):
     is_prefill = phase == "prefill"
+    route_activation = os.environ.get("HCU_STEP5_W4A8_ROUTE_ACTIVATION", "0") == "1"
     # Initialize the public package before HCU replacement modules, avoiding
     # the partial deep_gemm_utils import cycle seen in the original probe.
     import vllm.model_executor.layers.fused_moe  # noqa: F401 - initialize before HCU adapters
@@ -281,7 +284,14 @@ def _make_experts_class(phase, backend="deepgemm"):
             a_scale = torch.empty(
                 (aligned, 1), device=hidden_states.device, dtype=torch.float32
             )
-            if hidden_states.shape[0] >= 1024 and N // 2 == 1536:
+            if route_activation:
+                _activation_routes[(topk_ids.numel() + 1,)](
+                    gateup, intermediate, a_scale, inverse, indices,
+                    aligned, topk_ids.numel(), N // 2,
+                    triton.next_power_of_2(N // 2), 8192,
+                    num_warps=4,
+                )
+            elif hidden_states.shape[0] >= 1024 and N // 2 == 1536:
                 activation_persistent[(min(triton.cdiv(aligned, 8), 1024),)](
                     gateup,
                     intermediate,
