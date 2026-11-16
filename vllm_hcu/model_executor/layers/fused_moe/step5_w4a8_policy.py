@@ -162,18 +162,18 @@ def profile_for_model(config):
         return phase
     if phase == "auto":
         raise ValueError("Step5 auto profile requires DeepEP auto dispatch")
-    expected = (1, 8, 1) if phase == "prefill" else (4, 2, 1)
+    expected = ((1, 8, 1),) if phase == "prefill" else ((4, 2, 1), (4, 4, 1))
     if (
         (
             parallel.tensor_parallel_size,
             parallel.data_parallel_size,
             parallel.pipeline_parallel_size,
         )
-        != expected
+        not in expected
         or not parallel.enable_expert_parallel
         or parallel.enable_eplb
     ):
-        raise ValueError(f"Step5 {phase} requires static TP/DP/PP={expected}, EP8")
+        raise ValueError(f"Step5 {phase} requires static TP/DP/PP in {expected}, with EP enabled")
     return phase
 
 
@@ -191,16 +191,24 @@ def resolve_profile(moe):
         if parallel.enable_eplb:
             raise ValueError("Step5 packed DeepGEMM weights require static expert placement")
         return "auto"
+    expected = ((8, 8),) if phase == "prefill" else ((8, 2), (16, 4))
     if (
-        parallel.enable_eplb
+        phase == "auto"
+        or parallel.enable_eplb
         or parallel.all2all_backend != "allgather_reducescatter"
-        or parallel.ep_size != 8
-        or parallel.dp_size != (8 if phase == "prefill" else 2)
+        or (parallel.ep_size, parallel.dp_size) not in expected
     ):
         raise ValueError(
-            "Step5 native W4A8 requires static EP8 AG/RS and matching P/D ranks"
+            f"Step5 native W4A8 requires static AG/RS with (EP, DP) in {expected}"
         )
     return phase
+
+
+def static_agrs_local_experts(moe):
+    """Complete local experts for the explicitly supported static profiles."""
+    if resolve_profile(moe) not in ("prefill", "decode") or uses_step5_deepep(moe):
+        raise ValueError("Step5 static expert shapes require an AG/RS P/D profile")
+    return 352 // moe.moe_parallel_config.ep_size
 
 
 def padded_route_rows(tokens, topk, experts, alignment=64):

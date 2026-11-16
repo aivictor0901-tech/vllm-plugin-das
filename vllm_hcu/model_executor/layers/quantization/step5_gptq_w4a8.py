@@ -16,6 +16,7 @@ from vllm.model_executor.layers.fused_moe import RoutedExperts, UnquantizedFused
 from vllm_hcu.model_executor.layers.fused_moe.step5_w4a8_policy import (
     compressed_w4a8_config,
     profile_for_model,
+    static_agrs_local_experts,
     uses_step5_deepep,
     validate_gptq_w4a8_scheme,
 )
@@ -57,8 +58,10 @@ class Step5BF16ToFP8MoEMethod(CompressedTensorsW8A8Fp8MoEMethod):
 
     def create_weights(self, layer, num_experts, hidden_size,
                        intermediate_size_per_partition, params_dtype, **attrs):
-        if not uses_step5_deepep(self.moe) and (num_experts, hidden_size, intermediate_size_per_partition) != (44, 4096, 1536):
-            raise ValueError("Step5 mixed FP8 requires 44 complete experts per EP8 rank")
+        if not uses_step5_deepep(self.moe):
+            expected = (static_agrs_local_experts(self.moe), 4096, 1536)
+            if (num_experts, hidden_size, intermediate_size_per_partition) != expected:
+                raise ValueError(f"Step5 mixed FP8 requires complete local expert dimensions {expected}")
         super().create_weights(layer, num_experts, hidden_size,
                                intermediate_size_per_partition, params_dtype, **attrs)
         self._bf16_loaded = set()
@@ -117,8 +120,10 @@ class Step5GPTQW4A8MoEMethod(SlimQuantW4A8Int8AiterMoEMethod):
             # Fail before reading the 335 GiB checkpoint when an incompatible
             # DeepGEMM wheel is installed.
             require_gemm_op("deepgemm")
-        if not uses_step5_deepep(self.moe) and (num_experts, hidden_size, intermediate_size_per_partition) != (44, 4096, 1536):
-            raise ValueError("Step5 GPTQ requires 44 complete experts per EP8 rank")
+        if not uses_step5_deepep(self.moe):
+            expected = (static_agrs_local_experts(self.moe), 4096, 1536)
+            if (num_experts, hidden_size, intermediate_size_per_partition) != expected:
+                raise ValueError(f"Step5 GPTQ requires complete local expert dimensions {expected}")
         super().create_weights(layer, num_experts, hidden_size,
                                intermediate_size_per_partition, params_dtype, **attrs)
         self._gptq_loaded = set()

@@ -10,7 +10,11 @@ from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 from functools import lru_cache
-from .step5_w4a8_policy import padded_route_rows, w4a8_execution_plan
+from .step5_w4a8_policy import (
+    padded_route_rows,
+    w4a8_execution_plan,
+    static_agrs_local_experts,
+)
 from .step5_w4a8_kernels import (
     _activation,
     _activation_routes,
@@ -389,12 +393,13 @@ def prepare_step5_w4a8(method, layer, phase):
     parallel = method.moe.moe_parallel_config
     if parallel.enable_eplb or parallel.all2all_backend != "allgather_reducescatter":
         raise ValueError(
-            "This W4 profile supports static EP8 AG/RS, not EPLB or DeepEP"
+            "This W4 profile supports static EP8/EP16 AG/RS, not EPLB or DeepEP"
         )
-    if tuple(layer.w13_weight.shape) != (44, 3072, 2048) or tuple(
+    local_experts = static_agrs_local_experts(method.moe)
+    if tuple(layer.w13_weight.shape) != (local_experts, 3072, 2048) or tuple(
         layer.w2_weight.shape
-    ) != (44, 4096, 768):
-        raise ValueError("Expected Step5 EP8 packed W4 dimensions")
+    ) != (local_experts, 4096, 768):
+        raise ValueError(f"Expected Step5 EP{parallel.ep_size} packed W4 dimensions")
     if getattr(layer, "swiglu_limit", 7.0) not in (None, 7.0, 7):
         raise ValueError("Step5 W4 activation clamp must remain7")
     if getattr(layer, "_hcu_step5_w4a8_owner", None) is not None:
@@ -429,8 +434,8 @@ def prepare_step5_w4a8(method, layer, phase):
     method.moe_kernel = mk.FusedMoEKernel(prepare, experts)
     decode_mode, decode_alignment = w4a8_execution_plan(128, phase)
     logger.info_once(
-        "[step5-w4a8] gemm_backend=%s, decode MODE=%d/pad%d, profile=%s, static EP8",
-        backend, decode_mode, decode_alignment, phase,
+        "[step5-w4a8] gemm_backend=%s, decode MODE=%d/pad%d, profile=%s, static EP%d",
+        backend, decode_mode, decode_alignment, phase, parallel.ep_size,
     )
     # The modular prepare owns quantize/dispatch and the modular kernel
     # owns pipe/DBO/combine. Outer naive dispatch must therefore be off.
@@ -499,10 +504,24 @@ def validate_loaded_model(model):
             ):
                 raise RuntimeError("Step5 mixed FP8 experts require FP8 weights and FP32 scales")
         expected_layers = len(expected)
-    if (len(layers) != expected_layers or len(storage) != expected_layers * 2
-            or sum(storage.values()) != expected_layers * (36_540_776_448 // 88)):
+    # EP16 owns 22 full experts per rank; EP8 owns 44. Keep the strict
+    # single-storage invariant while accounting for the local expert count.
+    local_counts = {int(m.w13_weight.shape[0]) for m in layers}
+    shapes_valid = len(local_counts) == 1 and local_counts <= {22, 44}
+    expected_bytes = 0
+    for m in layers:
+        e = int(m.w13_weight.shape[0])
+        shapes_valid = shapes_valid and (
+            tuple(m.w13_weight.shape) == (e, 3072, 2048)
+            and tuple(m.w2_weight.shape) == (e, 4096, 768)
+            and m.w13_weight.dtype == m.w2_weight.dtype == torch.int8
+        )
+        expected_bytes += e * (3072 * 2048 + 4096 * 768)
+    if (not shapes_valid or len(layers) != expected_layers
+            or len(storage) != expected_layers * 2
+            or sum(storage.values()) != expected_bytes):
         raise RuntimeError(
-            "Step5 W4A8 must have one packed owner per declared EP8 expert layer"
+            "Step5 W4A8 must have one packed owner per declared EP8/EP16 expert layer"
         )
     logger.info(
         "[step5-w4a8] verified %d W4A8 layers, %d FP8 layers, %d BF16 layers, packed bytes=%d",
