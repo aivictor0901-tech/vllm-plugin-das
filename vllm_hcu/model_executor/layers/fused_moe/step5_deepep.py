@@ -10,6 +10,7 @@ import os
 
 import torch
 import triton
+import triton.language as tl
 import vllm.model_executor.layers.fused_moe  # initialize upstream before HCU
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.logger import init_logger
@@ -34,8 +35,16 @@ def _gemm(a: torch.Tensor, b: torch.Tensor, out: torch.Tensor,
         import deepgemm
         fn = (deepgemm.m_grouped_w4a8_gemm_nt_masked_hipc if masked
               else deepgemm.m_grouped_w4a8_gemm_nt_contiguous_hipc)
+        if masked:
+            # Auto-selected large-M kernels require the canonical rank-3
+            # handle. The N32 view aliases the same packed bytes: reshape
+            # only the metadata, never repack weights on the forward path.
+            b = b.view(a.shape[0], out.shape[2], a.shape[2] // 2)
         args = ((a, a_scale), (b, b_scale), out, layout)
-        fn(*args, *([expected_m] if masked else []), config={"MODE": 1002})
+        # Masked kernels select the architecture/shape-specific plan from
+        # expected_m; contiguous HT keeps its existing weight/layout contract.
+        fn(*args, *([expected_m] if masked else []),
+           config=None if masked else {"MODE": 1002})
     else:
         from .step5_fp8_gemm import grouped_fp8
         grouped_fp8((a, a_scale), (b, b_scale), out, layout,
@@ -239,15 +248,26 @@ def prepare_step5_deepep(method, layer, int4):
     from vllm_hcu.model_executor.layers.fused_moe.prepare_finalize.deepep_auto import DeepEPAutoPrepareAndFinalize
     if not uses_step5_deepep(method.moe):
         raise ValueError("Step5 DeepEP adapter requires a DeepEP backend")
-    if method.moe.moe_parallel_config.enable_eplb:
+    from .step5_ll_eplb_policy import allows_static_step5_ll_eplb
+    if method.moe.moe_parallel_config.enable_eplb and not allows_static_step5_ll_eplb(method.moe):
         raise ValueError("Step5 packed weights require static expert placement")
     gemm_op()
     shared_reduce_op()
+    restore_ll_op()
     quant = method.get_fused_moe_quant_config(layer)
-    prepare = maybe_make_prepare_finalize(moe=method.moe, quant_config=quant,
+    backend = method.moe.moe_parallel_config.all2all_backend
+    prepare_moe = method.moe
+    if backend == "deepep_low_latency" and method.moe.is_sequence_parallel:
+        from dataclasses import replace
+        # Each TP rank dispatches only its token shard. Keep the scheduler
+        # bound (including profiling/prefill), rounded up for LL alignment.
+        sp = method.moe.moe_parallel_config.sp_size
+        sender_tokens = (method.moe.max_num_tokens + sp - 1) // sp
+        prepare_moe = replace(method.moe,
+            max_num_tokens=((sender_tokens + 15) // 16) * 16)
+    prepare = maybe_make_prepare_finalize(moe=prepare_moe, quant_config=quant,
         routing_tables=layer._expert_routing_tables(), allow_new_interface=True,
         use_monolithic=False)
-    backend = method.moe.moe_parallel_config.all2all_backend
     fixed = None
     local = not method.moe.moe_parallel_config.use_all2all_kernels
     if local:
@@ -270,6 +290,12 @@ def prepare_step5_deepep(method, layer, int4):
         ll.use_int8_dispatch = bool(int4)
         ll.use_fp8_dispatch = False
         ll.use_ue8m0_dispatch = False
+        ll._hcu_step5_live_row_fp8 = (
+            not int4 and quant.quant_dtype == torch.float8_e4m3fn
+            and quant.per_act_token_quant and quant.block_shape is None)
+    if fixed is True:
+        from .step5_ll_runtime import install_counter_reset
+        install_counter_reset(ll.buffer)
     capacity = ll.max_num_tokens_per_rank() if fixed is not False else 1
     experts = auto_experts_class(int4)(method.moe, quant, capacity,
         ht.num_dispatchers(), fixed_use_low_latency=fixed,
@@ -336,3 +362,69 @@ def shared_reduce_op():
         direct_register_custom_op(op_name="step5_shared_reduce_scatter",
             op_func=_shared_reduce_impl, mutates_args=[], fake_impl=_shared_reduce_fake)
         return torch.ops.vllm.step5_shared_reduce_scatter.default
+
+
+@triton.jit
+def _ll_shared_routed_partial(shared, routed, out, N: tl.constexpr,
+                              LOCAL_N: tl.constexpr, H: tl.constexpr,
+                              TP: tl.constexpr, RANK: tl.constexpr,
+                              BLOCK: tl.constexpr, COUNTERS=None,
+                              RESET_COUNTERS: tl.constexpr = False):
+    if RESET_COUNTERS and tl.program_id(0) == 0:
+        tl.store(COUNTERS, 0)
+        tl.store(COUNTERS + 1, 0)
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    row = offsets // H
+    shared_value = tl.load(shared + offsets, mask=row < N, other=0.).to(tl.float32)
+    local_offset = offsets - RANK * LOCAL_N * H
+    owner = (row >= RANK * LOCAL_N) & (row < (RANK + 1) * LOCAL_N)
+    routed_value = tl.load(routed + local_offset, mask=owner, other=0.).to(tl.float32)
+    tl.store(out + offsets, shared_value + routed_value, mask=row < TP * LOCAL_N)
+
+
+def restore_ll_shared_and_routed(shared, routed, tp_group):
+    """Restore uniquely owned LL tokens and sum shared TP partials once."""
+    return restore_ll_op()(shared, routed, tp_group.world_size, tp_group.unique_name)
+
+
+def _restore_ll_impl(shared: torch.Tensor, routed: torch.Tensor,
+                     tp_size: int, group_name: str) -> torch.Tensor:
+    from vllm.distributed import get_tp_group
+    group = get_tp_group()
+    if group.world_size != tp_size or group.unique_name != group_name:
+        raise RuntimeError("Step5 LL restore TP group changed")
+    if (shared.dim() != 2 or routed.dim() != 2
+            or not shared.is_contiguous() or not routed.is_contiguous()
+            or shared.shape[1] != routed.shape[1]
+            or routed.shape[0] != (shared.shape[0] + tp_size - 1) // tp_size):
+        raise ValueError("Step5 LL restore input/token ownership mismatch")
+    n, h = shared.shape
+    local_n = routed.shape[0]
+    out = torch.empty((local_n * tp_size, h), dtype=torch.float32, device=shared.device)
+    from .step5_ll_runtime import take_pending_counters, finish_pending_counter_reset
+    counters = take_pending_counters(shared.device)
+    if out.numel() or counters is not None:
+        _ll_shared_routed_partial[(max(1, triton.cdiv(out.numel(), 1024)),)](
+            shared, routed, out, N=n, LOCAL_N=local_n, H=h,
+            TP=tp_size, RANK=group.rank_in_group, BLOCK=1024,
+            COUNTERS=counters, RESET_COUNTERS=counters is not None, num_warps=4)
+        finish_pending_counter_reset()
+    if out.numel():
+        out = group.all_reduce(out)
+    return out
+
+
+def _restore_ll_fake(shared: torch.Tensor, routed: torch.Tensor,
+                     tp_size: int, group_name: str) -> torch.Tensor:
+    return shared.new_empty((routed.shape[0] * tp_size, shared.shape[1]), dtype=torch.float32)
+
+
+@lru_cache(maxsize=1)
+def restore_ll_op():
+    try:
+        return torch.ops.vllm.step5_ll_shared_restore.default
+    except AttributeError:
+        from vllm.utils.torch_utils import direct_register_custom_op
+        direct_register_custom_op(op_name="step5_ll_shared_restore",
+            op_func=_restore_ll_impl, mutates_args=[], fake_impl=_restore_ll_fake)
+        return torch.ops.vllm.step5_ll_shared_restore.default

@@ -1687,6 +1687,17 @@ class FusedMoEBlock(nn.Module):
         self._step5_deepep = (uses_step5_deepep(vllm_config)
                              and vllm_config.parallel_config.enable_expert_parallel
                              and get_ep_group().world_size > 1)
+        # LL routed tokens are uniquely owned across TP. For the ordinary
+        # replicated residual path, sum shared TP partials and restore routed
+        # owners together in one TP collective instead of ReduceScatter + AG.
+        self._step5_ll_fused_restore = (
+            self._step5_deepep
+            and vllm_config.parallel_config.all2all_backend == "deepep_low_latency"
+            and bool(getattr(config, "fp32_residual_connection", False))
+            and not vllm_config.compilation_config.pass_config.enable_sp
+            and self.tp_size == 4
+            and get_ep_group().world_size == 16
+        )
         self.effective_sequence_parallel = (
             (vllm_config.compilation_config.pass_config.enable_sp or self._step5_deepep)
             and self.tp_size > 1
@@ -1716,7 +1727,7 @@ class FusedMoEBlock(nn.Module):
         if (
             FUSED_ROUTER_SHARED
             and isinstance(self.gate, BF16FP32RouterLinear)
-            and self.fold_shared_expert
+            and (self.fold_shared_expert or self._step5_ll_fused_restore)
             and self.share_expert.limit is not None
             and (
                 self.share_expert.gate_up_proj.weight.dtype == torch.bfloat16
@@ -1728,9 +1739,16 @@ class FusedMoEBlock(nn.Module):
             router_bias_func,
             router_bias=self.router_bias,
             routed_scaling_factor=config.moe_router_scaling_factor,
+            # Zero weights do not suppress native DeepEP dispatch. NaN dummy
+            # rows must use its skip sentinel rather than eight copies of ID 0,
+            # which can overflow the per-expert LL receive capacity.
+            nan_row_i_out=-1 if self._step5_deepep else 0,
+            indices_dtype=torch.int64 if self._step5_deepep else torch.int32,
         )
         self.experts = FusedMoEFactory(
-            gate=self.gate,
+            # LL owns only a TP token slice; compute fused shared/router on
+            # the full shared input outside the routed-only runner.
+            gate=None if self._step5_ll_fused_restore else self.gate,
             num_experts=config.moe_num_experts,
             top_k=config.moe_top_k,
             hidden_size=config.hidden_size,
@@ -1750,6 +1768,34 @@ class FusedMoEBlock(nn.Module):
             router_logits_dtype=torch.float32,
             custom_routing_function=custom_routing_function,
         )
+
+        from vllm_hcu.model_executor.layers.fused_moe.step5_ll_eplb_policy import install_int64_eplb_mapping
+        install_int64_eplb_mapping(self.experts.router, vllm_config)
+
+        if self._step5_ll_fused_restore:
+            from vllm_hcu.model_executor.layers.fused_moe.step5_ll_runtime import router_shared_op
+            router_shared_op()
+            self.experts._hcu_step5_ll_router_shared = self._ll_router_shared_eager
+
+    def _ll_router_shared_eager(self, full_input, xq=None, xs=None):
+        """Keep shape-dependent dispatch inside the opaque runtime boundary."""
+        quanted = None if xq is None else (xq, xs)
+        if self.share_expert.requires_main_stream_for_fused_activation(full_input):
+            logits, activation = self.gate(full_input, x_and_scale_quanted=quanted)
+            shared = (self.share_expert.forward_fused_router_activation(activation)
+                      if activation is not None else self.share_expert(
+                          full_input, x_and_scale_quanted=quanted))
+            # logits is newly allocated inside this opaque op. Its owner view
+            # does not alias any op input, so the generic chunk op's mandatory
+            # no-pad clone is unnecessary here.
+            rows = (logits.shape[0] + self.tp_size - 1) // self.tp_size
+            if logits.shape[0] % self.tp_size:
+                logits = torch.nn.functional.pad(
+                    logits, (0, 0, 0, rows * self.tp_size - logits.shape[0]))
+            return shared, logits.narrow(0, get_tp_group().rank_in_group * rows, rows)
+        shared = self.share_expert(full_input, x_and_scale_quanted=quanted)
+        owner = sequence_parallel_chunk(full_input)
+        return shared, self.gate._gemm(owner, self.gate.weight)
 
     @property
     def routed_experts(self):
@@ -1772,7 +1818,8 @@ class FusedMoEBlock(nn.Module):
         hidden_states = hidden_states.view(-1, hidden_dim)
         shared_kwargs = {}
         if shared_x_and_scale_quanted is not None:
-            if not self.fold_shared_expert or input_is_sequence_parallel:
+            if (not (self.fold_shared_expert or self._step5_ll_fused_restore)
+                    or input_is_sequence_parallel):
                 raise ValueError("shared Norm+INT8 requires an unsharded shared input")
             shared_kwargs = dict(
                 shared_input_quanted=shared_x_and_scale_quanted[0],
@@ -1788,13 +1835,31 @@ class FusedMoEBlock(nn.Module):
             full_input = (tensor_model_parallel_all_gather(hidden_states, dim=0)
                           if input_is_sequence_parallel and self.tp_size > 1
                           else hidden_states)
-            shared = shared_expert_token_slice(self.share_expert(full_input), get_tp_group())
             routed_input = (hidden_states if input_is_sequence_parallel or self.tp_size == 1
                             else sequence_parallel_chunk(hidden_states))
+            if self._step5_ll_fused_restore and not input_is_sequence_parallel:
+                xq, xs = (None, None) if shared_x_and_scale_quanted is None else shared_x_and_scale_quanted
+                shared, logits = torch.ops.vllm.step5_ll_router_shared.default(
+                    full_input, xq, xs, self.experts.layer_name,
+                    self.tp_size, self.gate.weight.shape[1])
+                routed = self.experts(hidden_states=routed_input, router_logits=logits)
+                return shared, routed
+            shared = self.share_expert(
+                full_input, x_and_scale_quanted=shared_x_and_scale_quanted)
+            if not self._step5_ll_fused_restore or input_is_sequence_parallel:
+                shared = shared_expert_token_slice(shared, get_tp_group())
             if self.experts.is_internal_router:
                 routed = self.experts(hidden_states=routed_input, router_logits=routed_input)
             else:
-                logits, _ = self.gate(routed_input)
+                if (self._step5_ll_fused_restore
+                        and isinstance(self.gate, BF16FP32RouterLinear)
+                        and routed_input.dtype == torch.bfloat16
+                        and self.gate.weight.shape[0] == routed_input.shape[-1]):
+                    # A full batch outside the fusion range must not compute
+                    # an unused shared activation on its smaller owner slice.
+                    logits = self.gate._gemm(routed_input, self.gate.weight)
+                else:
+                    logits, _ = self.gate(routed_input)
                 routed = self.experts(hidden_states=routed_input, router_logits=logits)
             return shared, routed
         if (
@@ -1966,6 +2031,11 @@ class Step5DecoderLayer(nn.Module):
             hidden_states, input_is_sequence_parallel=input_is_sequence_parallel,
             shared_x_and_scale_quanted=shared_x_and_scale_quanted,
         )
+        if getattr(self.moe, "_step5_ll_fused_restore", False) and not input_is_sequence_parallel:
+            from vllm_hcu.model_executor.layers.fused_moe.step5_deepep import restore_ll_shared_and_routed
+            return restore_ll_shared_and_routed(
+                shared_output, routed_output, get_tp_group()
+            )[:hidden_states.shape[0]]
         if self.moe.experts.moe_config.is_sequence_parallel:
             combined = self._cast_for_residual(shared_output) + self._cast_for_residual(
                 routed_output
@@ -2059,7 +2129,7 @@ class Step5DecoderLayer(nn.Module):
         if (
             INT8_ATTN_NORM_QUANT and torch.compiler.is_compiling()
             and self.compute_dtype == torch.bfloat16 and self.use_moe
-            and self.moe.fold_shared_expert
+            and (self.moe.fold_shared_expert or self.moe._step5_ll_fused_restore)
             and _can_fuse_int8_shared_expert(self.moe.share_expert)
         ):
             from vllm_hcu.ops.step5.attention_int8 import (
