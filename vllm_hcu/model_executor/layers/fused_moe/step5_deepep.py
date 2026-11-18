@@ -163,8 +163,9 @@ class Step5LLExperts(BatchedDeepGemmExperts):
            self.w1_scale.contiguous(), counts, expected, int4, True)
         q = _resize_cache(workspace2.view(dtype), (e, capacity, n // 2))
         scales = torch.empty((e, capacity, 1), device=q.device, dtype=torch.float32)
-        activation_masked[(e, 8)](gateup, q, scales, counts, capacity, n // 2,
-            int4, triton.next_power_of_2(n // 2), num_warps=4)
+        # More independent row programs reduce tails from uneven expert loads.
+        activation_masked[(e, 32)](gateup, q, scales, counts, capacity, n // 2,
+            int4, triton.next_power_of_2(n // 2), ROWS=32, num_warps=4)
         op(q, self._deepgemm_w2, output, scales, self.w2_scale.contiguous(),
            counts, expected, int4, True)
 
