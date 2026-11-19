@@ -1927,6 +1927,10 @@ class Step5Model(nn.Module):
                     else 0
                 ),
             )
+            from vllm_hcu.v1.step5_pcp_memory import compact_dsa_layers, indexer_rope_limit
+
+            self.dsa_state._step5_pcp_rope_cache_limit = indexer_rope_limit(vllm_config)
+            self.dsa_state._step5_pcp_compact_layers = compact_dsa_layers(vllm_config)
             logger.info(
                 "step5: DSA enabled on %d of %d layers (%d...%d)",
                 len(sparse_layers),

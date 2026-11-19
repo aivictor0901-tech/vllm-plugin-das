@@ -165,6 +165,13 @@ class HcuGPUWorker(Worker):
 
         return audit_step5_pcp_quantization(self.model_runner)
 
+    def get_step5_pcp_memory_audit(self, reset_peaks: bool = False) -> dict:
+        from vllm_hcu.v1.step5_pcp_config import is_step5_pcp
+        if not is_step5_pcp(self.vllm_config):
+            raise ValueError('Step5 memory audit requires the isolated PCP path')
+        from vllm_hcu.v1.step5_pcp_memory_audit import audit_memory
+        return audit_memory(self.model_runner, self.device, reset_peaks)
+
     def reload_weights(self, *args, **kwargs) -> None:
         super().reload_weights(*args, **kwargs)
         from vllm_hcu.patch.worker.core_fix.patch_deepseek_v4_attention import (

@@ -19,13 +19,14 @@ def workspace_api():
             self.count = count
         def numel(self):
             return self.count
-    state = dict(device=0, streams={0: 7, 1: 9}, allocations=[])
+    state = dict(device=0, streams={0: 7, 1: 9}, allocations=[], alive_at_allocation=[])
     def device(value, index=None):
         if isinstance(value, NS):
             return value
         kind, _, suffix = value.partition(':')
         return NS(type=kind, index=index if index is not None else int(suffix) if suffix else None)
     def empty(count, **kwargs):
+        state['alive_at_allocation'].append(sum(ref() is not None for ref in state['allocations']))
         value = Owner(count)
         state['allocations'].append(weakref.ref(value))
         return value
@@ -56,6 +57,22 @@ def logits_function(file, class_name, function_name):
 
 
 class WorkspaceLifecycle(unittest.TestCase):
+    def test_small_large_small_growth_drops_old_owner_before_new_allocation(self):
+        api, state, device = workspace_api()
+        x = NS(device=device('cuda:0'))
+        pool = api['_workspace'](x)
+        pool.reserve(13, 4096, 1536, x.device)
+        old = [weakref.ref(pool.integer), weakref.ref(pool.bf16)]
+        pool.reserve(29, 4096, 1536, x.device)
+        self.assertTrue(all(ref() is None for ref in old))
+        # Only the other buffer owner may survive during either allocation;
+        # keeping the replaced owner alive would produce two instead of one.
+        self.assertEqual(state['alive_at_allocation'], [0, 1, 1, 1])
+        larger = (pool.integer, pool.bf16)
+        pool.reserve(1, 4096, 1536, x.device)
+        self.assertEqual((pool.integer, pool.bf16), larger)
+        self.assertEqual(len(state['allocations']), 4)
+
     def test_current_stream_owners_released_idempotently_then_same_pool_reserves_again(self):
         api, state, device = workspace_api()
         x = NS(device=device('cuda:0'))

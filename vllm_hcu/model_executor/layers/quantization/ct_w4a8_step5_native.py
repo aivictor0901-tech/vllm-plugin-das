@@ -148,8 +148,14 @@ class _Workspace:
     def reserve(self, rows, hidden, intermediate, device):
         sizes = workspace_bytes(rows, hidden, intermediate)
         if self.integer is None or self.integer.numel() < sizes["INT8"]:
+            # Disposable scratch has no surviving external views after apply.
+            # All queued users and the next allocation use this pool's stream.
+            # Drop the old owner before RHS allocation to avoid an extra full
+            # old-buffer allocation at a small-to-large transition.
+            self.integer = None
             self.integer = torch.empty(sizes["INT8"], dtype=torch.int8, device=device)
         if self.bf16 is None or self.bf16.numel() * 2 < sizes["BF16"]:
+            self.bf16 = None
             self.bf16 = torch.empty(sizes["BF16"] // 2, dtype=torch.bfloat16, device=device)
 
 

@@ -2820,9 +2820,20 @@ class Step4DSAState:
         # so nothing outlives the step (or the graph) it was built in.
         self.step_cache: dict = {}
 
-    def register_layer(self, slot: int) -> None:
+    def register_layer(self, slot: int) -> int:
+        if getattr(self, '_step5_pcp_compact_layers', False):
+            mapping = getattr(self, '_step5_pcp_layer_storage', None)
+            if mapping is None:
+                mapping = self._step5_pcp_layer_storage = {}
+            if slot not in mapping:
+                if self.summary is not None:
+                    raise RuntimeError('Cannot add a DSA layer after compact storage allocation')
+                mapping[slot] = len(mapping)
+            slot = mapping[slot]
         self._registered.add(slot)
-        self.first_slot = min(self._registered)
+        mapping = getattr(self, '_step5_pcp_layer_storage', None)
+        self.first_slot = mapping[min(mapping)] if mapping else min(self._registered)
+        return slot
 
     def reset_allocation(self) -> None:
         """Forget everything sized from, or written against, the bound KV cache.
@@ -2900,13 +2911,17 @@ class Step4DSAState:
         rows = num_blocks * self.regions_per_page
         proxy = self.geometry.proxy_dim
 
+        storage_layers = (len(self._registered) if getattr(self, '_step5_pcp_compact_layers', False)
+                          else self.num_layers)
+        if storage_layers <= 0:
+            raise RuntimeError('DSA storage requires at least one registered local layer')
         self.summary = torch.zeros(
-            (self.num_layers, rows, 1, proxy),
+            (storage_layers, rows, 1, proxy),
             dtype=torch.float8_e4m3fn,
             device=device,
         )
         self.pending_key = torch.zeros(
-            (self.num_layers, self.max_pending + 1, self.geometry.region_size, proxy),
+            (storage_layers, self.max_pending + 1, self.geometry.region_size, proxy),
             dtype=self.dtype,
             device=device,
         )
@@ -2919,7 +2934,7 @@ class Step4DSAState:
             "step4 DSA: %d region summaries x %d layers = %.1f MiB fp8 "
             "(%.1f%% of one DSA layer's KV pool), plus %.1f MiB of pending buffers.",
             rows,
-            self.num_layers,
+            storage_layers,
             self.summary.numel() / 2**20,
             100.0 * self.summary[0].numel() / max(kv_bytes, 1),
             2 * self.pending_key.numel() * self.pending_key.element_size() / 2**20,
@@ -3076,6 +3091,9 @@ class Step4DSAState:
         two agree on the maths but not on the intermediate precision, and the
         difference shows up in bf16 table entries from position 24 onward.
         """
+        limit = int(getattr(self, '_step5_pcp_rope_cache_limit', 0))
+        if limit:
+            max_position = min(int(max_position), limit)
         key = (float(theta), repr(scaling), int(max_position), str(device), dtype)
         cached = self._rope.get(key)
         if cached is None:
@@ -4108,7 +4126,7 @@ class Step4Indexer:
         owner.sparse_indexer_q.weight.weight_loader = sharded
         owner.sparse_indexer_w.weight.weight_loader = sharded
 
-        state.register_layer(dsa_slot)
+        self.slot = state.register_layer(dsa_slot)
 
         # The op is dispatched by name, because a Python object cannot cross a
         # custom-op boundary. Names are unique per layer per process, and vLLM
