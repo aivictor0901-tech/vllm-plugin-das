@@ -141,6 +141,10 @@ _DSA_INDEXER_SUBSTRINGS = (
 # Escape hatch back to the pre-DSA dense path, for A/B against this backend.
 DISABLE_DSA = is_dsa_disabled()
 
+# A full input vocabulary on each TP rank avoids the embedding all-reduce.
+# This changes storage only; the native embedding loader and dtype are kept.
+REPLICATED_EMBEDDING = os.environ.get("HCU_STEP5_REPLICATED_EMBEDDING", "0") == "1"
+
 # Apply placement while checkpoint tensors stream through the plugin loader.
 EXPERT_PLACEMENT = (
     os.environ.get("VLLM_STEP5_EXPERT_PLACEMENT", "")
@@ -2220,9 +2224,15 @@ class Step5Model(nn.Module):
         if get_pp_group().is_first_rank or (
             config.tie_word_embeddings and get_pp_group().is_last_rank
         ):
+            if (REPLICATED_EMBEDDING and config.tie_word_embeddings
+                    and get_tensor_model_parallel_world_size() > 1):
+                raise ValueError(
+                    "Replicated Step5 input embeddings cannot tie a TP-sharded lm_head"
+                )
             self.embed_tokens = VocabParallelEmbedding(
                 self.vocab_size,
                 config.hidden_size,
+                disable_tp=REPLICATED_EMBEDDING,
             )
         else:
             self.embed_tokens = PPMissingLayer()

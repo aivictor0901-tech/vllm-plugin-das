@@ -38,6 +38,10 @@ def warn_ignored_step5_envs() -> None:
 
 
 ENVIRONMENT_VARIABLES = {
+    # Changing embedding TP layout also changes the compiled main graph.
+    "HCU_STEP5_REPLICATED_EMBEDDING": lambda: (
+        os.getenv("HCU_STEP5_REPLICATED_EMBEDDING", "0") == "1"
+    ),
     # One cache factor covers metadata update graphs and prefix/suffix overlap.
     "HCU_STEP5_METADATA_OVERLAP": lambda: (
         os.getenv("HCU_STEP5_METADATA_OVERLAP", "0") == "1"
