@@ -980,7 +980,7 @@ class Step5MLP(nn.Module):
             os.getenv("VLLM_HCU_STEP5_SHARED_INT8_EPILOGUE", "0") == "1"
             and MIXED_DENSE_INT8 and not MIXED_DENSE_DEQUANT
             and ".share_expert" in prefix and self.limit is not None
-            and self.gate_up_proj.output_size_per_partition == 768
+            and self.gate_up_proj.output_size_per_partition in (768, 3072)
             and getattr(self.down_proj, "input_is_parallel", False)
             and callable(supports) and supports()
         )
@@ -1694,13 +1694,13 @@ class FusedMoEBlock(nn.Module):
         # LL routed tokens are uniquely owned across TP. For the ordinary
         # replicated residual path, sum shared TP partials and restore routed
         # owners together in one TP collective instead of ReduceScatter + AG.
+        from vllm_hcu.model_executor.layers.fused_moe.step5_ll_topology import uses_step5_ll_fused_restore
         self._step5_ll_fused_restore = (
             self._step5_deepep
-            and vllm_config.parallel_config.all2all_backend == "deepep_low_latency"
-            and bool(getattr(config, "fp32_residual_connection", False))
-            and not vllm_config.compilation_config.pass_config.enable_sp
-            and self.tp_size == 4
-            and get_ep_group().world_size == 16
+            and uses_step5_ll_fused_restore(vllm_config)
+            and get_ep_group().world_size == (
+                self.tp_size * vllm_config.parallel_config.data_parallel_size
+            )
         )
         self.effective_sequence_parallel = (
             (vllm_config.compilation_config.pass_config.enable_sp or self._step5_deepep)

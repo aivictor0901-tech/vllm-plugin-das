@@ -52,12 +52,12 @@ def _gate_quant_int8_kernel(
 
 
 def usable_gate_quant_int8(x: torch.Tensor, gate: torch.Tensor) -> bool:
-    """Static metadata guard for the measured TP4/TP8 BF16 attention shards."""
+    """Static metadata guard for TP1/TP4/TP8 BF16 attention shards."""
     return (
         x.is_cuda and x.ndim == 2 and x.dtype == torch.bfloat16
         and x.is_contiguous() and 0 <= x.shape[0] <= ATTN_INT8_MAX_M
         and gate.ndim == 2 and gate.dtype == torch.bfloat16
-        and gate.shape[0] == x.shape[0] and gate.shape[1] in (8, 16)
+        and gate.shape[0] == x.shape[0] and gate.shape[1] in (8, 16, 64)
         and x.shape[1] == gate.shape[1] * 192
         and gate.stride(1) == 1 and gate.stride(0) >= gate.shape[1]
         and gate.device == x.device
