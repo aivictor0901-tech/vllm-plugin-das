@@ -101,6 +101,9 @@ class Step5MultiTokenPredictorLayer(nn.Module):
         prefix: str,
     ) -> None:
         super().__init__()
+        from vllm_hcu.v1.step5_pcp_mtp_quant import step5_pcp_mtp_quant_config
+
+        vllm_config = step5_pcp_mtp_quant_config(vllm_config, prefix)
         config = _get_mtp_config(vllm_config)
         self.compute_dtype = vllm_config.model_config.dtype
         self.fp32_residual_connection = getattr(
@@ -242,6 +245,9 @@ class Step5MTP(nn.Module, MixtureOfExperts):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
+        from vllm_hcu.v1.step5_pcp_config import is_step5_pcp
+
+        self._step5_pcp_quant_guard = is_step5_pcp(vllm_config)
         self.config = _get_mtp_config(vllm_config)
         self.vllm_config = vllm_config
         self.model = Step5MultiTokenPredictor(
@@ -332,6 +338,10 @@ class Step5MTP(nn.Module, MixtureOfExperts):
                     continue
 
                 param = params_dict[name]
+                if getattr(self, "_step5_pcp_quant_guard", False) and name.endswith(".weight"):
+                    from vllm_hcu.models.step5_text import _check_dense_int8_dtype
+
+                    _check_dense_int8_dtype(name, param, loaded_weight)
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
                 break
@@ -349,11 +359,19 @@ class Step5MTP(nn.Module, MixtureOfExperts):
                 if "embed_tokens" in name:
                     name = "model.embed_tokens.weight"
                 if name not in params_dict:
+                    if getattr(self, "_step5_pcp_quant_guard", False) and name.endswith((".weight_scale", ".weight_scale_inv")):
+                        raise ValueError(
+                            f"Step5 PCP MTP checkpoint scale has no parameter: {name}"
+                        )
                     logger.warning_once(
                         "Skipping unexpected MTP checkpoint weight: %s", name
                     )
                     continue
                 param = params_dict[name]
+                if getattr(self, "_step5_pcp_quant_guard", False) and name.endswith(".weight"):
+                    from vllm_hcu.models.step5_text import _check_dense_int8_dtype
+
+                    _check_dense_int8_dtype(name, param, loaded_weight)
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
             loaded_params.add(name)

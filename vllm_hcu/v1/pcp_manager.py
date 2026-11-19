@@ -118,6 +118,11 @@ class HcuPCPManager:
             self._dcp_group = dcp_group
             self.dcp_rank = 0
         self._use_mla = bool(vllm_config.model_config.use_mla)
+        from vllm_hcu.v1.step5_pcp_config import is_step5_pcp
+
+        # Step5 DSA projections need nonempty, uniform virtual rows even when
+        # a short prefill gives a peer no actual query tokens.
+        self._uniform_attn_rows = self._use_mla or is_step5_pcp(vllm_config)
 
         self._req_states = req_states
         self._block_tables = block_tables
@@ -249,7 +254,7 @@ class HcuPCPManager:
     ) -> int:
         """Return the largest real rank-local batch before runner padding."""
 
-        if self._use_mla:
+        if getattr(self, "_uniform_attn_rows", self._use_mla):
             # MLA/EP collectives require each request to contribute the same
             # token width on every PCP rank. _build_batch_layout() adds virtual
             # padding per request, so sum each request's widest rank rather
@@ -394,7 +399,7 @@ class HcuPCPManager:
             input_batch.num_scheduled_tokens
         ):
             if (
-                not self._use_mla
+                not getattr(self, "_uniform_attn_rows", self._use_mla)
                 or int(query_len_value) == 0
                 or not bool(input_batch.is_prefilling_np[req_idx])
             ):

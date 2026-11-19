@@ -55,6 +55,12 @@ def apply_to_module(module: ModuleType) -> bool:
 
     @functools.wraps(original)
     def prepare_attn(self, *args, **kwargs):
+        from vllm_hcu.v1.step5_pcp_config import is_step5_pcp
+
+        if is_step5_pcp(self.vllm_config):
+            from vllm_hcu.v1.step5_pcp_metadata import prepare_step5_pcp_attn
+
+            return prepare_step5_pcp_attn(self, *args, **kwargs)
         if (
             is_step5_config(self.vllm_config)
             and self.vllm_config.parallel_config.prefill_context_parallel_size == 1

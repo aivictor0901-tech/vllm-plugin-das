@@ -1224,7 +1224,14 @@ class Step5Attention(nn.Module):
 
         self.max_position_embeddings = max_position
         # Sliding layers: q/k norm + RoPE + q quant + KV cache write in one op.
-        self.swa_fused_qk = SWA_FUSED_QK and _get_step5_swa_fused().can_use(self)
+        from vllm.config import get_current_vllm_config
+        from vllm_hcu.v1.step5_pcp_config import is_step5_pcp
+
+        self.swa_fused_qk = (
+            SWA_FUSED_QK
+            and not is_step5_pcp(get_current_vllm_config())
+            and _get_step5_swa_fused().can_use(self)
+        )
         # Gate + fp8 quant of the o_proj input as one op (folded into the SWA
         # decode combine when swa_fused_qk); needs the fused qkvg fp8 GEMM.
         self.fused_gate = (

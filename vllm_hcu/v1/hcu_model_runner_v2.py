@@ -26,6 +26,10 @@ from vllm_hcu.forward_context_runtime import (
 )
 from vllm_hcu.patch.config import get_hcu_config
 from vllm_hcu.v1.pcp_manager import make_hcu_pcp_manager_cls
+from vllm_hcu.v1.step5_pcp_config import is_step5_pcp
+from vllm_hcu.v1.step5_pcp_mtp import (
+    install_step5_pcp_mtp_sync, sync_step5_pcp_sampler_output,
+)
 from vllm_hcu.v1.glm53_pcp_mtp_sync import (
     install_glm53_pcp_mtp_sync,
     sync_glm53_pcp_sampler_output,
@@ -319,6 +323,7 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
             pcp_size > 1
             and len(kv_cache_config.kv_cache_groups) != 1
             and not _uses_global_pcp_batch(self.vllm_config)
+            and not is_step5_pcp(self.vllm_config)
         ):
             raise ValueError(
                 "HCU PCP requires exactly one KV cache group."
@@ -337,7 +342,11 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
         maybe_log_runtime_layer_shard_plan(self.vllm_config)
         from vllm_hcu.v1.kv_cache import use_hcu_flash_kv_cache_allocator
 
-        if is_glm53_pcp(self.vllm_config):
+        if is_step5_pcp(self.vllm_config):
+            from vllm_hcu.v1.step5_pcp_metadata import install_step5_pcp
+
+            install_step5_pcp(self)
+        elif is_glm53_pcp(self.vllm_config):
             from vllm_hcu.v1.glm53_pcp import install_glm53_pcp
 
             # Install before upstream discovers backends and checks PCP support.
@@ -368,6 +377,7 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
         self._init_host_seq_lens()
         if not is_profiling:
             install_glm53_pcp_mtp_sync(self)
+            install_step5_pcp_mtp_sync(self)
         if is_step5_config(self.vllm_config) and getattr(self, "ubatch_runner", None) is not None:
             from vllm_hcu.v1.hcu_dbo import install_runner
 
@@ -499,6 +509,7 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
         # Commit identical PCP decisions before post_update() and KDA state
         # advancement. The manager can be hidden by sample_tokens() here.
         out = sync_glm53_pcp_sampler_output(self, out)
+        out = sync_step5_pcp_sampler_output(self, out)
         if self._hsl_enabled and input_batch is self._hsl_batch:
             self._hsl_batch = None
             self._hsl_record(input_batch, out[2])
@@ -527,12 +538,20 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
             from vllm_hcu.v1.glm53_pcp import bind_glm53_pcp_batch
 
             bind_glm53_pcp_batch(self.pcp_manager, input_batch)
+        if is_step5_pcp(self.vllm_config):
+            if self.pcp_manager is None:
+                raise RuntimeError("Step5 PCP input dispatch has no PCP manager")
+            self.model_state._step5_pcp_local_batch = input_batch
         return input_batch
 
     @functools.wraps(GPUModelRunner.execute_model)
     def execute_model(self, *args, **kwargs):
         scope = nullcontext()
         dummy_scope = nullcontext()
+        if is_step5_pcp(self.vllm_config) and kwargs.get("dummy_run", False):
+            # Profiling runs rank-local dummy queries with invalid cache slots.
+            # They have no original global request rows to gather or schedule.
+            dummy_scope = replicated_mtp_batch_scope()
         if _uses_global_pcp_batch(self.vllm_config):
             from vllm_hcu.v1.glm53_pcp import glm53_pcp_step_scope
 
@@ -620,7 +639,12 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
             phase_scope = _deepep_auto_dummy_phase_scope(
                 not bool(kwargs.get("uniform_decode", False))
             )
-        with phase_scope:
+        step5_dummy_scope = (
+            replicated_mtp_batch_scope() if is_step5_pcp(self.vllm_config) else nullcontext()
+        )
+        # The upstream dummy also calls MTP propose() after execute_model()
+        # returns. Keep the explicit dummy scope active for that entire call.
+        with phase_scope, step5_dummy_scope:
             return self._dummy_run_with_phase(num_tokens, *args, **kwargs)
 
     def _dummy_run_with_phase(self, num_tokens, *args, **kwargs):
@@ -636,6 +660,7 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
         if dtype is None:
             dtype = torch.bfloat16
         device = self.device
+        is_last_pp_rank = self.is_last_pp_rank
 
         class _TargetForwardStub:
             """Keep target attributes, skip heavy MoE/attention compute."""
@@ -652,6 +677,12 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
                     n = int(input_ids.shape[0])
                 else:
                     n = int(num_tokens)
+                if not is_last_pp_rank:
+                    # PP2 still requires an IntermediateTensors result. Use the
+                    # model factory to preserve Step5's FP32 residual stream.
+                    return real_model.make_empty_intermediate_tensors(
+                        n, dtype=dtype, device=device,
+                    )
                 hidden = torch.zeros(
                     n, hidden_size, dtype=dtype, device=device
                 )
@@ -684,7 +715,7 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
         return result
 
     def prepare_dummy_attn(self, input_batch, valid_state_slots=False):
-        if _uses_global_pcp_batch(self.vllm_config):
+        if _uses_global_pcp_batch(self.vllm_config) or is_step5_pcp(self.vllm_config):
             manager = self.pcp_manager
             self.pcp_manager = None
             try:

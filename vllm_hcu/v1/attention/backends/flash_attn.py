@@ -965,6 +965,12 @@ class FlashAttentionImpl(AttentionImpl):
             self.kv_cache_dtype in ("fp8", "fp8_e4m3")
             and torch.cuda.get_device_properties("cuda").gcnArchName.split(":")[0] == "gfx936"
         )
+        vllm_config = get_current_vllm_config_or_none()
+        from vllm_hcu.v1.step5_pcp_config import is_step5_pcp
+
+        self._step5_pcp = bool(
+            vllm_config is not None and is_step5_pcp(vllm_config)
+        )
         if self._gfx936_fp8_swa and not (
             _SWA_DECODE_ENABLED and henvs.VLLM_HCU_USE_CUSTOM_OPS
             and head_size == 192 and self.sliding_window[0] >= 0
@@ -972,11 +978,13 @@ class FlashAttentionImpl(AttentionImpl):
             and logits_soft_cap == 0 and sinks is None
             and num_heads % num_kv_heads == 0
             and self.num_queries_per_kv == 16
-            and self.dcp_world_size == 1 and self.pcp_world_size == 1
+            and self.dcp_world_size == 1
+            and (self.pcp_world_size == 1 or self._step5_pcp)
         ):
             raise NotImplementedError(
                 "gfx936 E4M3 supports only D192 GQA16 causal SWA, no sinks/ALiBi/softcap, "
-                "DCP=PCP=1, native custom ops and SWA decode enabled"
+                "DCP1 and PCP1 (or the opt-in Step5 PCP path), "
+                "native custom ops and SWA decode enabled"
             )
         self.supports_quant_query_input = (
             not self._gfx936_fp8_swa
@@ -984,7 +992,6 @@ class FlashAttentionImpl(AttentionImpl):
             and flash_attn_supports_quant_query_input()
         )
 
-        vllm_config = get_current_vllm_config_or_none()
         dcp_a2a = (
             vllm_config is not None
             and vllm_config.parallel_config.decode_context_parallel_size > 1
@@ -1121,6 +1128,32 @@ class FlashAttentionImpl(AttentionImpl):
                     "gfx936 E4M3 requires BF16 causal SWA, page64/128, unit KV scales, "
                     "and no cascade attention"
                 )
+            if getattr(self, "_step5_pcp", False):
+                from vllm_hcu.model_executor.layers.attention.pcp import (
+                    in_replicated_mtp_batch,
+                )
+                from vllm_hcu.v1.attention.step5_swa_pcp import (
+                    forward_step5_swa_pcp,
+                )
+                from vllm_hcu.v1.step5_pcp import get_step5_pcp_metadata
+
+                context = get_step5_pcp_metadata(attn_metadata)
+                if context is not None:
+                    logger.info_once(
+                        "[STEP5 PCP SWA] local Q, replicated full E4M3 KV, "
+                        "absolute-position virtual rows; no LSE combine",
+                        scope="local",
+                    )
+                    return forward_step5_swa_pcp(
+                        query, key_cache, value_cache, output,
+                        attn_metadata, context,
+                        softmax_scale=self.scale,
+                        window_left=window[0],
+                        decode_kernel=swa_decode_fp8_d192,
+                        prefill_kernel=swa_prefill_fp8_d192,
+                    )
+                if not in_replicated_mtp_batch():
+                    raise RuntimeError("Step5 PCP SWA target metadata is missing")
             args = (
                 query[:num_actual_tokens], key_cache, value_cache,
                 output[:num_actual_tokens], attn_metadata.query_start_loc,
@@ -1455,6 +1488,11 @@ class FlashAttentionImpl(AttentionImpl):
         writes sigmoid(gate)-scaled, per-token fp8 output (xq, xs) instead of
         the bf16 attention output. Only where forward() would take the
         swa_decode_fp8_d192 path; returns False otherwise (nothing written)."""
+        if getattr(self, "_step5_pcp", False):
+            # Keep all PCP target calls on the local-Q/full-cache path above,
+            # including its explicit padding ownership. The model applies its
+            # ordinary gate/quant epilogue after receiving BF16 attention.
+            return False
         if (
             attn_metadata.use_cascade
             or self.dcp_world_size > 1
@@ -1535,7 +1573,26 @@ class FlashAttentionImpl(AttentionImpl):
         # No TMA kernel is invoked here, so stride canonicalization is not needed.
         key_cache, value_cache = _split_kv_cache(kv_cache, key.shape[-1])
 
-        if (
+        step5_pcp = getattr(self, "_step5_pcp", False)
+        if step5_pcp:
+            from vllm_hcu.model_executor.layers.attention.pcp import (
+                in_replicated_mtp_batch,
+            )
+            from vllm_hcu.v1.attention.step5_swa_pcp import (
+                gather_step5_swa_cache_inputs,
+            )
+            from vllm_hcu.v1.step5_pcp import get_step5_pcp_metadata
+
+            context = get_step5_pcp_metadata(
+                layer_name=getattr(layer, "layer_name", None)
+            )
+            if context is not None:
+                key, value, slot_mapping = gather_step5_swa_cache_inputs(
+                    key, value, context
+                )
+            elif not in_replicated_mtp_batch():
+                raise RuntimeError("Step5 PCP SWA cache-write metadata is missing")
+        elif (
             getattr(self, "use_pcp", False)
             and slot_mapping.shape[0] > key.shape[0]
         ):

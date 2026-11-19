@@ -93,6 +93,14 @@ from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
 from vllm_hcu.platforms import envs as henvs
+from vllm_hcu.v1.step5_pcp import (
+    gather_global_tokens,
+    get_step5_pcp_metadata,
+    global_cache_slot_mapping,
+    mask_local_padding,
+    scoring_rows,
+    step5_pcp_enabled,
+)
 
 logger = init_logger("vllm.step5.step4_dsa")
 
@@ -1537,6 +1545,9 @@ class Step4DSAMetadata:
     # control flow and the one device-to-host read live, and the builder runs
     # eagerly on every step -- including the steps that are only a graph replay.
     schedule: Step4DSASchedule | None = None
+    # Set only by the opt-in Step5 PCP runner after both local and original
+    # global metadata are built. The local query geometry stays unchanged.
+    step5_pcp: Any | None = None
 
 
 class Step4DSAMetadataBuilder(AttentionMetadataBuilder[Step4DSAMetadata]):
@@ -1575,6 +1586,7 @@ class Step4DSAMetadataBuilder(AttentionMetadataBuilder[Step4DSAMetadata]):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
         self.block_size = kv_cache_spec.block_size
         self._state: Step4DSAState | None = None
+        self._step5_pcp_enabled = step5_pcp_enabled(vllm_config)
         self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
         # Builders are made by initialize_kv_cache, i.e. whenever a new KV
         # cache is bound. 0.28's CUDA graph memory profiling binds a throwaway
@@ -1676,6 +1688,7 @@ class Step4DSAMetadataBuilder(AttentionMetadataBuilder[Step4DSAMetadata]):
         state = self._dsa_state()
         if (
             state is not None
+            and not self._step5_pcp_enabled
             and state.graph_decode
             and state.summary is not None  # not yet allocated: first forward
             and num_prefills == 0
@@ -2025,11 +2038,21 @@ class Step4DSAImpl(AttentionImpl[Step4DSAMetadata]):
         # cache bytes mean.
         k_scale = float(getattr(layer, "_k_scale_float", 1.0))
         v_scale = float(getattr(layer, "_v_scale_float", 1.0))
+        pcp = get_step5_pcp_metadata(attn_metadata)
+        cache_key = key[:num_tokens]
+        cache_value = value[:num_tokens]
+        cache_slots = attn_metadata.slot_mapping
+        if pcp is not None:
+            # Q/output remain local. Only K/V are restored to original request
+            # order, with exactly one write for replicated decode rows.
+            cache_key = gather_global_tokens(cache_key, pcp)
+            cache_value = gather_global_tokens(cache_value, pcp)
+            cache_slots = global_cache_slot_mapping(pcp)
         k_flat, v_flat = self._write_kv(
             kv_cache,
-            key[:num_tokens],
-            value[:num_tokens],
-            attn_metadata.slot_mapping,
+            cache_key,
+            cache_value,
+            cache_slots,
             k_scale,
             v_scale,
         )
@@ -2197,6 +2220,8 @@ class Step4DSAImpl(AttentionImpl[Step4DSAMetadata]):
             del lse_p
             output[ndt:num_tokens] = out_p
 
+        if pcp is not None:
+            mask_local_padding(output, pcp)
         return output
 
 
@@ -4112,6 +4137,35 @@ class Step4Indexer:
             self.owner.step4_dsa_plan_token,
         )
 
+    def _pcp_scoring_schedule(self, md: Step4DSAMetadata) -> Step4DSASchedule:
+        """Describe local query scoring without acquiring any pending rows.
+
+        Summary compression owns the original global request schedule. A
+        second call to _general_schedule(local_md) would mutate that pending
+        table for each disjoint DualChunkSwap interval and corrupt tails that
+        are completed on another PCP rank.
+        """
+        cached = getattr(md, "_step5_pcp_scoring_schedule", None)
+        if cached is not None:
+            return cached
+        schedule = Step4DSASchedule()
+        rpp = self.state.regions_per_page
+        for row in scoring_rows(md, self.geometry.region_size):
+            count = row["nscore"]
+            ids = torch.arange(count, device=md.block_table.device, dtype=torch.int64)
+            slots = md.block_table[row["row"], ids // rpp].to(torch.int64) * rpp + ids % rpp
+            schedule.requests.append(_RequestPlan(
+                **row,
+                head=0,
+                buf_start=0,
+                pending_row_in=-1,
+                pending_row_out=-1,
+                tail=0,
+                score_slots=slots,
+            ))
+        md._step5_pcp_scoring_schedule = schedule
+        return schedule
+
     def run(self, hidden_states: torch.Tensor, positions: torch.Tensor) -> int:
         attn = self.owner.attn
         raw = get_forward_context().attn_metadata
@@ -4154,7 +4208,28 @@ class Step4Indexer:
 
         state = self.state
         state.ensure_allocated(kv_cache, hidden_states.device)
-        sched = state.schedule(md)
+        pcp = get_step5_pcp_metadata(md)
+        summary_md = md
+        if pcp is not None:
+            summary_md = pcp.global_attn_metadata
+            if not isinstance(summary_md, Step4DSAMetadata):
+                raise TypeError("Step5 PCP DSA requires original global DSA metadata")
+            if md.num_actual_tokens != pcp.local_num_tokens:
+                raise ValueError("Step5 PCP DSA local metadata/token count mismatch")
+            if pcp.has_global_prefill and md.num_decode_tokens > md.num_decodes:
+                # A small CP shard can be classified as an all-decode verify
+                # batch even when a peer owns a long prefill interval. Use the
+                # general per-query scoring/attention route for those local
+                # multi-token rows, exactly as the ordinary mixed builder does.
+                md.num_prefills += md.num_decodes
+                md.num_decodes = 0
+                md.num_decode_tokens = 0
+                md.num_prefill_tokens = md.num_actual_tokens
+        sched = state.schedule(summary_md)
+        score_sched = (
+            self._pcp_scoring_schedule(md)
+            if pcp is not None and pcp.has_global_prefill else sched
+        )
         if self.slot == state.first_slot:
             state.step_cache = {}
 
@@ -4162,12 +4237,18 @@ class Step4Indexer:
         index_q, index_k, index_z, weights = self._project(
             hidden_states[:num_tokens], positions[:num_tokens], num_tokens
         )
+        if pcp is not None:
+            # Compression must see complete regions in original request order,
+            # including a region whose token inputs span CP ranks or chunks.
+            # Index queries/weights remain local and never incur global scoring.
+            index_k = gather_global_tokens(index_k, pcp)
+            index_z = gather_global_tokens(index_z, pcp)
         self._update_summaries(sched, index_k, index_z)
         chunk_prefill = PREFILL_PLAN_CHUNK > 0 and md.num_prefills > 0 and not (
-            DENSE_EQUIV or sched.spec
+            DENSE_EQUIV or score_sched.spec
         )
         prefill_logits, decode_logits, width = self._score(
-            md, sched, index_q, weights, skip_prefill=chunk_prefill
+            md, score_sched, index_q, weights, skip_prefill=chunk_prefill
         )
 
         topk = max(width, 1) if DENSE_EQUIV else self.geometry.topk
@@ -4178,13 +4259,13 @@ class Step4Indexer:
             topk=topk,
             num_kv_groups=self.num_kv_groups,
             regions_per_page=state.regions_per_page,
-            decode_seq_lens=sched.tok_seq if sched.spec else None,
-            decode_table=sched.tok_table if sched.spec else None,
+            decode_seq_lens=score_sched.tok_seq if score_sched.spec else None,
+            decode_table=score_sched.tok_table if score_sched.spec else None,
             step_cache=state.step_cache,
         )
         if chunk_prefill:
             attn.step4_sparse_plan.prefill, prefill_width = self._score_prefill_chunked(
-                md, sched, index_q, weights, chunk_size=PREFILL_PLAN_CHUNK
+                md, score_sched, index_q, weights, chunk_size=PREFILL_PLAN_CHUNK
             )
             width = max(width, prefill_width)
         if MEMORY_TRACE and md.num_prefills > 0 and self.slot in (

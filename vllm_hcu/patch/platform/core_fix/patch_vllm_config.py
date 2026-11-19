@@ -308,6 +308,15 @@ def _require_glm53_mtp_pcp_contract(vllm_config: object) -> None:
 def _require_mrv2_pcp_contract(vllm_config: object) -> None:
     """Reject every Model Runner V2 PCP configuration outside HCU support."""
 
+    from vllm_hcu.v1.step5_pcp_config import (
+        is_step5_pcp,
+        validate_step5_pcp_config,
+    )
+
+    if is_step5_pcp(vllm_config):
+        validate_step5_pcp_config(vllm_config)
+        return
+
     if not _require_hcu_pcp_attribute(
         vllm_config, "use_v2_model_runner", "VllmConfig"
     ):

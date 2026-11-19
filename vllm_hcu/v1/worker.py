@@ -155,6 +155,16 @@ class HcuGPUWorker(Worker):
             )
         validate_worker_patches(require_applied=True)
 
+    def get_step5_pcp_quantization_audit(self) -> dict:
+        """Read lightweight type/shape metadata for the isolated CP validation."""
+        from vllm_hcu.v1.step5_pcp_config import is_step5_pcp
+
+        if not is_step5_pcp(self.vllm_config):
+            return {"enabled": False, "reason": "Step5 PCP is not active"}
+        from vllm_hcu.v1.step5_pcp_quant_audit import audit_step5_pcp_quantization
+
+        return audit_step5_pcp_quantization(self.model_runner)
+
     def reload_weights(self, *args, **kwargs) -> None:
         super().reload_weights(*args, **kwargs)
         from vllm_hcu.patch.worker.core_fix.patch_deepseek_v4_attention import (
