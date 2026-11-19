@@ -80,7 +80,15 @@ def audit_memory(runner, device, reset_peaks=False):
     if os.environ.get('VLLM_STEP5_NATIVE_W4A8','0') == '1':
         from vllm_hcu.model_executor.layers.quantization.ct_w4a8_step5_native import native_workspace_inventory
         native = {'enabled':True,'pools':native_workspace_inventory()}
-    return {'scope':'model parameters/buffers, explicit DSA owners, native pools and allocator; not all CUDA-library allocations',
+    from vllm_hcu.model_executor.layers import step4_dsa as dsa
+    indexer_policy = dict(prefill_bf16=dsa.PREFILL_BF16_INDEXER,
+        prefill_fp8=dsa.PREFILL_FP8_INDEXER, spec_fp8=dsa._SPEC_INDEXER_FP8_DOT,
+        math_mode=dsa._fp8_math, prefill_qk_fp8=dsa.PREFILL_QK_FP8,
+        prefill_pv_fp8=dsa.PREFILL_PV_FP8, decode_qk_fp8=dsa.DECODE_QK_FP8,
+        decode_pv_fp8=dsa.DECODE_PV_FP8, block_q=dsa.BF16_INDEXER_BLOCK_Q,
+        block_k=dsa.BF16_INDEXER_BLOCK_K)
+    return {'indexer_policy':indexer_policy,
+            'scope':'model parameters/buffers, explicit DSA owners, native pools and allocator; not all CUDA-library allocations',
             'pid':os.getpid(),'parallel':_parallel_metadata(),'storage':inventory,'native':native,'dsa_states':dsa_states,
             'peak_reset':bool(reset_peaks),'allocator':{
                 'allocated_bytes':torch.cuda.memory_allocated(device),

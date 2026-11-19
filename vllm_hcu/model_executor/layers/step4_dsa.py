@@ -164,6 +164,21 @@ PREFILL_FP8_INDEXER = henvs.optional_custom_op_enabled(
     os.environ.get("VLLM_STEP4_DSA_PREFILL_FP8_INDEXER", "1") == "1"
 )
 
+# Opt-in BF16 compute over the existing FP8 summary/query storage. Keep the
+# causal tile skip and avoid converting the full summary pool per layer.
+PREFILL_BF16_INDEXER = henvs.optional_custom_op_enabled(
+    os.environ.get("VLLM_STEP5_PCP_BF16_INDEXER", "0") == "1"
+)
+if PREFILL_BF16_INDEXER and PREFILL_FP8_INDEXER:
+    raise ValueError("BF16 indexer requires VLLM_STEP4_DSA_PREFILL_FP8_INDEXER=0")
+PREFILL_CAUSAL_INDEXER = PREFILL_FP8_INDEXER or PREFILL_BF16_INDEXER
+BF16_INDEXER_BLOCK_Q = int(os.environ.get("VLLM_STEP5_BF16_INDEXER_BLOCK_Q", "32"))
+BF16_INDEXER_BLOCK_K = int(os.environ.get("VLLM_STEP5_BF16_INDEXER_BLOCK_K", "128"))
+if PREFILL_BF16_INDEXER and (
+    BF16_INDEXER_BLOCK_Q not in (32, 64, 128) or BF16_INDEXER_BLOCK_K not in (64, 128)
+):
+    raise ValueError("BF16 indexer tile must be Q32/64/128 and K64/128")
+
 # Bound the score tensor itself by selecting each query chunk before scoring
 # the next. Unlike INDEXER_Q_CHUNK this also bounds the top-k workspace.
 # Uses the existing reference scorers/selectors; 0 keeps the original path.
@@ -4746,7 +4761,7 @@ class Step4Indexer:
             # kept zeroed for bisecting).
             alloc = (
                 torch.empty
-                if PREFILL_FP8_INDEXER and not DENSE_EQUIV and INDEXER_Q_CHUNK == 0
+                if PREFILL_CAUSAL_INDEXER and not DENSE_EQUIV and INDEXER_Q_CHUNK == 0
                 else torch.zeros
             )
             prefill_logits = alloc(
@@ -4768,7 +4783,7 @@ class Step4Indexer:
             decode = plan.row < num_decodes
             if skip_prefill and not decode:
                 continue
-            if PREFILL_FP8_INDEXER and not decode and INDEXER_Q_CHUNK == 0:
+            if PREFILL_CAUSAL_INDEXER and not decode and INDEXER_Q_CHUNK == 0:
                 if prefill_q8 is None:
                     # One cast for all prefill rows; exact, q is already e4m3-valued.
                     prefill_q8 = index_q[num_decode_tokens:].to(torch.float8_e4m3fn)
@@ -4782,6 +4797,9 @@ class Step4Indexer:
                     out=prefill_logits,
                     out_row_base=first,
                     out_group_stride=num_prefill_tokens,
+                    use_fp8_dot=not PREFILL_BF16_INDEXER,
+                    block_q=BF16_INDEXER_BLOCK_Q if PREFILL_BF16_INDEXER else 128,
+                    block_k=BF16_INDEXER_BLOCK_K if PREFILL_BF16_INDEXER else 128,
                 )
                 continue
             keys = summary[plan.score_slots].to(index_q.dtype)
@@ -4845,7 +4863,7 @@ class Step4Indexer:
             first = plan.tok_start - ndt
             requests[:, first:first + plan.qlen] = plan.row
             keys = summary[plan.score_slots] if plan.nscore else None
-            if keys is not None and not PREFILL_FP8_INDEXER:
+            if keys is not None and not PREFILL_CAUSAL_INDEXER:
                 keys = keys.to(index_q.dtype)
             for begin in range(0, plan.qlen, chunk_size):
                 count = min(chunk_size, plan.qlen - begin)
@@ -4855,7 +4873,7 @@ class Step4Indexer:
                     (groups * count, max(plan.nscore, 1)), dtype=torch.float32, device=device
                 )
                 if plan.nscore:
-                    if PREFILL_FP8_INDEXER:
+                    if PREFILL_CAUSAL_INDEXER:
                         prefill_indexer_logits(
                             index_q[src:src + count].to(torch.float8_e4m3fn),
                             weights[src:src + count],
@@ -4866,7 +4884,9 @@ class Step4Indexer:
                             # gfx936: Q128 spills 299 registers (1196 bytes
                             # private scratch/thread); Q32 has no spills and
                             # produces bit-identical visible scores.
-                            block_q=32,
+                            block_q=BF16_INDEXER_BLOCK_Q if PREFILL_BF16_INDEXER else 32,
+                            block_k=BF16_INDEXER_BLOCK_K if PREFILL_BF16_INDEXER else 128,
+                            use_fp8_dot=not PREFILL_BF16_INDEXER,
                         )
                     else:
                         indexer_logits(

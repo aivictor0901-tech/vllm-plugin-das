@@ -834,8 +834,9 @@ def _prefill_indexer_logits_kernel(
     proxy_dim: tl.constexpr,
     BLOCK_Q: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    USE_FP8_DOT: tl.constexpr,
 ) -> None:
-    """``_indexer_logits_kernel`` for one prefill request, causal and in fp8.
+    """``_indexer_logits_kernel`` for one prefill request, causal with selectable dot type.
 
     Two differences, both only on the prefill path:
 
@@ -843,7 +844,9 @@ def _prefill_indexer_logits_kernel(
       regions ``< (first_position + i) // region_size``, so key tiles past the
       block's last visible region are never read by the selector and are not
       computed (or written). On a fresh 32K chunk that is half the rectangle.
-    * fp8 x fp8 MFMA. ``index_q`` is already e4m3-valued (``q_prerounded``) and the
+    * When USE_FP8_DOT is false, convert both tiles to BF16 before dot.
+      E4M3 values are exactly representable in BF16; accumulation is FP32.
+      This path never executes an FP8 dot. Otherwise, fp8 x fp8 MFMA. ``index_q`` is already e4m3-valued (``q_prerounded``) and the
       keys come straight from the e4m3 summary pool, so feeding them to ``tl.dot``
       as fp8 is lossless on the inputs; only the fp32 accumulation order inside
       the dot differs from the bf16 path (~1e-5 relative), as in the decode
@@ -869,6 +872,8 @@ def _prefill_indexer_logits_kernel(
         mask=key_ok[None, :],
         other=0.0,
     )
+    if not USE_FP8_DOT:
+        key_tile = key_tile.to(tl.bfloat16)
     accumulator = tl.zeros((BLOCK_Q, BLOCK_K), dtype=tl.float32)
     for head in tl.static_range(heads_per_group):
         query_tile = tl.load(
@@ -882,6 +887,8 @@ def _prefill_indexer_logits_kernel(
             mask=query_ok,
             other=0.0,
         ).to(tl.float32)
+        if not USE_FP8_DOT:
+            query_tile = query_tile.to(tl.bfloat16)
         scores = tl.dot(query_tile, key_tile, out_dtype=tl.float32)
         accumulator += tl.maximum(scores, 0.0) * head_weight[:, None]
 
@@ -907,8 +914,9 @@ def prefill_indexer_logits(
     block_k: int = 128,
     num_warps: int = 4,
     num_stages: int = 1,
+    use_fp8_dot: bool = True,
 ) -> torch.Tensor:
-    """Causal fp8 indexer scores for one prefill request; see the kernel docstring.
+    """Causal indexer scores with e4m3 storage and FP8 or BF16 dots; see the kernel docstring.
 
     ``index_q`` ``[seq_q, groups, heads, proxy_dim]`` and ``index_k``
     ``[seq_k, 1, proxy_dim]`` must both be ``float8_e4m3fn``. Row/column layout of
@@ -944,7 +952,8 @@ def prefill_indexer_logits(
         index_q.stride(0), index_q.stride(1), index_q.stride(2), index_k.stride(0),
         weights.stride(0), weights.stride(1), target.stride(0), rows_per_group,
         region_size=region_size, heads_per_group=heads, proxy_dim=proxy_dim,
-        BLOCK_Q=block_q, BLOCK_K=block_k, num_warps=num_warps, num_stages=num_stages,
+        BLOCK_Q=block_q, BLOCK_K=block_k, USE_FP8_DOT=use_fp8_dot,
+        num_warps=num_warps, num_stages=num_stages,
     )
     return out
 
