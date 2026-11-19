@@ -42,6 +42,34 @@ def dsa_methods():
 
 
 class PCPMemory(unittest.TestCase):
+    def test_ordinary_rotary_cache_keeps_defaults_and_frequency_parameters(self):
+        cfg = NS(cp=True, model_config=NS(max_model_len=131073, enforce_eager=True),
+                 speculative_config=NS(num_speculative_tokens=3))
+        contract = ModuleType('vllm_hcu.v1.step5_pcp_config')
+        contract.is_step5_pcp = lambda c: c.cp
+        params = {'rope_type':'llama3','factor':1.,'original_max_position_embeddings':1048576,
+                  'rope_theta':1e7,'partial_rotary_factor':1/3}
+        before = dict(params)
+        with patch.dict(sys.modules,{contract.__name__:contract}), patch.dict(os.environ,{},clear=True):
+            self.assertEqual(memory.rotary_cache_position(cfg,1048576,params),1048576)
+            os.environ['VLLM_STEP5_PCP_TRIM_ROTARY_CACHE']='1'
+            self.assertEqual(memory.rotary_cache_position(cfg,1048576,params),131136)
+            self.assertEqual(memory.rotary_cache_position(cfg,8192,params),8192)
+            self.assertEqual(params,before)
+            self.assertEqual(memory.indexer_rope_limit(cfg),0)
+            cfg.cp=False
+            self.assertEqual(memory.rotary_cache_position(cfg,1048576,params),1048576)
+
+    def test_ordinary_rotary_rejects_unverified_scaling_and_graphs(self):
+        cfg=NS(model_config=NS(max_model_len=131073,enforce_eager=True),
+               speculative_config=NS(num_speculative_tokens=3))
+        contract=ModuleType('vllm_hcu.v1.step5_pcp_config');contract.is_step5_pcp=lambda c:True
+        with patch.dict(sys.modules,{contract.__name__:contract}),patch.dict(os.environ,{'VLLM_STEP5_PCP_TRIM_ROTARY_CACHE':'1'}):
+            for params in ({'rope_type':'yarn'},{'rope_type':'llama3','factor':8.}):
+                with self.assertRaises(ValueError):memory.rotary_cache_position(cfg,1048576,params)
+            cfg.model_config.enforce_eager=False
+            with self.assertRaises(ValueError):memory.rotary_cache_position(cfg,1048576,{'rope_type':'default'})
+
     def test_pp_local_storage_retains_unique_layer_ownership_and_schedule_order(self):
         api, Tensor = dsa_methods()
         for compact in (False,True):

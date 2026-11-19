@@ -35,3 +35,26 @@ def indexer_rope_limit(config):
     # Include invalid speculative rows near the end of the context. The
     # cache builder uses length only for arange, never to set frequencies.
     return ((maximum + lookahead + 1 + 63) // 64) * 64
+
+
+def rotary_cache_position(config, original_maximum, parameters):
+    """Bound ordinary rotary tables for the verified eager PCP model only."""
+    name = 'VLLM_STEP5_PCP_TRIM_ROTARY_CACHE'
+    flag = os.environ.get(name, '0')
+    if flag not in ('0', '1'):
+        raise ValueError(name + ' must be 0 or 1')
+    if flag == '0':
+        return original_maximum
+    from vllm_hcu.v1.step5_pcp_config import is_step5_pcp
+    if not is_step5_pcp(config):
+        return original_maximum
+    if not config.model_config.enforce_eager:
+        raise ValueError('Step5 PCP rotary storage trimming requires eager')
+    if parameters.get('rope_type', 'default') not in ('default', 'llama3') or parameters.get('factor', 1.) != 1.:
+        raise ValueError('Only prefix-verified default/llama3 factor1 rotary tables are supported')
+    maximum = int(config.model_config.max_model_len)
+    lookahead = int(getattr(getattr(config, 'speculative_config', None), 'num_speculative_tokens', 0))
+    if maximum <= 0 or lookahead not in (0, 1, 2, 3):
+        raise ValueError('Invalid serving position or unverified MTP lookahead')
+    bound = ((maximum + lookahead + 1 + 63) // 64) * 64
+    return min(int(original_maximum), bound)

@@ -1125,9 +1125,15 @@ class Step5Attention(nn.Module):
         rope_parameters["rope_theta"] = self.rope_theta
         rope_parameters["partial_rotary_factor"] = partial_rotary_factor
 
+        from vllm.config import get_current_vllm_config
+        from vllm_hcu.v1.step5_pcp_memory import rotary_cache_position
+
+        rope_cache_position = rotary_cache_position(
+            get_current_vllm_config(), max_position, rope_parameters
+        )
         self.rotary_emb = get_rope(
             head_size=self.head_dim,
-            max_position=max_position,
+            max_position=rope_cache_position,
             rope_parameters=rope_parameters,
         )
 
