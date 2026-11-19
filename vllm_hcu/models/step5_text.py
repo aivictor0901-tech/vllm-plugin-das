@@ -2339,6 +2339,14 @@ class Step5ForCausalLM(nn.Module, SupportsPP, MixtureOfExperts):
         return hidden_states
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        from vllm_hcu.model_executor.layers.quantization.ct_w4a8_step5_native_policy import (
+            native_enabled,
+        )
+        if native_enabled():
+            from vllm_hcu.model_executor.layers.quantization.ct_w4a8_step5_native import (
+                release_native_workspaces,
+            )
+            release_native_workspaces(hidden_states.device)
         hidden_states = self.model.norm(hidden_states)
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits

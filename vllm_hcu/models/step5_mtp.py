@@ -215,6 +215,14 @@ class Step5MultiTokenPredictor(nn.Module):
         hidden_states: torch.Tensor,
         spec_step_idx: int = 0,
     ) -> torch.Tensor:
+        from vllm_hcu.model_executor.layers.quantization.ct_w4a8_step5_native_policy import (
+            native_enabled,
+        )
+        if native_enabled():
+            from vllm_hcu.model_executor.layers.quantization.ct_w4a8_step5_native import (
+                release_native_workspaces,
+            )
+            release_native_workspaces(hidden_states.device)
         shared_head = self._layer(spec_step_idx).shared_head
         return self.logits_processor(shared_head.head, shared_head(hidden_states))
 
@@ -223,6 +231,14 @@ class Step5MultiTokenPredictor(nn.Module):
         hidden_states: torch.Tensor,
         spec_step_idx: int = 0,
     ) -> torch.Tensor:
+        from vllm_hcu.model_executor.layers.quantization.ct_w4a8_step5_native_policy import (
+            native_enabled,
+        )
+        if native_enabled():
+            from vllm_hcu.model_executor.layers.quantization.ct_w4a8_step5_native import (
+                release_native_workspaces,
+            )
+            release_native_workspaces(hidden_states.device)
         shared_head = self._layer(spec_step_idx).shared_head
         return self.logits_processor.get_top_tokens(
             shared_head.head,

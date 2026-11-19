@@ -77,6 +77,11 @@ class Step5CompressedW4A8MoEMethod(FusedMoEMethodBase):
         if getattr(moe, "has_bias", False):
             raise ValueError("Step5 packed INT4 does not support expert biases")
         parallel = getattr(moe, "moe_parallel_config", None)
+        from .ct_w4a8_step5_native_policy import native_enabled, validate_parallel
+        self._use_native_w4a8 = native_enabled()
+        if self._use_native_w4a8:
+            validate_parallel(parallel, activation, getattr(moe, "moe_backend", "auto"),
+                              getattr(moe, "has_bias", False))
         self._use_deepep = (
             getattr(parallel, "all2all_backend", None) == "deepep_low_latency"
             and getattr(moe, "moe_backend", "auto") in ("auto", "triton", "deep_gemm")
@@ -149,11 +154,15 @@ class Step5CompressedW4A8MoEMethod(FusedMoEMethodBase):
         )
 
     def process_weights_after_loading(self, layer):
-        if not self._use_deepgemm:
+        if not self._use_deepgemm and not self._use_native_w4a8:
             _packed_w4a8_experts()
         for name in ("w13_weight_packed", "w2_weight_packed"):
             layer._parameters.pop(name, None)
         self.moe_quant_config = self.get_fused_moe_quant_config(layer)
+        if self._use_native_w4a8:
+            from .ct_w4a8_step5_native import prepare_native_w4a8
+            prepare_native_w4a8(layer)
+            return
         if self._use_deepep:
             from vllm_hcu.model_executor.layers.quantization.ct_w4a8_step5_deepep import make_step5_w4a8_ll_kernel
             self.moe_kernel = make_step5_w4a8_ll_kernel(self.moe, self.moe_quant_config, layer)
@@ -169,6 +178,11 @@ class Step5CompressedW4A8MoEMethod(FusedMoEMethodBase):
         self, layer, x, topk_weights, topk_ids,
         shared_experts=None, shared_experts_input=None,
     ):
+        if self._use_native_w4a8:
+            from .ct_w4a8_step5_native import apply_native_w4a8
+            # As in the original BoltOps branch, shared experts and AgRs
+            # combine are exclusively owned by MoERunner.
+            return apply_native_w4a8(layer, x, topk_weights, topk_ids)
         if self._use_deepep:
             if self.moe_kernel is None:
                 raise RuntimeError("Step5 DeepEP weights/kernel have not been initialized")

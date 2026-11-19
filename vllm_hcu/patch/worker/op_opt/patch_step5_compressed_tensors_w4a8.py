@@ -304,6 +304,31 @@ def apply_to_module(module: ModuleType) -> bool:
     @functools.wraps(original)
     def hcu_get_moe_method(quant_config, layer, layer_name):
         if _is_step5_channel_w4a8(quant_config, layer, layer_name):
+            from vllm_hcu.model_executor.layers.quantization.ct_w4a8_step5_native_policy import (
+                native_enabled,
+            )
+
+            if native_enabled():
+                # This is the final Step5 selector after the core and generic
+                # OP callbacks. Delegating ``original`` would be intercepted
+                # by the generic LightOp W4A8 wrapper before reaching core.
+                # Select the core adapter explicitly for this opt-in only.
+                scheme = quant_config.get_scheme_dict(
+                    layer, layer_name + ".0.down_proj"
+                )
+                weight = scheme["weights"]
+                if (
+                    getattr(weight.strategy, "value", weight.strategy) != "channel"
+                    or not weight.symmetric
+                ):
+                    raise ValueError(
+                        "Step5 HCU W4A8 adapter requires symmetric per-channel weights"
+                    )
+                from vllm_hcu.model_executor.layers.quantization.ct_w4a8_step5 import (
+                    Step5CompressedW4A8MoEMethod,
+                )
+
+                return Step5CompressedW4A8MoEMethod(quant_config, layer.moe_config)
             parallel = getattr(layer.moe_config, "moe_parallel_config", None)
             if getattr(parallel, "all2all_backend", None) == "deepep_low_latency":
                 # The core_fix selector owns the Step5 packed INT4 LL kernel.
