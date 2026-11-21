@@ -1359,6 +1359,29 @@ def _spec_indexer_stacked_kernel(
     )
 
 
+def _step5_lightop_spec_indexer(
+    index_q: torch.Tensor, summary: torch.Tensor, block_table: torch.Tensor,
+    weights: torch.Tensor, nscore: torch.Tensor, query_start_loc: torch.Tensor,
+    out: torch.Tensor, weight_scale: float,
+) -> None:
+    from lightop.attention import spec_indexer_logits as native_indexer
+
+    native_indexer(index_q, summary, block_table, weights, nscore,
+                   query_start_loc, out, weight_scale)
+
+
+def _step5_lightop_spec_indexer_fake(
+    index_q, summary, block_table, weights, nscore, query_start_loc, out, weight_scale,
+):
+    return None
+
+
+direct_register_custom_op(
+    op_name="step5_lightop_spec_indexer", op_func=_step5_lightop_spec_indexer,
+    mutates_args=["out"], fake_impl=_step5_lightop_spec_indexer_fake,
+)
+
+
 def spec_indexer_logits(
     index_q: torch.Tensor,
     weights: torch.Tensor,
@@ -1374,6 +1397,7 @@ def spec_indexer_logits(
     weight_scale: float = 1.0,
     q_prerounded: bool = False,
     max_query: int | None = None,
+    use_lightop: bool = False,
 ) -> None:
     """``decode_indexer_logits`` for verify batches, one program per request.
 
@@ -1397,6 +1421,8 @@ def spec_indexer_logits(
         max_query: upper bound on any request's query length. When given
             (with 4 heads per group, an fp8 pool and ``q_prerounded``), the
             stacked fp8 kernel is used; see ``_spec_indexer_stacked_kernel``.
+        use_lightop: explicit Step5-only opt-in. Other model callers keep the
+            existing implementation by default; no batch-size dispatch is added.
     """
     num_tokens, groups, heads_per_group, proxy_dim = index_q.shape
     width = out.shape[1]
@@ -1422,6 +1448,15 @@ def spec_indexer_logits(
         and q_prerounded
         and summary.dtype == torch.float8_e4m3fn
     ):
+        if use_lightop:
+            if groups != 1 or proxy_dim != 256 or regions_per_page != 8:
+                raise ValueError("Step5 LightOp indexer requires G1/H4/D256/page8")
+            torch.ops.vllm.step5_lightop_spec_indexer(
+                index_q, summary, block_table[:num_reqs], weights,
+                nscore[:num_tokens], query_start_loc[:num_reqs + 1], out,
+                float(weight_scale),
+            )
+            return
         # 32-key blocks on one warp: the dot is tiny, so more, smaller programs
         # keep more CUs busy (bk32/nw1 43us vs bk128/nw4 53us).
         _spec_indexer_stacked_kernel[(num_reqs, triton.cdiv(width, 32), groups)](
@@ -3972,8 +4007,10 @@ class Step4Indexer:
         max_position: int,
         params_dtype: torch.dtype,
         num_attention_heads: int,
+        use_lightop_spec_indexer: bool = False,
     ) -> None:
         self.owner = owner
+        self._use_lightop_spec_indexer = use_lightop_spec_indexer
         # Set by the owner when its own projection GEMM also produces the
         # indexer's q | k | z | w columns (Step5 VLLM_HCU_STEP5_QKV_INDEXER):
         # forward then receives that [tokens, 1540]-wide view instead of
@@ -4759,6 +4796,7 @@ class Step4Indexer:
                 weight_scale=self.weight_prescale,
                 q_prerounded=True,
                 max_query=state.spec_query_len,
+                use_lightop=self._use_lightop_spec_indexer,
             )
             return None, decode_logits, width
 

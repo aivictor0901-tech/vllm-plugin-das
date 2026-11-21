@@ -38,6 +38,9 @@ def warn_ignored_step5_envs() -> None:
 
 
 ENVIRONMENT_VARIABLES = {
+    "VLLM_STEP5_LIGHTOP_SPEC_INDEXER": lambda: (
+        os.getenv("VLLM_STEP5_LIGHTOP_SPEC_INDEXER", "0") == "1"
+    ),
     "VLLM_HCU_STEP5_SHARED_INT8_EPILOGUE": lambda: (
         os.getenv("VLLM_HCU_STEP5_SHARED_INT8_EPILOGUE", "0") == "1"
     ),
