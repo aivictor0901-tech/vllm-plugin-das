@@ -9,7 +9,7 @@ from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 from functools import lru_cache
-from .step5_w4a8_policy import padded_route_rows
+from .step5_w4a8_policy import padded_route_rows, w4a8_execution_plan
 from .step5_w4a8_kernels import (
     _activation,
     _weighted_output,
@@ -58,6 +58,7 @@ def _make_experts_class(phase, backend="deepgemm"):
             a[1].contiguous(),
             b[1].contiguous(),
             indices.contiguous(),
+            config["MODE"],
         )
         return output
 
@@ -142,10 +143,11 @@ def _make_experts_class(phase, backend="deepgemm"):
                 expert_tokens_meta,
                 activation,
             )
-            if not is_prefill or (N, K) != (3072, 4096):
+            _, alignment = w4a8_execution_plan(M, phase)
+            if (not is_prefill and alignment == 64) or (N, K) != (3072, 4096):
                 return base
             if expert_tokens_meta is None:
-                aligned = padded_route_rows(M, topk, local_num_experts)
+                aligned = padded_route_rows(M, topk, local_num_experts, alignment)
             else:
                 from vllm_hcu.model_executor.layers.quantization import (
                     slimquant_w4a8_deepgemm_runtime as dg,
@@ -211,6 +213,11 @@ def _make_experts_class(phase, backend="deepgemm"):
                 and expert_map is not None
                 and a1q_scale.is_contiguous()
             )
+            mode, alignment = w4a8_execution_plan(hidden_states.shape[0], phase)
+            if not use_small:
+                # The 128-row mode is validated only with the small-route
+                # producer; other dispatchers retain their existing ABI.
+                mode, alignment = 1002, 64
             aligned = dg.compute_aligned_M(
                 M=topk_ids.shape[0],
                 num_topk=topk,
@@ -219,7 +226,7 @@ def _make_experts_class(phase, backend="deepgemm"):
                 expert_tokens_meta=expert_tokens_meta,
             )
             if use_small:
-                aligned = padded_route_rows(hidden_states.shape[0], topk, E)
+                aligned = padded_route_rows(hidden_states.shape[0], topk, E, alignment)
             elif use_large64:
                 aligned = padded_route_rows(hidden_states.shape[0], topk, E)
             gathered = _resize_cache(workspace13.view(dtype=torch.int8), (aligned, K))
@@ -238,6 +245,7 @@ def _make_experts_class(phase, backend="deepgemm"):
                     E,
                     gathered,
                     global_num_experts,
+                    alignment,
                 )
             elif use_large64:
                 aq, scales, indices, inverse, _ = permute64(
@@ -265,7 +273,7 @@ def _make_experts_class(phase, backend="deepgemm"):
                 (self._deepgemm_w13, self.w1_scale),
                 gateup,
                 indices,
-                config={"MODE": 1002},
+                config={"MODE": mode},
             )
             intermediate = _resize_cache(
                 workspace13.view(dtype=torch.int8), (aligned, N // 2)
@@ -302,7 +310,7 @@ def _make_experts_class(phase, backend="deepgemm"):
                 (self._deepgemm_w2, self.w2_scale),
                 down,
                 indices,
-                config={"MODE": 1002},
+                config={"MODE": mode},
             )
             # Same provider/state protocol as FP8 fused experts. It declines
             # while DP-pipe owns combine or shared output is not ready. The
@@ -401,9 +409,10 @@ def prepare_step5_w4a8(method, layer, phase):
     experts.process_weights_after_loading(layer)
     method.moe_quant_config = quant
     method.moe_kernel = mk.FusedMoEKernel(prepare, experts)
+    decode_mode, decode_alignment = w4a8_execution_plan(128, phase)
     logger.info_once(
-        "[step5-w4a8] gemm_backend=%s, MODE=1002, profile=%s, static EP8",
-        backend, phase,
+        "[step5-w4a8] gemm_backend=%s, decode MODE=%d/pad%d, profile=%s, static EP8",
+        backend, decode_mode, decode_alignment, phase,
     )
     # The modular prepare owns quantize/dispatch and the modular kernel
     # owns pipe/DBO/combine. Outer naive dispatch must therefore be off.
@@ -416,9 +425,9 @@ def prepare_step5_w4a8(method, layer, phase):
         "weight_bits": 4,
         "gemm_backend": backend,
         "gemm_op": str(require_gemm_op(backend)),
-        "gemm_mode": 1002,
+        "gemm_mode": decode_mode,
         "reduction_block": 2048,
-        "small_route_alignment": 64,
+        "small_route_alignment": decode_alignment,
         "prefill_activation": "persistent8x512",
         "profile": phase,
         "shared_add_protocol": "EP_COMBINE provider/finalize",

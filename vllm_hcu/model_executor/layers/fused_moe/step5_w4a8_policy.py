@@ -210,3 +210,20 @@ def padded_route_rows(tokens, topk, experts, alignment=64):
         // alignment
         * alignment
     )
+
+
+def w4a8_execution_plan(tokens, phase):
+    """Select the mode and its routing alignment as one inseparable plan.
+
+    Decode shapes include the C8-C64 verify-token family. Larger real-prefill
+    batches and shapes outside the validated family retain MODE1002/pad64.
+    No device routing counts are copied to the host for this decision.
+    """
+    mode = int(os.environ.get("HCU_STEP5_W4A8_MODE", "1002"))
+    if mode not in (1002, 1006):
+        raise ValueError("HCU_STEP5_W4A8_MODE must be 1002 or 1006")
+    if mode == 1006 and phase == "decode" and tokens in (
+        8, 16, 24, 32, 48, 64, 96, 128, 160, 192, 224, 256
+    ):
+        return 1006, 128
+    return 1002, 64
