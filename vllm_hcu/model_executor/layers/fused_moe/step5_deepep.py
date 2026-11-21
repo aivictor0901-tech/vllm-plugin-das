@@ -410,7 +410,7 @@ def _restore_ll_impl(shared: torch.Tensor, routed: torch.Tensor,
             TP=tp_size, RANK=group.rank_in_group, BLOCK=1024,
             COUNTERS=counters, RESET_COUNTERS=counters is not None, num_warps=4)
         finish_pending_counter_reset()
-    if out.numel():
+    if tp_size > 1 and out.numel():
         out = group.all_reduce(out)
     return out
 

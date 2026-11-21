@@ -17,6 +17,7 @@ from __future__ import annotations
 import math
 
 import torch
+from triton.language.extra import libdevice
 
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
@@ -204,21 +205,96 @@ direct_register_custom_op(
 )
 
 
+@triton.jit
+def _shared_int8_wide_epilogue_kernel(
+    source, xscale, wscale, output, scales,
+    M: tl.constexpr, I: tl.constexpr, NR: tl.constexpr, LIMIT: tl.constexpr,
+    FROM_PARTIALS: tl.constexpr, B: tl.constexpr,
+    BM: tl.constexpr, BN: tl.constexpr, SPLIT_K: tl.constexpr,
+):
+    """TP1 full-row epilogue; preserve both BF16 rounding boundaries."""
+    row = tl.program_id(0)
+    col = tl.arange(0, B)
+    mask = col < I
+    if FROM_PARTIALS:
+        num_m: tl.constexpr = tl.cdiv(M, BM)
+        tiles: tl.constexpr = num_m * (tl.cdiv(NR, BN) + tl.cdiv(I, BN))
+        pid = (tl.cdiv(NR, BN) + col // BN) * num_m + row // BM
+        offset = pid * 2 * BM * BN + (row % BM) * BN + col % BN
+        gate_sum = tl.full((B,), 0, tl.int32)
+        up_sum = tl.full((B,), 0, tl.int32)
+        for split in tl.static_range(SPLIT_K):
+            base = source + split * tiles * 2 * BM * BN + offset
+            gate_sum += tl.load(base, mask, other=0)
+            up_sum += tl.load(base + BM * BN, mask, other=0)
+        xs = tl.load(xscale + row)
+        gs = tl.load(wscale + col, mask, other=0.)
+        us = tl.load(wscale + I + col, mask, other=0.)
+        gate = (gate_sum.to(tl.float32) * (xs * gs)).to(tl.bfloat16).to(tl.float32)
+        up = (up_sum.to(tl.float32) * (xs * us)).to(tl.bfloat16).to(tl.float32)
+    else:
+        gate = tl.load(source + row * 2 * I + col, mask, other=0.).to(tl.float32)
+        up = tl.load(source + row * 2 * I + I + col, mask, other=0.).to(tl.float32)
+    value = (tl.minimum(tl.sigmoid(gate) * gate, LIMIT)
+             * tl.minimum(tl.maximum(up, -LIMIT), LIMIT)).to(tl.bfloat16).to(tl.float32)
+    amax = tl.maximum(tl.max(tl.where(mask, tl.abs(value), 0.), 0), 1e-10)
+    quant = libdevice.nearbyint(value * (127. / amax)).to(tl.int8)
+    tl.store(output + row * I + col, quant, mask)
+    tl.store(scales + row, amax / 127.)
+
+
+def _shared_int8_shape(input, xscale, wscale):
+    if input.dtype == torch.int32:
+        if xscale is None or wscale is None:
+            raise ValueError("shared split-K epilogue requires input and weight scales")
+        rows, width = xscale.shape[0], wscale.numel() // 2
+    else:
+        if input.dtype != torch.bfloat16 or input.ndim != 2:
+            raise ValueError("shared epilogue requires BF16 gate/up or INT32 split-K input")
+        rows, width = input.shape[0], input.shape[1] // 2
+    if width not in (384, 1536):
+        raise ValueError("shared INT8 epilogue supports TP4 (384) and TP1 (1536)")
+    return rows, width
+
+
 def _shared_int8_epilogue(
     input: torch.Tensor, xscale: torch.Tensor | None = None,
     wscale: torch.Tensor | None = None, router_columns: int = 352, limit: float = 7.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    from lightop.moe import shared_gateup_int8_epilogue
-
-    return shared_gateup_int8_epilogue(
-        input, xscale, wscale, router_columns, limit,
-    )
+    rows, width = _shared_int8_shape(input, xscale, wscale)
+    if width == 384:
+        # Keep the validated TP4 native operation and its launch unchanged.
+        from lightop.moe import shared_gateup_int8_epilogue
+        return shared_gateup_int8_epilogue(input, xscale, wscale, router_columns, limit)
+    if not input.is_contiguous():
+        raise ValueError("shared epilogue requires contiguous input")
+    if input.dtype == torch.int32:
+        tiles = triton.cdiv(rows, _BM) * (triton.cdiv(router_columns, _BN)
+                                        + triton.cdiv(width, _BN))
+        if (input.numel() < _SPLIT_K * tiles * 2 * _BM * _BN
+                or xscale.shape != (rows, 1) or wscale.numel() != 2 * width
+                or xscale.dtype != torch.float32 or wscale.dtype != torch.float32
+                or not xscale.is_contiguous() or not wscale.is_contiguous()
+                or xscale.device != input.device or wscale.device != input.device):
+            raise ValueError("invalid shared split-K workspace or scales")
+    elif input.shape[1] != 2 * width:
+        raise ValueError("invalid shared gate/up width")
+    q = input.new_empty((rows, width), dtype=torch.int8)
+    scale = input.new_empty((rows, 1), dtype=torch.float32)
+    if rows:
+        _shared_int8_wide_epilogue_kernel[(rows,)](
+            input, xscale, wscale, q, scale, M=rows, I=width,
+            NR=router_columns, LIMIT=limit, FROM_PARTIALS=input.dtype == torch.int32,
+            B=triton.next_power_of_2(width), BM=_BM, BN=_BN, SPLIT_K=_SPLIT_K,
+            num_warps=4, num_stages=1,
+        )
+    return q, scale
 
 
 def _shared_int8_epilogue_fake(input, xscale=None, wscale=None, router_columns=352, limit=7.0):
-    rows = xscale.shape[0] if input.dtype == torch.int32 else input.shape[0]
+    rows, width = _shared_int8_shape(input, xscale, wscale)
     return (
-        input.new_empty((rows, 384), dtype=torch.int8),
+        input.new_empty((rows, width), dtype=torch.int8),
         input.new_empty((rows, 1), dtype=torch.float32),
     )
 
@@ -238,19 +314,21 @@ def _router_shared_int8_quant(
 
     m, k = x.shape
     nr = w_router.shape[1]
+    width = w_gate_up.shape[0] // 2
     logits = x.new_empty((m, nr), dtype=torch.float32)
     if m == 0:
-        q, scale = _shared_int8_epilogue_fake(x, limit=limit)
+        q = x.new_empty((m, width), dtype=torch.int8)
+        scale = x.new_empty((m, 1), dtype=torch.float32)
         return logits, q, scale
     if xq is None:
         xq, xs = per_token_quant_int8(x)
-    tiles = triton.cdiv(m, _BM) * (triton.cdiv(nr, _BN) + 6)
+    tiles = triton.cdiv(m, _BM) * (triton.cdiv(nr, _BN) + triton.cdiv(width, _BN))
     # The original GEMM tiles/layout are unchanged. Its shared epilogue is
     # replaced by the same full-row LightOp operation used after hipBLASLt.
     _router_shared_int8_kernel[(tiles, _SPLIT_K)](
         x, xq, xs, w_router, w_gate_up, weight_scale,
         logits, x, partials, counters, m, k, x.stride(0), w_router.stride(0),
-        NR=nr, I=384, LIMIT=limit, BM=_BM, BN=_BN, BK=_BK, SPLIT_K=_SPLIT_K,
+        NR=nr, I=width, LIMIT=limit, BM=_BM, BN=_BN, BK=_BK, SPLIT_K=_SPLIT_K,
         DEFER_SHARED=True, num_warps=_WARPS, num_stages=_STAGES,
     )
     q, scale = torch.ops.vllm.step5_shared_int8_epilogue(
@@ -264,7 +342,7 @@ def _router_shared_int8_quant_fake(
 ):
     return (
         x.new_empty((x.shape[0], w_router.shape[1]), dtype=torch.float32),
-        x.new_empty((x.shape[0], 384), dtype=torch.int8),
+        x.new_empty((x.shape[0], w_gate_up.shape[0] // 2), dtype=torch.int8),
         x.new_empty((x.shape[0], 1), dtype=torch.float32),
     )
 
@@ -319,8 +397,8 @@ def router_shared_swiglustep_int8(
     ):
         raise ValueError("invalid private router/shared INT8 workspace")
     if quantized_output:
-        if I != 384:
-            raise ValueError("shared INT8 epilogue requires the384-wide TP4 shard")
+        if I not in (384, 1536):
+            raise ValueError("shared INT8 epilogue requires a TP4 or TP1 shard")
         logits, q, scale = torch.ops.vllm.step5_router_shared_int8_quant(
             x, w_router, w_gate_up, weight_scale, partials, counters, float(limit), xq, xs,
         )
