@@ -38,6 +38,9 @@ def warn_ignored_step5_envs() -> None:
 
 
 ENVIRONMENT_VARIABLES = {
+    "VLLM_HCU_STEP5_SWA_INT8_EPILOGUE": lambda: (
+        os.getenv("VLLM_HCU_STEP5_SWA_INT8_EPILOGUE", "0") == "1"
+    ),
     "VLLM_HCU_STEP5_W4A8_GEMM_BACKEND": lambda: os.getenv(
         "VLLM_HCU_STEP5_W4A8_GEMM_BACKEND", "deepgemm"
     ),
