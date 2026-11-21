@@ -762,14 +762,26 @@ def validate_and_update_hcu_config(vllm_config: object) -> HcuFeatureConfig:
                 model_architectures(vllm_config)
             )
         )
+        # Step5 explicitly assigns each TP token shard to one EP dispatcher,
+        # so TP+EP also supports auto without multiple DP replicas. Keep the
+        # PCP-only guard for models without global phase synchronization.
+        from vllm_hcu.runtime_compat.step5 import is_step5_config
+        supports_step5_tp_auto = (
+            is_step5_config(vllm_config)
+            and bool(os.environ.get("VLLM_HCU_STEP5_W4A8_PROFILE", ""))
+            and int(getattr(parallel_config, "tensor_parallel_size", 1)) > 1
+            and int(getattr(parallel_config, "prefill_context_parallel_size", 1)) == 1
+        )
         if (
             int(getattr(parallel_config, "data_parallel_size", 1)) <= 1
             and not supports_pcp_only_auto
+            and not supports_step5_tp_auto
         ):
             raise ValueError(
                 "HCU deepep_auto requires data_parallel_size > 1; "
                 "the PCP-only exception requires DeepSeek V4 or its native "
-                "MTP draft with prefill_context_parallel_size > 1."
+                "MTP draft with prefill_context_parallel_size > 1; "
+                "Step5 W4A8 also supports TP+EP token sharding."
             )
         if not getattr(parallel_config, "enable_expert_parallel", False):
             raise ValueError(

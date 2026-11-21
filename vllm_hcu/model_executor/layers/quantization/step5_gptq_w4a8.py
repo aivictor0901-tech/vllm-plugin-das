@@ -16,6 +16,7 @@ from vllm.model_executor.layers.fused_moe import RoutedExperts, UnquantizedFused
 from vllm_hcu.model_executor.layers.fused_moe.step5_w4a8_policy import (
     compressed_w4a8_config,
     profile_for_model,
+    uses_step5_deepep,
     validate_gptq_w4a8_scheme,
 )
 from .slimquant_w4a8 import SlimQuantW4A8Int8AiterMoEMethod, SlimQuantW4A8Int8Config
@@ -45,6 +46,9 @@ def quantize_bf16_expert(weight, device):
 class Step5BF16ToFP8MoEMethod(CompressedTensorsW8A8Fp8MoEMethod):
     """Reuse the existing channel-FP8 runtime with local load-time conversion."""
     def __init__(self, moe, layer_name):
+        # Scope the FP8 oracle exception to this mixed-checkpoint adapter.
+        # Other Channel-FP8 models retain their existing backend validation.
+        moe._hcu_step5_deepep_mixed_fp8 = uses_step5_deepep(moe)
         weight = QuantizationArgs(num_bits=8, type="float", strategy="channel",
                                   symmetric=True, dynamic=False)
         activation = QuantizationArgs(num_bits=8, type="float", strategy="token",
@@ -53,7 +57,7 @@ class Step5BF16ToFP8MoEMethod(CompressedTensorsW8A8Fp8MoEMethod):
 
     def create_weights(self, layer, num_experts, hidden_size,
                        intermediate_size_per_partition, params_dtype, **attrs):
-        if (num_experts, hidden_size, intermediate_size_per_partition) != (44, 4096, 1536):
+        if not uses_step5_deepep(self.moe) and (num_experts, hidden_size, intermediate_size_per_partition) != (44, 4096, 1536):
             raise ValueError("Step5 mixed FP8 requires 44 complete experts per EP8 rank")
         super().create_weights(layer, num_experts, hidden_size,
                                intermediate_size_per_partition, params_dtype, **attrs)
@@ -68,9 +72,10 @@ class Step5BF16ToFP8MoEMethod(CompressedTensorsW8A8Fp8MoEMethod):
                 local = layer._map_global_expert_id_to_local_expert_id(expert_id)
                 if local == -1:
                     return False if return_success else None
-                expected = ((hidden_size, intermediate_size_per_partition)
+                full_intermediate = intermediate_size_per_partition * self.moe.moe_parallel_config.tp_size
+                expected = ((hidden_size, full_intermediate)
                             if shard_id == "w2"
-                            else (intermediate_size_per_partition, hidden_size))
+                            else (full_intermediate, hidden_size))
                 if tuple(tensor.shape) != expected:
                     raise ValueError(f"Unexpected BF16 expert projection shape: {tuple(tensor.shape)}")
                 quantized, scale = quantize_bf16_expert(tensor, param.device)
@@ -89,19 +94,29 @@ class Step5BF16ToFP8MoEMethod(CompressedTensorsW8A8Fp8MoEMethod):
     def process_weights_after_loading(self, layer):
         if len(self._bf16_loaded) != self._bf16_expected:
             raise RuntimeError(f"Incomplete BF16-to-FP8 expert load: {len(self._bf16_loaded)}/{self._bf16_expected}")
-        super().process_weights_after_loading(layer)
+        if uses_step5_deepep(self.moe):
+            from vllm_hcu.model_executor.layers.fused_moe.step5_deepep import prepare_step5_deepep
+            prepare_step5_deepep(self, layer, int4=False)
+        else:
+            super().process_weights_after_loading(layer)
 
 
 class Step5GPTQW4A8MoEMethod(SlimQuantW4A8Int8AiterMoEMethod):
+    @property
+    def supports_int8_allgatherv_input(self):
+        if uses_step5_deepep(self.moe):
+            return False
+        return super().supports_int8_allgatherv_input
+
     def create_weights(self, layer, num_experts, hidden_size,
                        intermediate_size_per_partition, params_dtype, **attrs):
         from vllm_hcu.ops.step5.w4a8 import gemm_backend, require_gemm_op
 
-        if gemm_backend() == "deepgemm":
+        if gemm_backend() == "deepgemm" or uses_step5_deepep(self.moe):
             # Fail before reading the 335 GiB checkpoint when an incompatible
             # DeepGEMM wheel is installed.
             require_gemm_op("deepgemm")
-        if (num_experts, hidden_size, intermediate_size_per_partition) != (44, 4096, 1536):
+        if not uses_step5_deepep(self.moe) and (num_experts, hidden_size, intermediate_size_per_partition) != (44, 4096, 1536):
             raise ValueError("Step5 GPTQ requires 44 complete experts per EP8 rank")
         super().create_weights(layer, num_experts, hidden_size,
                                intermediate_size_per_partition, params_dtype, **attrs)
@@ -117,14 +132,16 @@ class Step5GPTQW4A8MoEMethod(SlimQuantW4A8Int8AiterMoEMethod):
                 if local == -1:
                     return False if return_success else None
                 if "scale" in _name:
-                    rows = hidden_size if shard_id == "w2" else intermediate_size_per_partition
+                    full_intermediate = intermediate_size_per_partition * self.moe.moe_parallel_config.tp_size
+                    rows = hidden_size if shard_id == "w2" else full_intermediate
                     if tensor.dtype != torch.float32 or tuple(tensor.shape) != (rows, 1):
                         raise ValueError("Step5 GPTQ requires FP32 per-output-channel scales")
                     converted = tensor * (1.0 / 16.0)
                 else:
-                    shape = ((hidden_size, intermediate_size_per_partition // 8)
+                    full_intermediate = intermediate_size_per_partition * self.moe.moe_parallel_config.tp_size
+                    shape = ((hidden_size, full_intermediate // 8)
                              if shard_id == "w2"
-                             else (intermediate_size_per_partition, hidden_size // 8))
+                             else (full_intermediate, hidden_size // 8))
                     if tuple(tensor.shape) != shape:
                         raise ValueError(f"Unexpected Step5 GPTQ packed weight shape: {tuple(tensor.shape)}")
                     converted = repack_gptq_int4(tensor)
@@ -176,8 +193,8 @@ def moe_quant_config(vllm_config):
     if (not source or source.get_name() != "compressed-tensors"
             or not compressed_w4a8_config(vllm_config)):
         return source
-    if profile_for_model(vllm_config) not in ("prefill", "decode"):
-        raise ValueError("Set VLLM_HCU_STEP5_W4A8_PROFILE=prefill (TP1/DP8/EP8) or decode (TP4/DP2/EP8)")
+    if profile_for_model(vllm_config) not in ("prefill", "decode", "auto"):
+        raise ValueError("Set VLLM_HCU_STEP5_W4A8_PROFILE=prefill, decode or auto")
     adapter = getattr(source, "_hcu_step5_gptq_adapter", None)
     if adapter is None:
         adapter = source._hcu_step5_gptq_adapter = Step5GPTQW4A8Config(source)

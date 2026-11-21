@@ -94,6 +94,13 @@ def apply_to_module(module: ModuleType) -> bool:
                 speculative_config, "num_speculative_tokens", 0
             )
             max_tokens *= 1 + int(num_speculative_tokens or 0)
+            from vllm_hcu.runtime_compat.step5 import is_step5_owner
+            if is_step5_owner(moe) and moe.moe_parallel_config.is_sequence_parallel:
+                # Step5 removes the TP replicas before dispatch. Bound LL by
+                # each sender's actual token shard instead of reserving the
+                # whole DP batch again on every TP rank.
+                sp = moe.moe_parallel_config.sp_size
+                max_tokens = ((max_tokens + sp - 1) // sp + 15) // 16 * 16
             handle = all2all_manager.get_handle(
                 {
                     "max_num_tokens_per_dp_rank": max_tokens,

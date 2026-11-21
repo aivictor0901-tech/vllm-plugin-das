@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import functools
+import os
 from types import ModuleType
 
 from vllm_hcu.patch.config import get_hcu_config
@@ -107,7 +108,15 @@ def apply_to_module(module: ModuleType) -> bool:
 
         vllm_config = get_current_vllm_config_or_none()
         custom_sp = get_hcu_config(vllm_config).enable_custom_sp
-        if custom_sp and self.is_ep_communicator:
+        from vllm_hcu.runtime_compat.step5 import is_step5_config
+        step5_auto = (
+            vllm_config is not None
+            and get_hcu_config(vllm_config).deepep_auto
+            and is_step5_config(vllm_config)
+            and bool(os.environ.get("VLLM_HCU_STEP5_W4A8_PROFILE", ""))
+            and vllm_config.parallel_config.tensor_parallel_size > 1
+        )
+        if (custom_sp or step5_auto) and self.is_ep_communicator:
             self.use_all2all = True
 
     def hcu_all_to_all_single(self, output, input):
