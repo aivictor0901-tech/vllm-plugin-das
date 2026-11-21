@@ -33,6 +33,7 @@ from vllm.sequence import IntermediateTensors
 
 from .step5_text import (
     MIXED_DENSE_INT8,
+    REPLICATED_EMBEDDING,
     Step5DecoderLayer,
     _QUANT_TENSOR_SUFFIXES,
     _check_dense_int8_dtype,
@@ -207,6 +208,7 @@ class Step5MultiTokenPredictor(nn.Module):
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
+            disable_tp=REPLICATED_EMBEDDING,
         )
         self.mtp_start_layer_idx = config.num_hidden_layers
         self.num_mtp_layers = getattr(config, "num_nextn_predict_layers", 3)
