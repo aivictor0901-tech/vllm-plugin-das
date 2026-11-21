@@ -161,6 +161,7 @@ def _router_shared_int8(
     x: torch.Tensor, w_router: torch.Tensor, w_gate_up: torch.Tensor,
     weight_scale: torch.Tensor, partials: torch.Tensor, counters: torch.Tensor,
     limit: float,
+    xq: torch.Tensor | None = None, xs: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     from lightop.quant import per_token_quant_int8
 
@@ -170,7 +171,8 @@ def _router_shared_int8(
     act = torch.empty((M, I), device=x.device, dtype=torch.bfloat16)
     if M == 0:
         return logits, act
-    xq, xs = per_token_quant_int8(x)
+    if xq is None:
+        xq, xs = per_token_quant_int8(x)
     tiles = triton.cdiv(M, _BM) * (triton.cdiv(NR, _BN) + triton.cdiv(I, _BN))
     _router_shared_int8_kernel[(tiles, _SPLIT_K)](
         x, xq, xs, w_router, w_gate_up, weight_scale,
@@ -186,6 +188,7 @@ def _router_shared_int8_fake(
     x: torch.Tensor, w_router: torch.Tensor, w_gate_up: torch.Tensor,
     weight_scale: torch.Tensor, partials: torch.Tensor, counters: torch.Tensor,
     limit: float,
+    xq: torch.Tensor | None = None, xs: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     return (
         torch.empty((x.shape[0], w_router.shape[1]), device=x.device, dtype=torch.float32),
@@ -203,6 +206,7 @@ def router_shared_swiglustep_int8(
     x: torch.Tensor, w_router: torch.Tensor, w_gate_up: torch.Tensor,
     weight_scale: torch.Tensor, limit: float,
     workspace: tuple[torch.Tensor, torch.Tensor] | None = None,
+    x_and_scale_quanted: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return FP32 router logits and BF16 activation from checkpoint INT8 weights.
 
@@ -212,6 +216,16 @@ def router_shared_swiglustep_int8(
     """
     if not usable_router_shared_int8(x, w_router, w_gate_up, weight_scale, limit):
         raise ValueError("unsupported Step5 router/shared INT8 dtype, layout or dimensions")
+    xq, xs = (None, None) if x_and_scale_quanted is None else x_and_scale_quanted
+    if xq is not None and (
+        xq.shape != x.shape or xq.dtype != torch.int8
+        or xs is None or xs.shape != (x.shape[0], 1) or xs.dtype != torch.float32
+        or xq.device != x.device or xs.device != x.device
+        or not xq.is_contiguous() or not xs.is_contiguous()
+    ):
+        raise ValueError("invalid prequantized router/shared INT8 input")
+    if (xq is None) != (xs is None):
+        raise ValueError("prequantized router/shared input requires both payload and scale")
     NR, I = w_router.shape[1], w_gate_up.shape[0] // 2
     if workspace is None:
         if torch.cuda.is_current_stream_capturing():
@@ -228,7 +242,7 @@ def router_shared_swiglustep_int8(
     ):
         raise ValueError("invalid private router/shared INT8 workspace")
     return torch.ops.vllm.step5_router_shared_int8(
-        x, w_router, w_gate_up, weight_scale, partials, counters, float(limit)
+        x, w_router, w_gate_up, weight_scale, partials, counters, float(limit), xq, xs
     )
 
 
