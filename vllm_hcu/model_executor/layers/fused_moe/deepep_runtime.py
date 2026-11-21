@@ -933,6 +933,9 @@ def ll_do_quant(module, self, x, a1_dtype, quant_config, expert_num_tokens=None)
         return x
 
     q_dtype = quant_config.quant_dtype
+    if getattr(self, "_hcu_step5_live_row_fp8", False):
+        from vllm_hcu.ops.token_fp8_quant import masked_token_fp8_quant
+        return masked_token_fp8_quant(x, expert_num_tokens)
     if q_dtype == "nvfp4" and module.envs.VLLM_DEEPEPLL_NVFP4_DISPATCH:
         if not isinstance(x, tuple):
             raise RuntimeError("DeepEP LL NVFP4 dispatch did not return data and scales")

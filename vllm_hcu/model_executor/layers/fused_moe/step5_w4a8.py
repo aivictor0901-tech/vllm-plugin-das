@@ -220,10 +220,17 @@ def _make_experts_class(phase, backend="deepgemm"):
                 and expert_map is not None
                 and a1q_scale.is_contiguous()
             )
-            mode, alignment = w4a8_execution_plan(hidden_states.shape[0], phase)
-            if not use_small:
-                # The 128-row mode is validated only with the small-route
-                # producer; other dispatchers retain their existing ABI.
+            generic_decode = (
+                backend == "deepgemm" and phase == "decode"
+                and hidden_states.shape[0] > 256
+                and expert_tokens_meta is None
+                and (N, K) == (3072, 4096)
+            )
+            mode, alignment = w4a8_execution_plan(
+                hidden_states.shape[0], phase, generic_decode=generic_decode,
+            )
+            if not use_small and not generic_decode:
+                # Other dispatchers and metadata retain their existing ABI.
                 mode, alignment = 1002, 64
             aligned = dg.compute_aligned_M(
                 M=topk_ids.shape[0],

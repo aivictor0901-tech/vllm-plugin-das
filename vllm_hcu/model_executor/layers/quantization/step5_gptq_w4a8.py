@@ -25,6 +25,21 @@ from compressed_tensors.quantization import QuantizationArgs
 from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w8a8_fp8 import CompressedTensorsW8A8Fp8MoEMethod
 
 
+def _static_eplb_loader_owner(layer, loader):
+    """Keep logical-ID mapping outside local checkpoint conversion."""
+    from vllm_hcu.model_executor.layers.fused_moe.step5_ll_eplb_policy import allows_static_step5_ll_eplb
+    if not allows_static_step5_ll_eplb(layer.moe_config):
+        return loader
+    from types import MethodType
+    def owned(owner, param, loaded_weight, weight_name, shard_id, expert_id,
+              return_success=False):
+        if owner is not layer:
+            raise ValueError("Step5 static loader owner changed")
+        return loader(param, loaded_weight, weight_name, shard_id, expert_id,
+                      return_success=return_success)
+    return MethodType(owned, layer)
+
+
 def repack_gptq_int4(weight):
     if weight.dtype != torch.int32 or weight.ndim != 2:
         raise ValueError("Step5 GPTQ weights must be rank-2 INT32 packed along K")
@@ -69,9 +84,13 @@ class Step5BF16ToFP8MoEMethod(CompressedTensorsW8A8Fp8MoEMethod):
         for name in ("w13_weight", "w2_weight"):
             parameter = getattr(layer, name)
             original = parameter.weight_loader
+            # Internal conversion already receives a physical expert ID. Retain
+            # the base scale loader before static EPLB wraps checkpoint loaders.
+            original_scale = getattr(layer, name + "_scale").weight_loader
 
             def load(param, tensor, weight_name, shard_id, expert_id,
-                     return_success=False, *, _name=name, _original=original):
+                     return_success=False, *, _name=name, _original=original,
+                     _original_scale=original_scale):
                 local = layer._map_global_expert_id_to_local_expert_id(expert_id)
                 if local == -1:
                     return False if return_success else None
@@ -85,14 +104,14 @@ class Step5BF16ToFP8MoEMethod(CompressedTensorsW8A8Fp8MoEMethod):
                 success = _original(param, quantized, weight_name, shard_id=shard_id,
                                     expert_id=expert_id, return_success=True)
                 scale_param = getattr(layer, _name + "_scale")
-                scale_success = scale_param.weight_loader(
+                scale_success = _original_scale(
                     scale_param, scale, weight_name + "_scale", shard_id=shard_id,
                     expert_id=expert_id, return_success=True)
                 if success and scale_success:
                     self._bf16_loaded.add((shard_id, local))
                 return success and scale_success if return_success else None
 
-            parameter.weight_loader = load
+            parameter.weight_loader = _static_eplb_loader_owner(layer, load)
 
     def process_weights_after_loading(self, layer):
         if len(self._bf16_loaded) != self._bf16_expected:
@@ -157,7 +176,7 @@ class Step5GPTQW4A8MoEMethod(SlimQuantW4A8Int8AiterMoEMethod):
                     self._gptq_loaded.add((_name, shard_id, local))
                 return success if return_success else None
 
-            parameter.weight_loader = load
+            parameter.weight_loader = _static_eplb_loader_owner(layer, load)
 
     def process_weights_after_loading(self, layer):
         if len(self._gptq_loaded) != self._gptq_expected:

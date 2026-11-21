@@ -4,6 +4,7 @@
 import os
 import re
 from vllm_hcu.runtime_compat.step5 import is_step5_config, is_step5_owner
+from .step5_ll_eplb_policy import allows_static_step5_ll_eplb
 
 
 def uses_step5_deepep(config):
@@ -157,7 +158,7 @@ def profile_for_model(config):
     if uses_step5_deepep(config):
         # TP/DP/EP/PP sizes belong to the framework. In particular, do not
         # require one eight-card deployment or a fixed local expert count.
-        if parallel.enable_eplb:
+        if parallel.enable_eplb and not allows_static_step5_ll_eplb(config):
             raise ValueError("Step5 packed DeepGEMM weights require static expert placement")
         return phase
     if phase == "auto":
@@ -188,7 +189,7 @@ def resolve_profile(moe):
         raise ValueError("VLLM_HCU_STEP5_W4A8_PROFILE must be prefill, decode or auto")
     parallel = moe.moe_parallel_config
     if uses_step5_deepep(moe):
-        if parallel.enable_eplb:
+        if parallel.enable_eplb and not allows_static_step5_ll_eplb(moe):
             raise ValueError("Step5 packed DeepGEMM weights require static expert placement")
         return "auto"
     expected = ((8, 8),) if phase == "prefill" else ((8, 2), (16, 4))
@@ -220,16 +221,21 @@ def padded_route_rows(tokens, topk, experts, alignment=64):
     )
 
 
-def w4a8_execution_plan(tokens, phase):
+def w4a8_execution_plan(tokens, phase, *, generic_decode=False):
     """Select the mode and its routing alignment as one inseparable plan.
 
-    Decode shapes include the C8-C64 verify-token family. Larger real-prefill
-    batches and shapes outside the validated family retain MODE1002/pad64.
+    Default plans preserve the existing small-Decode and Prefill behavior.
+    generic_decode enables validated large Decode MODE1006 while retaining
+    the generic producer's existing 256-row expert layout.
     No device routing counts are copied to the host for this decision.
     """
     mode = int(os.environ.get("HCU_STEP5_W4A8_MODE", "1002"))
     if mode not in (1002, 1006):
         raise ValueError("HCU_STEP5_W4A8_MODE must be 1002 or 1006")
+    if mode == 1006 and phase == "decode" and generic_decode and tokens in (
+        272, 288, 320, 352, 384, 416, 448, 480, 512,
+    ):
+        return 1006, 256
     if mode == 1006 and phase == "decode" and tokens in (
         8, 16, 24, 32, 48, 64, 96, 128, 160, 192, 224, 256
     ):

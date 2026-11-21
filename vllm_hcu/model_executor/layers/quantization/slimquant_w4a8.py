@@ -327,6 +327,10 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
 
     @property
     def supports_eplb(self) -> bool:
+        if self._step5_w4a8_profile is not None:
+            from vllm_hcu.model_executor.layers.fused_moe.step5_ll_eplb_policy import allows_static_step5_ll_eplb
+            if allows_static_step5_ll_eplb(self.moe):
+                return True
         # Kimi fixed LL is safe for synchronous EPLB only because its masked
         # N32 views alias the same in-place packed Parameter storage. Keep the
         # capability limited to the exact model/backend/config combination.
