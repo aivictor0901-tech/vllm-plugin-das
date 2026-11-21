@@ -151,9 +151,7 @@ def aiter_moe_weight_layout_signature(config: object) -> tuple[Any, ...]:
 
     config_values = getattr(config, "config", None)
     padded_k = (
-        config_values.get("PADDED_K")
-        if isinstance(config_values, dict)
-        else None
+        config_values.get("PADDED_K") if isinstance(config_values, dict) else None
     )
     return (
         _freeze(getattr(config, "quant_type", None)),
@@ -201,8 +199,7 @@ def _validate_derived_tensor(
         return None
     if not isinstance(derived, torch.Tensor):
         raise HcuAiterMoeDispatchError(
-            f"AITER returned a non-tensor {label}; "
-            f"solution={_solution_token(config)}"
+            f"AITER returned a non-tensor {label}; solution={_solution_token(config)}"
         )
     compatible_shape = derived.shape == original.shape
     config_values = getattr(config, "config", None)
@@ -256,8 +253,7 @@ def select_aiter_moe_config(
     selector = getattr(moe_module, "get_aiter_moe_config", None)
     if not callable(selector):
         raise HcuAiterMoeDispatchError(
-            "aiter.moe exposes no callable get_aiter_moe_config; "
-            + problem.describe()
+            "aiter.moe exposes no callable get_aiter_moe_config; " + problem.describe()
         )
 
     # A pinned solution is used when weights have already been converted to
@@ -282,14 +278,12 @@ def select_aiter_moe_config(
     result = selector(**selector_kwargs)
     if not isinstance(result, tuple) or len(result) != 2:
         raise HcuAiterMoeDispatchError(
-            "get_aiter_moe_config must return (status, config); "
-            + problem.describe()
+            "get_aiter_moe_config must return (status, config); " + problem.describe()
         )
     status, config = result
     if type(status) is not bool:
         raise HcuAiterMoeDispatchError(
-            "get_aiter_moe_config must return a boolean status; "
-            + problem.describe()
+            "get_aiter_moe_config must return a boolean status; " + problem.describe()
         )
     if status is False:
         if _mark_route_logged(problem):
@@ -312,9 +306,13 @@ def select_aiter_moe_config(
             solution,
             problem.describe(),
         )
-    if solution_type is not None and _solution_token(config) != str(
-        getattr(solution_type, "value", solution_type)
-    ).rsplit(".", 1)[-1].upper():
+    if (
+        solution_type is not None
+        and _solution_token(config)
+        != str(getattr(solution_type, "value", solution_type))
+        .rsplit(".", 1)[-1]
+        .upper()
+    ):
         raise HcuAiterMoeDispatchError(
             "AITER ignored the requested MoE solution layout; requested="
             f"{solution_type!r}, returned={_solution_token(config)}"
@@ -439,7 +437,10 @@ def refresh_aiter_moe_scale_cache(
         return
     for old_key, entry in list(cache.items()):
         fresh = prepare_aiter_moe_scales(
-            scale1, scale2, entry.config, cache_owner=object(),
+            scale1,
+            scale2,
+            entry.config,
+            cache_owner=object(),
         )
         _copy_prepared_scales(entry, fresh)
         if update_generation:
@@ -511,16 +512,20 @@ def _validate_expert_mapping_tensor(
     label: str,
 ) -> None:
     if value.ndim != 1 or value.dtype not in (torch.int32, torch.int64):
-        raise HcuAiterMoeDispatchError(
-            f"AITER requires a rank-1 integer {label}"
-        )
+        raise HcuAiterMoeDispatchError(f"AITER requires a rank-1 integer {label}")
 
 
 def resolve_aiter_expert_maps(
     expert_map: torch.Tensor | None,
     global_num_experts: int,
+    *,
+    create_mask: bool = True,
 ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
-    """Recover vLLM's native map and AITER's sentinel mask as a pair."""
+    """Recover the native map, optionally constructing AITER's sentinel mask.
+
+    Native-map-only consumers can skip mask construction. Already paired masks
+    are still validated and returned; no routing tensor is copied or cached.
+    """
 
     if expert_map is None:
         return None, None
@@ -532,10 +537,7 @@ def resolve_aiter_expert_maps(
                 "AITER expert mask carries a non-tensor native expert map"
             )
         _validate_expert_mapping_tensor(native_map, label="native expert map")
-        if (
-            global_num_experts > 0
-            and expert_map.numel() < global_num_experts + 1
-        ):
+        if global_num_experts > 0 and expert_map.numel() < global_num_experts + 1:
             raise HcuAiterMoeDispatchError(
                 "AITER expert mask has no trailing sentinel: "
                 f"{expert_map.numel()} < {global_num_experts + 1}"
@@ -547,6 +549,8 @@ def resolve_aiter_expert_maps(
             "AITER received an unpaired expert mask; the original vLLM "
             "global-to-local map is required for non-ASM routing and fallback"
         )
+    if not create_mask:
+        return expert_map, None
     sentinel = torch.zeros((1,), dtype=torch.int32, device=expert_map.device)
     expert_mask = torch.cat(((expert_map >= 0).to(torch.int32), sentinel))
     return expert_map, expert_mask
@@ -571,10 +575,7 @@ def aiter_expert_map_for_solution(
         if native_map is not None:
             _validate_expert_mapping_tensor(native_map, label="native expert map")
         _validate_expert_mapping_tensor(expert_mask, label="expert mask")
-        if (
-            global_num_experts > 0
-            and expert_mask.numel() < global_num_experts + 1
-        ):
+        if global_num_experts > 0 and expert_mask.numel() < global_num_experts + 1:
             raise HcuAiterMoeDispatchError(
                 "AITER expert mask has no trailing sentinel: "
                 f"{expert_mask.numel()} < {global_num_experts + 1}"

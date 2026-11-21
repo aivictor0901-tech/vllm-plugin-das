@@ -90,7 +90,9 @@ def execute_model(
             self.dp_size,
             self.dp_rank,
             max_query_len=max_query_len,
-            need_eager=is_profile or skip_compiled or needs_context_eager(self, batch_req_state, dummy_run),
+            need_eager=is_profile
+            or skip_compiled
+            or needs_context_eager(self, batch_req_state, dummy_run),
             num_active_loras=num_active_loras,
             parallel_config=self.parallel_config,
             allow_ubatching=(
@@ -197,6 +199,27 @@ def execute_model(
         if inputs_embeds is not None and not requires_raw_input_tokens(self.model):
             input_ids = None
 
+    boundary_started = False
+    prepared_model_inputs = None
+    eplb_prepared = False
+    if (
+        not dummy_run
+        and batch_desc.cg_mode == CUDAGraphMode.FULL
+        and batch_desc.num_ubatches == 1
+        and getattr(self.cudagraph_manager, "_step5_boundary_enabled", False)
+    ):
+        from vllm_hcu.v1.step5_boundary import start_prefix
+
+        prepared_model_inputs = self.model_state.prepare_inputs(
+            input_batch, self.req_states
+        )
+        self.step_timing.record_batch(input_batch, True)
+        self.step_timing.forward_start()
+        self.eplb.prepare_forward(self.model_config, input_batch.num_tokens, None)
+        eplb_prepared = True
+        self.kv_connector.pre_forward(scheduler_output)
+        boundary_started = start_prefix(self, batch_desc)
+
     attn_metadata = None
     slot_mappings_by_layer = None
     ubatch_state: UBatchState | None = None
@@ -220,18 +243,32 @@ def execute_model(
                 [g for g in groups if not isinstance(g.kv_cache_spec, MambaSpec)]
                 for groups in attn_groups
             ]
-        attn_metadata = self.model_state.prepare_attn(
-            input_batch,
-            batch_desc.cg_mode,
-            block_tables,
-            slot_mappings,
-            attn_groups,
-            self.kv_cache_config,
-            # FULL replay reads capture-time metadata buffers. Re-stage them
-            # from the zeroed dummy block tables instead of retaining state
-            # indices from the previous real batch.
-            for_capture=dummy_run and batch_desc.cg_mode == CUDAGraphMode.FULL,
+        from vllm_hcu.v1.step5_boundary import metadata_consumer_scope
+        from contextlib import nullcontext
+
+        early = boundary_started and getattr(
+            self.cudagraph_manager, "_step5_boundary_early", False
         )
+        consumer_scope = (
+            metadata_consumer_scope(
+                self.cudagraph_manager._step5_boundary_pairs[batch_desc]
+            )
+            if early
+            else nullcontext()
+        )
+        with consumer_scope:
+            attn_metadata = self.model_state.prepare_attn(
+                input_batch,
+                batch_desc.cg_mode,
+                block_tables,
+                slot_mappings,
+                attn_groups,
+                self.kv_cache_config,
+                # FULL replay reads capture-time metadata buffers. Re-stage them
+                # from the zeroed dummy block tables instead of retaining state
+                # indices from the previous real batch.
+                for_capture=dummy_run and batch_desc.cg_mode == CUDAGraphMode.FULL,
+            )
 
     model_inputs = {
         "input_ids": input_ids,
@@ -240,7 +277,11 @@ def execute_model(
         "intermediate_tensors": None,
         # NOTE: Values returned by `prepare_inputs` will override the default
         # values above.
-        **self.model_state.prepare_inputs(input_batch, self.req_states),
+        **(
+            prepared_model_inputs
+            if prepared_model_inputs is not None
+            else self.model_state.prepare_inputs(input_batch, self.req_states)
+        ),
     }
     if not self.is_first_pp_rank:
         # Update for non-first PP ranks.
@@ -260,10 +301,16 @@ def execute_model(
 
     # Update the EPLB meta.
     ubatch_slices = ubatch_state.slices if ubatch_state is not None else None
-    self.eplb.prepare_forward(self.model_config, input_batch.num_tokens, ubatch_slices)
+    if not eplb_prepared:
+        self.eplb.prepare_forward(
+            self.model_config, input_batch.num_tokens, ubatch_slices
+        )
 
-    self.step_timing.record_batch(input_batch, batch_desc.cg_mode == CUDAGraphMode.FULL)
-    self.step_timing.forward_start()
+    if not boundary_started:
+        self.step_timing.record_batch(
+            input_batch, batch_desc.cg_mode == CUDAGraphMode.FULL
+        )
+        self.step_timing.forward_start()
 
     # Run model.
     if batch_desc.cg_mode == CUDAGraphMode.FULL:
@@ -271,7 +318,8 @@ def execute_model(
         # NOTE(woosuk): Here, we don't need to pass the input tensors,
         # because they are already copied to the CUDA graph input buffers.
         assert self.cudagraph_manager is not None
-        self.kv_connector.pre_forward(scheduler_output)
+        if not boundary_started:
+            self.kv_connector.pre_forward(scheduler_output)
         model_output = self.cudagraph_manager.run_fullgraph(batch_desc)
     else:
         # For piecewise and eager mode, just call model().

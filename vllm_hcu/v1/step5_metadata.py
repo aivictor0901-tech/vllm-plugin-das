@@ -4,6 +4,7 @@
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
+import numpy as np
 
 if TYPE_CHECKING:
     from vllm.v1.worker.gpu.input_batch import InputBatch
@@ -184,7 +185,9 @@ def prepare_step5_attn(
         # Capture with worst-case max_seq_len so the graph is valid at any replay.
         max_seq_len = self.max_model_len
     else:
-        max_seq_len = seq_lens_cpu_upper_bound[:num_reqs].max().item()
+        # This is an explicit CPU mirror, so NumPy avoids constructing a
+        # temporary CPU tensor and dispatching reduction/item operators.
+        max_seq_len = int(np.max(seq_lens_cpu_upper_bound.numpy()[:num_reqs]))
     req_doc_ranges: dict[int, list[tuple[int, int]]] | None = None
     if (
         self.supports_mm_inputs

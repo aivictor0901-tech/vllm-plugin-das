@@ -13,9 +13,12 @@ The three deltas that matter:
   reference implementation.
 * **``partial_rotary_factors`` is 1/3 on full-attention layers**, so the rotary
   dim comes from ``get_rope`` rather than a ``head_dim // 2`` special case.
-* **Only the MoE expert weights are fp8.** Every other weight in the checkpoint
-  is bf16, so ``quant_config`` is handed to ``FusedMoE`` alone. (``FP8_DENSE``
-  and ``FP8_BF16_MOE`` quantize more of them at load time.)
+* **Only the MoE expert weights are fp8.** Every other weight in the fp8
+  checkpoints is bf16, so ``quant_config`` is handed to ``FusedMoE`` alone.
+  (``FP8_DENSE`` and ``FP8_BF16_MOE`` quantize more of them at load time, and
+  ``MIXED_DENSE_INT8`` threads ``quant_config`` into attention, the dense MLPs
+  and the shared MLP for the mixed INT4/INT8 checkpoint, whose routed experts
+  are INT4 W4A8 and whose dense projections are INT8 W8A8.)
 
 Two fp8 checkpoint layouts load through this file unchanged:
 
@@ -138,6 +141,10 @@ _DSA_INDEXER_SUBSTRINGS = (
 # Escape hatch back to the pre-DSA dense path, for A/B against this backend.
 DISABLE_DSA = is_dsa_disabled()
 
+# A full input vocabulary on each TP rank avoids the embedding all-reduce.
+# This changes storage only; the native embedding loader and dtype are kept.
+REPLICATED_EMBEDDING = os.environ.get("HCU_STEP5_REPLICATED_EMBEDDING", "0") == "1"
+
 # Apply placement while checkpoint tensors stream through the plugin loader.
 EXPERT_PLACEMENT = (
     os.environ.get("VLLM_STEP5_EXPERT_PLACEMENT", "")
@@ -185,12 +192,73 @@ QKV_INDEXER = henvs.optional_custom_op_enabled(
     os.environ.get("VLLM_HCU_STEP5_QKV_INDEXER", "0") == "1"
 )
 
+# Explicitly opt in to load-time INT8 quantization of the BF16 DSA indexer.
+# This appends its q/k/z/w rows to QKVG and shares its dynamic input quantizer.
+INT8_QKV_INDEXER = henvs.optional_custom_op_enabled(
+    os.environ.get("VLLM_STEP5_INT8_QKV_INDEXER", "0") == "1"
+)
+
 # Quantize the bf16 routed experts (layers 88-90) to fp8 per output channel at
 # load time, the scheme of the other layers' checkpoint experts, so they run the
 # same fp8 MoE path instead of the bf16 Triton experts. Channel (compressed-
 # tensors) checkpoint only.
 FP8_BF16_MOE = henvs.optional_custom_op_enabled(
     os.environ.get("VLLM_HCU_STEP5_FP8_BF16_MOE", "0") == "1"
+)
+
+# Mixed mode passes the checkpoint's compressed-tensors config to attention
+# and dense/shared MLPs; main-head storage is selected separately below.
+# Modes: 0 keeps the legacy path, 1 uses W8A8, and dequant is a BF16 diagnostic
+# reference with roughly twice the dense bytes.
+_MIXED_DENSE_SETTING = (
+    os.environ.get("VLLM_STEP5_MIXED_DENSE_INT8", "0").strip().lower()
+)
+if _MIXED_DENSE_SETTING not in ("0", "1", "dequant"):
+    raise ValueError(
+        "VLLM_STEP5_MIXED_DENSE_INT8 must be 0, 1 or dequant, got "
+        f"{_MIXED_DENSE_SETTING!r}"
+    )
+MIXED_DENSE_INT8 = _MIXED_DENSE_SETTING in ("1", "dequant")
+MIXED_DENSE_DEQUANT = _MIXED_DENSE_SETTING == "dequant"
+
+# The measured TP4 QKVG shard (K=4096, logical N=3472) otherwise selects a
+# large, slow hipBLASLt INT8 tile. Zero-pad N to 3584 at construction so the
+# native heuristic selects its small-tile kernels; logical checkpoint rows,
+# channel scales and the single input-quantization boundary stay unchanged.
+# Other shard geometries retain their original 16-channel storage alignment.
+INT8_QKVG_PAD256 = henvs.optional_custom_op_enabled(
+    os.environ.get("VLLM_STEP5_INT8_QKVG_PAD256", "1") == "1"
+)
+
+# Retain the gate result's BF16 rounding before dynamic INT8 quantization,
+# while avoiding the intermediate gated-output allocation and readback.
+INT8_ATTN_GATE_QUANT = henvs.optional_custom_op_enabled(
+    os.environ.get("VLLM_STEP5_INT8_ATTN_GATE_QUANT", "1") == "1"
+)
+
+# The LightOp producer emits BF16 norm and its single INT8 quantization.
+INT8_ATTN_NORM_QUANT = henvs.optional_custom_op_enabled(
+    os.environ.get("VLLM_STEP5_INT8_ATTN_NORM_QUANT", "0") == "1"
+)
+
+# Keep the main head in INT8 storage, with skinny decode GEMM or native W8A8.
+# Requires mixed mode and checkpoint INT8 head tensors; disabling it uses the
+# load-time BF16 compatibility path.
+LM_HEAD_INT8_SKINNY = henvs.optional_custom_op_enabled(
+    os.environ.get("VLLM_STEP5_LM_HEAD_INT8_SKINNY", "0") == "1"
+)
+
+# Suffixes that exist only on a quantized layer. Silently dropping one would
+# leave INT8 weights loaded without their scale, so MIXED_DENSE_INT8 treats an
+# unmatched one as a load failure instead.
+_QUANT_TENSOR_SUFFIXES = (
+    ".weight_scale",
+    ".weight_scale_inv",
+    ".weight_zero_point",
+    ".weight_packed",
+    ".weight_shape",
+    ".input_scale",
+    ".input_zero_point",
 )
 
 SWA_FUSED_QK = henvs.optional_custom_op_enabled(
@@ -213,6 +281,7 @@ def _get_step5_swa_fused():
     assert step5_swa_fused is not None
     return step5_swa_fused
 
+
 _PACKED_EXPERT_WEIGHT = re.compile(r"\.moe\.(gate|up|down)_proj\.weight$")
 
 
@@ -231,8 +300,196 @@ def _unignore_bf16_experts(quant_config: QuantizationConfig | None) -> None:
     quant_config.ignore = kept
 
 
+def _dense_quant_config(vllm_config: VllmConfig) -> QuantizationConfig | None:
+    """MIXED_DENSE_INT8: the checkpoint's config for the dense projections.
+
+    Returns None for every other checkpoint, which leaves those projections
+    bf16 as before. Which of them end up quantized is still decided by the
+    checkpoint's own config_groups and ignore list.
+    """
+    if not MIXED_DENSE_INT8:
+        return None
+    quant_config = vllm_config.quant_config
+    name = None if quant_config is None else quant_config.get_name()
+    if name != "compressed-tensors":
+        raise ValueError(
+            "VLLM_STEP5_MIXED_DENSE_INT8 needs a compressed-tensors checkpoint; "
+            f"this one reports {name}"
+        )
+    # BF16 expert-tail conversion is selected independently by its MoE adapter.
+    if FP8_DENSE:
+        raise ValueError(
+            "VLLM_STEP5_MIXED_DENSE_INT8 takes the dense precision from the "
+            "checkpoint, while VLLM_HCU_STEP5_FP8_DENSE "
+            "quantizes dense bf16 weights at load time; enable only one of them"
+        )
+    logger.info_once(
+        "step5: attention, dense MLP and shared MLP follow the checkpoint's INT8 scheme"
+    )
+    if MIXED_DENSE_DEQUANT:
+        # Build them bf16; _fold_int8_dense turns the checkpoint's INT8 weights
+        # into bf16 on the way in.
+        logger.info_once(
+            "step5: dense INT8 weights are dequantized to bf16 instead of running W8A8"
+        )
+        return None
+    return quant_config
+
+
+def _check_dense_int8_dtype(
+    name: str, param: torch.nn.Parameter, loaded_weight: torch.Tensor
+) -> None:
+    """MIXED_DENSE_INT8: refuse a weight whose dtype contradicts its layer.
+
+    ``Parameter.data.copy_`` casts silently, so loading a bf16 checkpoint
+    tensor into an INT8 parameter (or the reverse) produces a model that serves
+    happily and generates noise. Both directions mean the layer's quantization
+    decision disagrees with the checkpoint.
+    """
+    if name.endswith(".weight_scale") and (
+        param.dtype != torch.float32 or loaded_weight.dtype != torch.float32
+    ):
+        raise ValueError(f"step5: {name} requires FP32 channel scales")
+    if param.dtype == torch.int8 and loaded_weight.dtype != torch.int8:
+        raise ValueError(
+            f"step5: {name} was built INT8 but the checkpoint tensor is "
+            f"{loaded_weight.dtype}. This layer is not quantized in this "
+            "checkpoint, so the quantization config has to list it under "
+            "'ignore' (its vLLM-side prefix, which is what get_scheme matches)."
+        )
+    if (
+        param.dtype in (torch.bfloat16, torch.float16, torch.float32)
+        and loaded_weight.dtype == torch.int8
+    ):
+        raise ValueError(
+            f"step5: {name} was built {param.dtype} but the checkpoint tensor "
+            "is INT8. This layer is quantized in this checkpoint, so either "
+            "the quantization config must target it or it needs "
+            "VLLM_STEP5_MIXED_DENSE_INT8=dequant."
+        )
+
+
+def _validate_int8_loaded_scales(module: nn.Module, loaded: set[str]) -> None:
+    """An INT8 matrix and its channel scales must both come from the checkpoint."""
+    params = dict(module.named_parameters())
+    for name, weight in params.items():
+        if not name.endswith(".weight") or weight.dtype != torch.int8:
+            continue
+        scale_name = name.removesuffix(".weight") + ".weight_scale"
+        scale = params.get(scale_name)
+        if name not in loaded or scale_name not in loaded or scale is None:
+            raise ValueError(f"step5: incomplete INT8 weight/scale pair: {name}")
+        if scale.dtype != torch.float32 or scale.numel() != weight.shape[0]:
+            raise ValueError(f"step5: invalid channel scales for {name}")
+
+
+def _fold_int8_dense(
+    weights: Iterable[tuple[str, torch.Tensor]],
+) -> Iterable[tuple[str, torch.Tensor]]:
+    """MIXED_DENSE_DEQUANT: emit every INT8 ``(weight, weight_scale)`` as bf16.
+
+    Covers lm_head and the dense projections in one pass. The INT4 experts are
+    untouched: their checkpoint tensors are ``weight_packed`` INT32, so neither
+    half of the pair matches.
+
+    safetensors keys arrive sorted and ``weight`` sorts before ``weight_scale``,
+    so only a weight is ever buffered, and only until the next key. A scale
+    whose weight was not INT8 -- every routed expert -- streams straight
+    through to the expert mapping.
+    """
+    pending: dict[str, torch.Tensor] = {}
+    for name, weight in weights:
+        base, _, suffix = name.rpartition(".")
+        if suffix == "weight" and weight.dtype == torch.int8:
+            pending[base] = weight
+            continue
+        if suffix == "weight_scale" and base in pending:
+            quantized = pending.pop(base)
+            logger.info_once("step5: dense INT8 weights folded to bf16")
+            yield (
+                f"{base}.weight",
+                _dequantize_int8_channel(f"{base}.weight", quantized, weight),
+            )
+            continue
+        yield name, weight
+    # INT8 weights whose scale never arrived; the loader reports them by name.
+    for base, weight in pending.items():
+        yield f"{base}.weight", weight
+
+
+def _dequantize_int8_channel(
+    name: str, weight: torch.Tensor, scale: torch.Tensor
+) -> torch.Tensor:
+    """INT8 ``[out, in]`` times a per-output-channel scale, as bf16.
+
+    Row-chunked: the head spans the full vocabulary and every rank dequantizes
+    its own copy of the checkpoint tensor, so materializing the fp32 product in
+    one go would cost several GiB per worker.
+    """
+    if weight.dtype != torch.int8:
+        raise ValueError(
+            f"{name}: INT8 dequantization needs int8 weights, got {weight.dtype}"
+        )
+    if weight.dim() != 2:
+        raise ValueError(f"{name}: expected a 2-D weight, got {tuple(weight.shape)}")
+    if scale.numel() != weight.shape[0]:
+        raise ValueError(
+            f"{name}: weight_scale holds one value per output channel; got "
+            f"{tuple(scale.shape)} for weight {tuple(weight.shape)}"
+        )
+    scale = scale.reshape(-1, 1).to(torch.float32)
+    out = torch.empty(weight.shape, dtype=torch.bfloat16, device=weight.device)
+    rows = max(1, (1 << 23) // weight.shape[1])
+    for start in range(0, weight.shape[0], rows):
+        stop = min(start + rows, weight.shape[0])
+        out[start:stop] = (weight[start:stop].to(torch.float32) * scale[start:stop]).to(
+            torch.bfloat16
+        )
+    return out
+
+
+def _fold_int8_lm_head(
+    weights: Iterable[tuple[str, torch.Tensor]],
+) -> Iterable[tuple[str, torch.Tensor]]:
+    """Pair and dequantize main-head weights for the BF16 compatibility path.
+
+    The enabled INT8 head instead passes both checkpoint tensors unchanged to
+    its loader. Otherwise whichever tensor arrives first waits in ``pending``.
+    """
+    pending: dict[str, torch.Tensor] = {}
+    for name, weight in weights:
+        if name in ("lm_head.weight", "lm_head.weight_scale"):
+            # LM_HEAD_INT8_SKINNY built INT8 storage for the head, so both
+            # tensors have a parameter to land in and must reach the loader.
+            if LM_HEAD_INT8_SKINNY and MIXED_DENSE_INT8 and not MIXED_DENSE_DEQUANT:
+                yield name, weight
+                continue
+        if name == "lm_head.weight_scale" or (
+            name == "lm_head.weight" and weight.dtype == torch.int8
+        ):
+            pending[name] = weight
+        else:
+            yield name, weight
+            continue
+        if len(pending) == 2:
+            quantized = pending.pop("lm_head.weight")
+            scale = pending.pop("lm_head.weight_scale")
+            logger.info_once("step5: lm_head INT8 weights folded to bf16")
+            yield (
+                "lm_head.weight",
+                _dequantize_int8_channel("lm_head.weight", quantized, scale),
+            )
+    # An INT8 weight with no scale, or a scale with no weight: pass it through
+    # and let the loader report it against the parameters it actually has.
+    for name, weight in pending.items():
+        yield name, weight
+
+
 def _place_experts(
-    weights: Iterable[tuple[str, torch.Tensor]], moe_layer_ids: list[int]
+    weights: Iterable[tuple[str, torch.Tensor]],
+    moe_layer_ids: list[int],
+    *,
+    per_expert: bool = False,
 ) -> Iterable[tuple[str, torch.Tensor]]:
     """EXPERT_PLACEMENT: index dim 0 of each packed expert tensor and of the
     router weight/bias with the layer's physical-to-logical map. Done on the
@@ -247,22 +504,47 @@ def _place_experts(
         or physical_to_logical.shape[1] == 0
         or physical_to_logical.dtype not in (torch.int32, torch.int64)
     ):
-        raise ValueError("Step5 expert placement must be an integer [MoE layers, experts] map")
+        raise ValueError(
+            "Step5 expert placement must be an integer [MoE layers, experts] map"
+        )
     physical_to_logical = physical_to_logical.to(torch.int64)
     identity = torch.arange(physical_to_logical.shape[1])
     for row in physical_to_logical:
         if not torch.equal(row.sort().values, identity):
             raise ValueError("Step5 expert placement row is not a permutation")
     rows = dict(zip(moe_layer_ids, physical_to_logical))
+    logical_to_physical = (
+        {layer: torch.argsort(row).tolist() for layer, row in rows.items()}
+        if per_expert
+        else {}
+    )
     logger.info_once("step5: expert placement loaded from %s", EXPERT_PLACEMENT)
     for name, w in weights:
         if ".moe.experts." in name:
-            raise ValueError("Step5 expert placement needs packed experts")
+            match = re.search(r"layers\.(\d+)\.moe\.experts\.(\d+)\.", name)
+            if not per_expert or match is None:
+                raise ValueError("Step5 expert placement needs packed experts")
+            layer, expert = int(match.group(1)), int(match.group(2))
+            if layer not in logical_to_physical or expert >= len(
+                logical_to_physical[layer]
+            ):
+                raise ValueError(f"Step5 per-expert placement mismatch: {name}")
+            # Rename payload, scale and shape metadata together. Their tensors
+            # stay unchanged; the router below uses the same physical ordering.
+            name = (
+                name[: match.start(2)]
+                + str(logical_to_physical[layer][expert])
+                + name[match.end(2) :]
+            )
+            yield name, w
+            continue
         m = _PLACED_TENSOR.search(name)
         if m is not None and int(m.group(1)) in rows:
             row = rows[int(m.group(1))]
             if w.ndim == 0 or w.shape[0] != row.numel():
-                raise ValueError(f"Step5 expert placement shape mismatch: {name} {w.shape}")
+                raise ValueError(
+                    f"Step5 expert placement shape mismatch: {name} {w.shape}"
+                )
             w = w[row.to(w.device)]
         yield name, w
 
@@ -339,11 +621,78 @@ class FP32ReplicatedLinear(ReplicatedLinear):
         return super().forward(x.to(torch.float32))
 
 
+def _can_fuse_int8_shared_expert(mlp: "Step5MLP") -> bool:
+    """Only the native dynamic symmetric channel-W8A8 layout is eligible."""
+    if not (
+        MIXED_DENSE_INT8
+        and not MIXED_DENSE_DEQUANT
+        and henvs.custom_quantization_gemm_enabled()
+    ):
+        return False
+    layer = mlp.gate_up_proj
+    scheme = getattr(layer, "scheme", None)
+    weight = layer.weight
+    scale = getattr(layer, "weight_scale", None)
+    return (
+        weight.dtype == torch.int8
+        and weight.ndim == 2
+        and weight.shape[0] % 2 == 0
+        and scale is not None
+        and scale.dtype == torch.float32
+        and scale.numel() == weight.shape[0]
+        and scale.device == weight.device
+        and getattr(layer, "params_dtype", None) == torch.bfloat16
+        and getattr(scheme, "strategy", None) == "channel"
+        and getattr(scheme, "is_static_input_scheme", None) is False
+        and getattr(scheme, "input_symmetric", None) is True
+        and getattr(layer, "input_zero_point", None) is None
+        and getattr(layer, "azp_adj", None) is None
+        and getattr(layer, "bias", None) is None
+    )
+
+
+def _can_fuse_int8_attention_gate(layer: RowParallelLinear) -> bool:
+    """Reuse only the native symmetric dynamic channel-INT8 input contract."""
+    if not (
+        INT8_ATTN_GATE_QUANT
+        and MIXED_DENSE_INT8
+        and not MIXED_DENSE_DEQUANT
+        and henvs.custom_quantization_gemm_enabled()
+    ):
+        return False
+    weight = getattr(layer, "weight", None)
+    scale = getattr(layer, "weight_scale", None)
+    scheme = getattr(layer, "scheme", None)
+    supports = getattr(
+        getattr(layer, "quant_method", None), "supports_quanted_inputs", None
+    )
+    return (
+        weight is not None
+        and weight.ndim == 2
+        and weight.dtype == torch.int8
+        and scale is not None
+        and scale.dtype == torch.float32
+        and scale.numel() == weight.shape[0]
+        and scale.device == weight.device
+        and getattr(layer, "params_dtype", None) == torch.bfloat16
+        and getattr(scheme, "strategy", None) == "channel"
+        and getattr(scheme, "is_static_input_scheme", None) is False
+        and getattr(scheme, "input_symmetric", None) is True
+        and getattr(layer, "input_zero_point", None) is None
+        and getattr(layer, "azp_adj", None) is None
+        and getattr(layer, "input_is_parallel", False)
+        and callable(getattr(layer, "_forward_with_hcu_quanted", None))
+        and callable(supports)
+        and supports()
+    )
+
+
 class BF16FP32RouterLinear(ReplicatedLinear):
     """Router with a bf16 weight and fp32 logits (see ``BF16_ROUTER``)."""
 
     # The second result is an activation, unlike ReplicatedLinear's extra bias.
     returns_fused_shared_activation = True
+    accepts_shared_quanted_input = True
 
     def __init__(self, input_size: int, output_size: int, prefix: str = ""):
         super().__init__(
@@ -364,6 +713,8 @@ class BF16FP32RouterLinear(ReplicatedLinear):
             init_router_gemm_workspace(self.weight.device, output_size)
         self._fused_shared: list[Step5MLP] | None = None
         self._rsg_workspace: tuple[torch.Tensor, torch.Tensor] | None = None
+        self._fused_shared_int8 = False
+        self._rsg_int8_workspace: tuple[torch.Tensor, torch.Tensor] | None = None
 
     def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor):
         if loaded_weight.dtype != torch.bfloat16:
@@ -376,6 +727,33 @@ class BF16FP32RouterLinear(ReplicatedLinear):
     def fuse_shared_expert(self, mlp: "Step5MLP") -> None:
         """Compute ``mlp``'s gate_up + SwigluStep together with the logits for
         decode-sized inputs; ``mlp.forward`` on the same input picks it up."""
+        if mlp.gate_up_proj.weight.dtype == torch.int8:
+            if not _can_fuse_int8_shared_expert(mlp):
+                return
+            from vllm_hcu.ops.step5.router_shared_int8 import (
+                RSG_INT8_MAX_M,
+                make_router_shared_int8_workspace,
+                router_shared_swiglustep_int8,
+            )
+
+            if RSG_INT8_MAX_M <= 0:
+                return
+            assert mlp.limit is not None
+            self._fused_shared = [mlp]
+            self._fused_shared_int8 = True
+            mlp.enable_fused_router_shared(RSG_INT8_MAX_M)
+            self._rsg_int8 = (
+                functools.partial(router_shared_swiglustep_int8, quantized_output=True)
+                if getattr(mlp, "_shared_output_int8", False)
+                else router_shared_swiglustep_int8
+            )
+            if self.weight.is_cuda:
+                self._rsg_int8_workspace = make_router_shared_int8_workspace(
+                    self.weight.device,
+                    self.weight.shape[1],
+                    mlp.gate_up_proj.output_size_per_partition // 2,
+                )
+            return
         from vllm_hcu.ops.step5.router_gemm import (
             RSG_MAX_M,
             make_router_shared_workspace,
@@ -395,8 +773,30 @@ class BF16FP32RouterLinear(ReplicatedLinear):
             )
 
     def _forward_fused_shared(
-        self, x2: torch.Tensor
+        self,
+        x2: torch.Tensor,
+        x_and_scale_quanted: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        if self._fused_shared_int8:
+            from vllm_hcu.ops.step5.router_shared_int8 import usable_router_shared_int8
+
+            mlp = self._fused_shared[0]
+            layer = mlp.gate_up_proj
+            weight = layer.weight
+            scale = getattr(layer, "weight_scale", None)
+            if not _can_fuse_int8_shared_expert(mlp) or not usable_router_shared_int8(
+                x2, self.weight, weight, scale, mlp.limit
+            ):
+                return None
+            return self._rsg_int8(
+                x2,
+                self.weight,
+                weight,
+                scale,
+                mlp.limit,
+                workspace=self._rsg_int8_workspace,
+                x_and_scale_quanted=x_and_scale_quanted,
+            )
         from vllm_hcu.ops.step5.router_gemm import RSG_MAX_M
 
         mlp = self._fused_shared[0]
@@ -419,7 +819,11 @@ class BF16FP32RouterLinear(ReplicatedLinear):
         )
         return logits, act
 
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
+    def forward(
+        self,
+        x: torch.Tensor,
+        x_and_scale_quanted: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         w = self.weight
         if self._fused_shared is not None:
             # A prior eligible call may have left a cache that must never be
@@ -430,7 +834,7 @@ class BF16FP32RouterLinear(ReplicatedLinear):
             if self._fused_shared is not None:
                 # Return the activation explicitly so Dynamo records the
                 # cross-module dataflow.
-                fused = self._forward_fused_shared(x2)
+                fused = self._forward_fused_shared(x2, x_and_scale_quanted)
                 if fused is not None:
                     out, shared_act = fused
                     return out.view(*x.shape[:-1], w.shape[1]), shared_act
@@ -569,7 +973,10 @@ class Step5MLP(nn.Module):
         # functionalization the router and the shared expert see different
         # buffers holding the same values. The stream check rejects a stale
         # entry when the shared expert runs on the aux stream before the router.
-        self.fused_act: tuple[int, torch.Size, torch.Tensor] | None = None
+        self.fused_act: (
+            tuple[int, torch.Size, torch.Tensor | tuple[torch.Tensor, torch.Tensor]]
+            | None
+        ) = None
         self._fused_router_shared_max_m: int | None = None
         self.limit = None
         layer_idx = extract_layer_index(prefix)
@@ -582,6 +989,19 @@ class Step5MLP(nn.Module):
         ):
             self.limit = swiglu_limits_shared[layer_idx]
             self.act_fn = SwigluStepAndMul(limit=self.limit)
+
+        supports = getattr(self.down_proj.quant_method, "supports_quanted_inputs", None)
+        self._shared_output_int8 = (
+            os.getenv("VLLM_HCU_STEP5_SHARED_INT8_EPILOGUE", "0") == "1"
+            and MIXED_DENSE_INT8
+            and not MIXED_DENSE_DEQUANT
+            and ".share_expert" in prefix
+            and self.limit is not None
+            and self.gate_up_proj.output_size_per_partition in (768, 3072)
+            and getattr(self.down_proj, "input_is_parallel", False)
+            and callable(supports)
+            and supports()
+        )
 
     def enable_fused_router_shared(self, max_m: int) -> None:
         """Keep short fused-router batches on the stream that made the act."""
@@ -598,7 +1018,9 @@ class Step5MLP(nn.Module):
         )
 
     def cache_fused_router_activation(
-        self, hidden_states: torch.Tensor, activation: torch.Tensor
+        self,
+        hidden_states: torch.Tensor,
+        activation: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
     ) -> None:
         """Consume the explicit router result in the internal MoE path."""
         self.fused_act = (
@@ -609,7 +1031,7 @@ class Step5MLP(nn.Module):
 
     def pop_fused_router_activation(
         self, hidden_states: torch.Tensor
-    ) -> torch.Tensor | None:
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | None:
         """Take a fresh activation on its producer stream, before any handoff."""
         fused, self.fused_act = self.fused_act, None
         if (
@@ -621,25 +1043,59 @@ class Step5MLP(nn.Module):
         return None
 
     def forward_fused_router_activation(
-        self, activation: torch.Tensor
+        self, activation: torch.Tensor | tuple[torch.Tensor, torch.Tensor]
     ) -> torch.Tensor:
         """The shared down projection reads only this independent activation."""
-        output, _ = self.down_proj(activation)
+        if isinstance(activation, tuple):
+            q, scale = activation
+            # Native W8A8 consumes q/scale; this tensor carries only the logical
+            # shape and output dtype. It does not dequantize or reread q.
+            logical_input = q.new_empty(q.shape, dtype=torch.bfloat16)
+            output, _ = self.down_proj._forward_with_hcu_quanted(
+                logical_input,
+                (q, scale),
+            )
+        else:
+            output, _ = self.down_proj(activation)
         return output
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        x_and_scale_quanted: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> torch.Tensor:
         intermediate_act = self.pop_fused_router_activation(hidden_states)
         if intermediate_act is None:
-            gate_up, _ = self.gate_up_proj(hidden_states)
-            intermediate_act = self.act_fn(gate_up)
+            if x_and_scale_quanted is None:
+                gate_up, _ = self.gate_up_proj(hidden_states)
+            else:
+                gate_up, _ = self.gate_up_proj._forward_with_hcu_quanted(
+                    hidden_states,
+                    x_and_scale_quanted,
+                )
+            if getattr(self, "_shared_output_int8", False):
+                from vllm_hcu.ops.step5 import (
+                    router_shared_int8,
+                )  # registers the custom op
+
+                intermediate_act = torch.ops.vllm.step5_shared_int8_epilogue(
+                    gate_up,
+                    None,
+                    None,
+                    352,
+                    float(self.limit),
+                )
+            else:
+                intermediate_act = self.act_fn(gate_up)
         return self.forward_fused_router_activation(intermediate_act)
 
 
 class Step5Attention(nn.Module):
     """GQA with qk-norm, a per-head sigmoid output gate, and partial rotary.
 
-    Every weight here is bf16 in the checkpoint, so ``quant_config`` is
-    deliberately not threaded into the projections -- see the module docstring.
+    ``quant_config`` reaches the three projections only for the mixed INT4/INT8
+    checkpoint (MIXED_DENSE_INT8), where they are INT8 W8A8. Every weight here
+    is bf16 in the fp8 checkpoints -- see the module docstring.
     """
 
     def __init__(
@@ -653,6 +1109,7 @@ class Step5Attention(nn.Module):
         qkv_bias: bool = False,
         rope_theta: float | list[float] | None = 10000,
         cache_config: CacheConfig | None = None,
+        quant_config: QuantizationConfig | None = None,
         rope_scaling: dict[str, Any] | None = None,
         prefix: str = "",
         attn_type: str = AttentionType.DECODER,
@@ -713,14 +1170,14 @@ class Step5Attention(nn.Module):
             self.total_num_heads,
             self.total_num_kv_heads,
             bias=qkv_bias,
-            quant_config=None,
+            quant_config=quant_config,
             prefix=f"{prefix}.qkv_proj",
         )
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             hidden_size,
             bias=False,
-            quant_config=None,
+            quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
         )
 
@@ -746,15 +1203,18 @@ class Step5Attention(nn.Module):
         self.register_buffer("qkvg_weight", None, persistent=False)
         self.register_buffer("qkvg_wq", None, persistent=False)
         self.register_buffer("qkvg_ws", None, persistent=False)
+        self.register_buffer("qkvg_int8_weight", None, persistent=False)
+        self.register_buffer("qkvg_int8_scale", None, persistent=False)
         if use_head_wise_attn_gate:
             self.g_proj = ColumnParallelLinear(
                 hidden_size,
                 self.total_num_heads,
                 bias=False,
-                quant_config=None,
+                quant_config=quant_config,
                 prefix=f"{prefix}.g_proj",
             )
             self._maybe_fuse_qkvg()
+            self._maybe_fuse_int8_qkvg()
         if FP8_DENSE:
             _use_fp8(self.o_proj)
             if self.qkvg_weight is not None:
@@ -814,6 +1274,9 @@ class Step5Attention(nn.Module):
                 max_position=max_position,
                 params_dtype=torch.get_default_dtype(),
                 num_attention_heads=total_num_attention_heads or self.total_num_heads,
+                use_lightop_spec_indexer=(
+                    os.getenv("VLLM_STEP5_LIGHTOP_SPEC_INDEXER", "0") == "1"
+                ),
             )
 
         self.max_position_embeddings = max_position
@@ -829,6 +1292,19 @@ class Step5Attention(nn.Module):
             and isinstance(self.o_proj.quant_method, Step5FP8LinearMethod)
             and self.num_heads & (self.num_heads - 1) == 0
         )
+        self.int8_gate_quant = (
+            self.qkvg_int8_weight is not None
+            and _can_fuse_int8_attention_gate(self.o_proj)
+        )
+        if self.int8_gate_quant:
+            # AOT graph loading needs the operator/schema before any forward.
+            from vllm_hcu.ops.step5 import attention_int8 as _attention_int8  # noqa: F401
+        self.swa_int8_epilogue = (
+            self.int8_gate_quant
+            and self.swa_fused_qk
+            and _get_step5_swa_fused().INT8_EPILOGUE
+        )
+
         # Step-5 uses 1/3 on full-attention layers, so take the rotary width from
         # get_rope (int(head_size * factor)) instead of assuming 1 or 1/2.
         self.rotary_dim = getattr(
@@ -867,6 +1343,142 @@ class Step5Attention(nn.Module):
         wg.data = fused[:, nq:]
         self.register_buffer("qkvg_weight", fused, persistent=False)
 
+    def _maybe_fuse_int8_qkvg(self) -> None:
+        """Share checkpoint storage for one W8A8 QKV+gate GEMM, without requant."""
+        if not MIXED_DENSE_INT8 or MIXED_DENSE_DEQUANT or not FUSE_QKVG:
+            return
+        from vllm_hcu.platforms import envs as henvs
+
+        if not (
+            henvs.VLLM_HCU_USE_CUSTOM_OPS
+            and henvs.VLLM_HCU_USE_CUSTOM_QUANTIZATION_GEMM
+        ):
+            return
+        qkv, gate = self.qkv_proj, self.g_proj
+        if qkv.bias is not None or gate.bias is not None:
+            return
+        wq, wg = qkv.weight, gate.weight
+        sq, sg = getattr(qkv, "weight_scale", None), getattr(gate, "weight_scale", None)
+        if (
+            wq.dtype != torch.int8
+            or wg.dtype != torch.int8
+            or sq is None
+            or sg is None
+            or sq.dtype != torch.float32
+            or sg.dtype != torch.float32
+            or wq.ndim != 2
+            or wg.ndim != 2
+            or wq.device != wg.device
+            or sq.device != wq.device
+            or sg.device != wq.device
+            or sq.numel() != wq.shape[0]
+            or sg.numel() != wg.shape[0]
+            or wq.shape[1] != wg.shape[1]
+            or wq.shape[0] != self.q_size + 2 * self.kv_size
+            or wg.shape[0] != self.num_heads
+        ):
+            return
+        # Existing TP loaders fill these views, including KV-head replication.
+        # Pad only N; the original parameters/loaders still own the logical
+        # rows. TP4 uses the measured native fast path, while e.g. TP8 keeps
+        # its existing sixteen-channel alignment and replicated KV-head views.
+        nq, ng = wq.shape[0], wg.shape[0]
+        tuned = wq.shape[1] == 4096 and nq + ng == 3472 and INT8_QKVG_PAD256
+        align = 256 if tuned else 16
+        n = ((nq + ng + align - 1) // align) * align
+        fused = torch.zeros((n, wq.shape[1]), dtype=torch.int8, device=wq.device)
+        scales = (
+            torch.ones((n, 1), dtype=torch.float32, device=wq.device)
+            if tuned
+            else torch.zeros((n, 1), dtype=torch.float32, device=wq.device)
+        )
+        wq.data, wg.data = fused[:nq], fused[nq : nq + ng]
+        sq.data = scales[:nq].view(sq.shape)
+        sg.data = scales[nq : nq + ng].view(sg.shape)
+        self.qkvg_int8_weight, self.qkvg_int8_scale = fused, scales
+
+    def _quantize_int8_indexer(self) -> None:
+        """Append load-time channel-INT8 indexer rows after linear finalization."""
+        if not INT8_QKV_INDEXER or self.indexer is None:
+            return
+        if getattr(self, "_int8_indexer_fused", False):
+            return
+        if not MIXED_DENSE_INT8 or MIXED_DENSE_DEQUANT or self.qkvg_int8_weight is None:
+            raise ValueError(
+                "Step5 INT8 indexer fusion requires mixed INT8 QKVG and custom ops"
+            )
+
+        projections = (
+            self.sparse_indexer_q,
+            self.sparse_indexer_k,
+            self.sparse_indexer_z,
+            self.sparse_indexer_w,
+        )
+        k = self.qkvg_int8_weight.shape[1]
+        if any(
+            layer.weight.ndim != 2
+            or layer.weight.shape[1] != k
+            or layer.weight.device != self.qkvg_int8_weight.device
+            or not layer.weight.is_floating_point()
+            for layer in projections
+        ):
+            raise ValueError("Step5 INT8 indexer has incompatible q/k/z/w weights")
+
+        # Match the original merged projection: even checkpoint FP32 w is
+        # rounded to activation BF16 before it participates in a GEMM.
+        with torch.no_grad():
+            indexer = torch.cat(
+                [layer.weight.detach().to(torch.bfloat16) for layer in projections],
+                dim=0,
+            ).float()
+            if not bool(torch.isfinite(indexer).all()):
+                raise ValueError("Step5 INT8 indexer weights must be finite")
+            indexer_scale = (
+                indexer.abs().amax(dim=1, keepdim=True).clamp_min(1e-12) / 127.0
+            )
+            indexer_q = (
+                torch.round(indexer / indexer_scale).clamp_(-127, 127).to(torch.int8)
+            )
+
+            # Discard any old QKVG padding; the indexer begins immediately
+            # after the logical QKV+gate rows, never in a new gap.
+            nq = self.q_size + 2 * self.kv_size
+            logical_qkvg = nq + self.num_heads
+            self.idx_off, self.idx_n = logical_qkvg, indexer_q.shape[0]
+            logical_n = self.idx_off + self.idx_n
+            align = 256 if INT8_QKVG_PAD256 else 16
+            n = ((logical_n + align - 1) // align) * align
+            fused = torch.zeros((n, k), dtype=torch.int8, device=indexer_q.device)
+            scales = torch.ones((n, 1), dtype=torch.float32, device=indexer_q.device)
+            fused[:logical_qkvg].copy_(self.qkvg_int8_weight[:logical_qkvg])
+            scales[:logical_qkvg].copy_(self.qkvg_int8_scale[:logical_qkvg])
+            fused[self.idx_off : logical_n].copy_(indexer_q)
+            scales[self.idx_off : logical_n].copy_(indexer_scale)
+
+            # Rebind the original Parameter owners too, so the superseded
+            # QKVG allocation does not remain alive through their views.
+            for layer, start, end in (
+                (self.qkv_proj, 0, nq),
+                (self.g_proj, nq, logical_qkvg),
+            ):
+                layer.weight.data = fused[start:end]
+                layer.weight_scale.data = scales[start:end].view(
+                    layer.weight_scale.shape
+                )
+            self.qkvg_int8_weight, self.qkvg_int8_scale = fused, scales
+            self.indexer.pre_projected = True
+            self.indexer._merged_w = None
+            self.indexer._param_cache = None
+            for layer in projections:
+                _free_weight(layer.weight)
+            self._int8_indexer_fused = True
+        logger.info(
+            "Step5 layer %s: QKVG/indexer fused INT8, logical N=%s, padded N=%s",
+            self.layer_idx,
+            logical_n,
+            n,
+        )
+
     def _quantize_qkvg(self) -> None:
         from vllm_hcu.ops.step5.fp8_dense import quantize_weight_fp8
 
@@ -886,7 +1498,9 @@ class Step5Attention(nn.Module):
             w = torch.cat([w, idx.t()], 1)
             self.indexer.pre_projected = True
             for lin in (
-                self.sparse_indexer_q, self.sparse_indexer_k, self.sparse_indexer_z
+                self.sparse_indexer_q,
+                self.sparse_indexer_k,
+                self.sparse_indexer_z,
             ):
                 _free_weight(lin.weight)
         self.qkvg_wq, self.qkvg_ws = quantize_weight_fp8(w)
@@ -898,8 +1512,26 @@ class Step5Attention(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
+        x_and_scale_quanted: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
-        if self.qkvg_wq is not None:
+        if x_and_scale_quanted is not None and self.qkvg_int8_weight is None:
+            raise ValueError("prequantized Step5 attention requires INT8 QKVG weights")
+        if self.qkvg_int8_weight is not None:
+            from vllm_hcu.model_executor.layers.quantization.int8_runtime import (
+                apply_int8_linear,
+            )
+
+            qkvg = apply_int8_linear(
+                hidden_states,
+                self.qkvg_int8_weight,
+                self.qkvg_int8_scale,
+                torch.bfloat16,
+                x_and_scale_quanted=x_and_scale_quanted,
+            )
+            nqkv = self.q_size + 2 * self.kv_size
+            qkv = qkvg[..., :nqkv]
+            extra_dims = qkvg[..., nqkv : nqkv + self.num_heads]
+        elif self.qkvg_wq is not None:
             from vllm_hcu.ops.step5.fp8_dense import fp8_linear
 
             # N is padded; slice instead of split.
@@ -917,13 +1549,15 @@ class Step5Attention(nn.Module):
             extra_dims = None
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         if self.swa_fused_qk:
+            int8_epilogue = self.swa_int8_epilogue and torch.compiler.is_compiling()
             attn_output = _get_step5_swa_fused().forward(
                 self,
                 positions,
                 qkv,
                 v,
                 k,
-                gate=extra_dims if self.fused_gate else None,
+                gate=extra_dims if self.fused_gate or int8_epilogue else None,
+                int8_output=int8_epilogue,
             )
             return self._gate_o_proj(attn_output, extra_dims, hidden_states)
         q_by_head = q.view(*q.shape[:-1], q.shape[-1] // self.head_dim, self.head_dim)
@@ -955,6 +1589,13 @@ class Step5Attention(nn.Module):
     ) -> torch.Tensor:
         if isinstance(attn_output, tuple):
             # Already gated and quantized (step5_swa_fused, fused_gate).
+            if attn_output[0].dtype == torch.int8:
+                # Only metadata is read from input; the explicit pair owns
+                # the payload/scale and the provider retains BF16 output.
+                output, _ = self.o_proj._forward_with_hcu_quanted(
+                    attn_output[0], attn_output
+                )
+                return output
             output, _ = self.o_proj(attn_output)
             return output
         if self.fused_gate and extra_dims is not None:
@@ -964,6 +1605,26 @@ class Step5Attention(nn.Module):
                 )
             )
             return output
+        # Inductor keeps sigmoid in FP32 through the multiply; eager PyTorch
+        # rounds the sigmoid tensor to BF16 first. Preserve each path's ABI.
+        if (
+            self.int8_gate_quant
+            and extra_dims is not None
+            and torch.compiler.is_compiling()
+        ):
+            from vllm_hcu.ops.step5.attention_int8 import (
+                gate_quant_int8,
+                usable_gate_quant_int8,
+            )
+
+            if usable_gate_quant_int8(attn_output, extra_dims):
+                quantized = gate_quant_int8(attn_output, extra_dims)
+                # The prequantized contract skips another input quantizer.
+                # Keep RowParallelLinear's bias, TP reduction and return ABI.
+                output, _ = self.o_proj._forward_with_hcu_quanted(
+                    attn_output, quantized
+                )
+                return output
         if self.use_head_wise_attn_gate:
             if extra_dims is None:
                 extra_dims, _ = self.g_proj(hidden_states)
@@ -1011,6 +1672,13 @@ class FusedMoEBlock(nn.Module):
         config = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
         parallel_config = vllm_config.parallel_config
+
+        if os.environ.get("VLLM_HCU_STEP5_W4A8_PROFILE"):
+            from vllm_hcu.model_executor.layers.quantization.step5_gptq_w4a8 import (
+                moe_quant_config,
+            )
+
+            quant_config = moe_quant_config(vllm_config)
 
         self.hidden_size = config.hidden_size
         self.enable_eplb = parallel_config.enable_eplb
@@ -1073,44 +1741,80 @@ class FusedMoEBlock(nn.Module):
         self.fuse_all_reduce, reduce_results = _step5_moe_reduce_policy(
             self.tp_size, get_dp_group().world_size
         )
-        self.effective_sequence_parallel = (
-            vllm_config.compilation_config.pass_config.enable_sp and self.tp_size > 1
+        from vllm_hcu.model_executor.layers.fused_moe.step5_w4a8_policy import (
+            uses_step5_deepep,
         )
+
+        self._step5_deepep = (
+            uses_step5_deepep(vllm_config)
+            and vllm_config.parallel_config.enable_expert_parallel
+            and get_ep_group().world_size > 1
+        )
+        # LL routed tokens are uniquely owned across TP. For the ordinary
+        # replicated residual path, sum shared TP partials and restore routed
+        # owners together in one TP collective instead of ReduceScatter + AG.
+        from vllm_hcu.runtime_compat.step5 import uses_step5_ll_fused_restore
+
+        self._step5_ll_fused_restore = (
+            self._step5_deepep
+            and uses_step5_ll_fused_restore(vllm_config)
+            and get_ep_group().world_size
+            == (self.tp_size * vllm_config.parallel_config.data_parallel_size)
+        )
+        self.effective_sequence_parallel = (
+            vllm_config.compilation_config.pass_config.enable_sp or self._step5_deepep
+        ) and self.tp_size > 1
         # Outside SP, FusedMoE owns the shared expert (as 0.21's step4.py did): the
         # runner adds shared + routed before its single TP all-reduce -- under DP>1
         # one all-reduce per layer instead of two -- and can run the shared expert
         # on the aux stream alongside the gate, router and routed experts.
-        self.fold_shared_expert = not self.effective_sequence_parallel
-        if self.fold_shared_expert:
+        self.fold_shared_expert = (
+            not self.effective_sequence_parallel and not self._step5_deepep
+        )
+        if self.fold_shared_expert or self._step5_deepep:
             self.fuse_all_reduce = False
         self.share_expert = Step5MLP(
             config=config,
             hidden_size=self.hidden_size,
             intermediate_size=config.share_expert_dim,
             hidden_act="silu",
-            reduce_results=False if self.fold_shared_expert else reduce_results,
-            # The shared expert is bf16 in both checkpoints. Do not rely on the
-            # ignore list: hf_to_vllm_mapper renames it to ".moe.share_expert.",
-            # which the channel checkpoint's regex ("layers.N.share_expert.")
-            # does not match, so it would be built as fp8 and the bf16 weights
-            # cast into it with no scale.
-            quant_config=None,
+            reduce_results=False
+            if self.fold_shared_expert or self._step5_deepep
+            else reduce_results,
+            # The shared expert is bf16 in both fp8 checkpoints and INT8 W8A8 in
+            # the mixed one. Do not rely on the ignore list either way:
+            # hf_to_vllm_mapper renames it to ".moe.share_expert.", which the
+            # channel checkpoint's regex ("layers.N.share_expert.") does not
+            # match, so it would be built as fp8 and the bf16 weights cast into
+            # it with no scale. MIXED_DENSE_INT8 opts in explicitly instead.
+            quant_config=_dense_quant_config(vllm_config),
             prefix=f"{prefix}.share_expert",
         )
         if (
             FUSED_ROUTER_SHARED
             and isinstance(self.gate, BF16FP32RouterLinear)
-            and self.fold_shared_expert
+            and (self.fold_shared_expert or self._step5_ll_fused_restore)
             and self.share_expert.limit is not None
+            and (
+                self.share_expert.gate_up_proj.weight.dtype == torch.bfloat16
+                or _can_fuse_int8_shared_expert(self.share_expert)
+            )
         ):
             self.gate.fuse_shared_expert(self.share_expert)
         custom_routing_function = functools.partial(
             router_bias_func,
             router_bias=self.router_bias,
             routed_scaling_factor=config.moe_router_scaling_factor,
+            # Zero weights do not suppress native DeepEP dispatch. NaN dummy
+            # rows must use its skip sentinel rather than eight copies of ID 0,
+            # which can overflow the per-expert LL receive capacity.
+            nan_row_i_out=-1 if self._step5_deepep else 0,
+            indices_dtype=torch.int64 if self._step5_deepep else torch.int32,
         )
         self.experts = FusedMoEFactory(
-            gate=self.gate,
+            # LL owns only a TP token slice; compute fused shared/router on
+            # the full shared input outside the routed-only runner.
+            gate=None if self._step5_ll_fused_restore else self.gate,
             num_experts=config.moe_num_experts,
             top_k=config.moe_top_k,
             hidden_size=config.hidden_size,
@@ -1131,6 +1835,41 @@ class FusedMoEBlock(nn.Module):
             custom_routing_function=custom_routing_function,
         )
 
+        from vllm_hcu.runtime_compat.step5 import install_int64_eplb_mapping
+
+        install_int64_eplb_mapping(self.experts.router, vllm_config)
+
+        if self._step5_ll_fused_restore:
+            from vllm_hcu.model_executor.layers.fused_moe.step5_ll_runtime import (
+                router_shared_op,
+            )
+
+            router_shared_op()
+            self.experts._hcu_step5_ll_router_shared = self._ll_router_shared_eager
+
+    def _ll_router_shared_eager(self, full_input, xq=None, xs=None):
+        """Keep shape-dependent dispatch inside the opaque runtime boundary."""
+        quanted = None if xq is None else (xq, xs)
+        if self.share_expert.requires_main_stream_for_fused_activation(full_input):
+            logits, activation = self.gate(full_input, x_and_scale_quanted=quanted)
+            shared = (
+                self.share_expert.forward_fused_router_activation(activation)
+                if activation is not None
+                else self.share_expert(full_input, x_and_scale_quanted=quanted)
+            )
+            # logits is newly allocated inside this opaque op. Its owner view
+            # does not alias any op input, so the generic chunk op's mandatory
+            # no-pad clone is unnecessary here.
+            rows = (logits.shape[0] + self.tp_size - 1) // self.tp_size
+            if logits.shape[0] % self.tp_size:
+                logits = torch.nn.functional.pad(
+                    logits, (0, 0, 0, rows * self.tp_size - logits.shape[0])
+                )
+            return shared, logits.narrow(0, get_tp_group().rank_in_group * rows, rows)
+        shared = self.share_expert(full_input, x_and_scale_quanted=quanted)
+        owner = sequence_parallel_chunk(full_input)
+        return shared, self.gate._gemm(owner, self.gate.weight)
+
     @property
     def routed_experts(self):
         """Expose the normal RoutedExperts owner to static EPLB loading."""
@@ -1145,10 +1884,81 @@ class FusedMoEBlock(nn.Module):
         self,
         hidden_states: torch.Tensor,
         input_is_sequence_parallel: bool = False,
+        shared_x_and_scale_quanted: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor | None, torch.Tensor]:
         """Return (shared, routed); shared is None when FusedMoE already added it."""
         hidden_dim = hidden_states.shape[-1]
         hidden_states = hidden_states.view(-1, hidden_dim)
+        shared_kwargs = {}
+        if shared_x_and_scale_quanted is not None:
+            if (
+                not (self.fold_shared_expert or self._step5_ll_fused_restore)
+                or input_is_sequence_parallel
+            ):
+                raise ValueError("shared Norm+INT8 requires an unsharded shared input")
+            shared_kwargs = dict(
+                shared_input_quanted=shared_x_and_scale_quanted[0],
+                shared_input_scale=shared_x_and_scale_quanted[1],
+            )
+        if self._step5_deepep:
+            # Shared weights are TP-sharded, whereas routed experts are EP-
+            # sharded. Compute shared partials over the same full token order
+            # on every TP rank; reduce-scatter them to the routed token owners.
+            # This is independent of compiler SP: each unique token enters
+            # DeepEP once even when enable_sp=False.
+            from vllm_hcu.model_executor.layers.fused_moe.step5_deepep import (
+                shared_expert_token_slice,
+            )
+
+            full_input = (
+                tensor_model_parallel_all_gather(hidden_states, dim=0)
+                if input_is_sequence_parallel and self.tp_size > 1
+                else hidden_states
+            )
+            routed_input = (
+                hidden_states
+                if input_is_sequence_parallel or self.tp_size == 1
+                else sequence_parallel_chunk(hidden_states)
+            )
+            if self._step5_ll_fused_restore and not input_is_sequence_parallel:
+                xq, xs = (
+                    (None, None)
+                    if shared_x_and_scale_quanted is None
+                    else shared_x_and_scale_quanted
+                )
+                shared, logits = torch.ops.vllm.step5_ll_router_shared.default(
+                    full_input,
+                    xq,
+                    xs,
+                    self.experts.layer_name,
+                    self.tp_size,
+                    self.gate.weight.shape[1],
+                )
+                routed = self.experts(hidden_states=routed_input, router_logits=logits)
+                return shared, routed
+            shared = self.share_expert(
+                full_input, x_and_scale_quanted=shared_x_and_scale_quanted
+            )
+            if not self._step5_ll_fused_restore or input_is_sequence_parallel:
+                shared = shared_expert_token_slice(shared, get_tp_group())
+            if self.experts.is_internal_router:
+                routed = self.experts(
+                    hidden_states=routed_input, router_logits=routed_input
+                )
+            else:
+                if (
+                    self._step5_ll_fused_restore
+                    and isinstance(self.gate, BF16FP32RouterLinear)
+                    and routed_input.dtype == torch.bfloat16
+                    and self.gate.weight.shape[0] == routed_input.shape[-1]
+                ):
+                    # A full batch outside the fusion range must not compute
+                    # an unused shared activation on its smaller owner slice.
+                    logits = self.gate._gemm(routed_input, self.gate.weight)
+                else:
+                    logits, _ = self.gate(routed_input)
+                routed = self.experts(hidden_states=routed_input, router_logits=logits)
+            return shared, routed
         if (
             self.experts.moe_config.is_sequence_parallel
             and not input_is_sequence_parallel
@@ -1159,10 +1969,18 @@ class FusedMoEBlock(nn.Module):
         )
         if self.experts.is_internal_router:
             routed_output = self.experts(
-                hidden_states=hidden_states, router_logits=hidden_states
+                hidden_states=hidden_states,
+                router_logits=hidden_states,
+                **shared_kwargs,
             )
         else:
-            router_logits, fused_shared_act = self.gate(hidden_states)
+            if isinstance(self.gate, BF16FP32RouterLinear):
+                router_logits, fused_shared_act = self.gate(
+                    hidden_states,
+                    x_and_scale_quanted=shared_x_and_scale_quanted,
+                )
+            else:
+                router_logits, fused_shared_act = self.gate(hidden_states)
             if fused_shared_act is not None:
                 self.share_expert.fused_act = (
                     torch.cuda.current_stream().cuda_stream,
@@ -1170,7 +1988,9 @@ class FusedMoEBlock(nn.Module):
                     fused_shared_act,
                 )
             routed_output = self.experts(
-                hidden_states=hidden_states, router_logits=router_logits
+                hidden_states=hidden_states,
+                router_logits=router_logits,
+                **shared_kwargs,
             )
         return shared_output, routed_output
 
@@ -1189,6 +2009,9 @@ class Step5DecoderLayer(nn.Module):
         layer_idx = extract_layer_index(prefix)
         self.layer_idx = layer_idx
         cache_config = vllm_config.cache_config
+        # INT8 W8A8 for attention and the dense MLP in the mixed checkpoint;
+        # None (bf16) everywhere else.
+        dense_quant_config = _dense_quant_config(vllm_config)
         self.fp32_residual_connection = getattr(
             config, "fp32_residual_connection", False
         )
@@ -1201,9 +2024,8 @@ class Step5DecoderLayer(nn.Module):
             )
 
         # HF exposes main-model layer_types separately; MTP uses the tail.
-        layer_types = (
-            getattr(config, "layer_types_with_mtp", None)
-            or getattr(config, "layer_types", [])
+        layer_types = getattr(config, "layer_types_with_mtp", None) or getattr(
+            config, "layer_types", []
         )
         num_attention_heads = None
         num_attention_groups = None
@@ -1234,6 +2056,7 @@ class Step5DecoderLayer(nn.Module):
             qkv_bias=getattr(config, "attention_bias", False),
             head_dim=head_dim if head_dim else getattr(config, "head_dim", None),
             cache_config=cache_config,
+            quant_config=dense_quant_config,
             rope_scaling=getattr(config, "rope_scaling", None),
             sliding_window=getattr(config, "sliding_window", None),
             use_head_wise_attn_gate=getattr(config, "use_head_wise_attn_gate", False),
@@ -1274,7 +2097,7 @@ class Step5DecoderLayer(nn.Module):
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
                 hidden_act="silu",
-                quant_config=None,
+                quant_config=dense_quant_config,
                 reduce_results=True,
                 prefix=f"{prefix}.mlp",
             )
@@ -1299,12 +2122,26 @@ class Step5DecoderLayer(nn.Module):
         input_is_sequence_parallel: bool = False,
         residual: torch.Tensor | None = None,
         orig_num_tokens: int | None = None,
+        shared_x_and_scale_quanted: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         if not self.use_moe:
             return self.mlp(hidden_states)
         shared_output, routed_output = self.moe(
-            hidden_states, input_is_sequence_parallel=input_is_sequence_parallel
+            hidden_states,
+            input_is_sequence_parallel=input_is_sequence_parallel,
+            shared_x_and_scale_quanted=shared_x_and_scale_quanted,
         )
+        if (
+            getattr(self.moe, "_step5_ll_fused_restore", False)
+            and not input_is_sequence_parallel
+        ):
+            from vllm_hcu.model_executor.layers.fused_moe.step5_deepep import (
+                restore_ll_shared_and_routed,
+            )
+
+            return restore_ll_shared_and_routed(
+                shared_output, routed_output, get_tp_group()
+            )[: hidden_states.shape[0]]
         if self.moe.experts.moe_config.is_sequence_parallel:
             combined = self._cast_for_residual(shared_output) + self._cast_for_residual(
                 routed_output
@@ -1326,10 +2163,40 @@ class Step5DecoderLayer(nn.Module):
             combined = tensor_model_parallel_all_reduce(combined)
         return combined
 
+    def _norm_attention_input(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        if not (
+            INT8_ATTN_NORM_QUANT
+            and MIXED_DENSE_INT8
+            and not MIXED_DENSE_DEQUANT
+            and self.compute_dtype == torch.bfloat16
+            and self.self_attn.qkvg_int8_weight is not None
+            and torch.compiler.is_compiling()
+        ):
+            return None
+        from vllm_hcu.ops.step5.attention_int8 import (
+            add_norm_quant_int8,
+            norm_quant_int8,
+            usable_add_norm_quant_int8,
+            usable_norm_quant_int8,
+        )
+
+        weight = self.input_layernorm.weight
+        epsilon = self.input_layernorm.variance_epsilon
+        if residual is not None:
+            if not usable_add_norm_quant_int8(x, residual, weight):
+                return None
+            return add_norm_quant_int8(x, residual, weight, epsilon)
+        if not usable_norm_quant_int8(x, weight):
+            return None
+        return (*norm_quant_int8(x, weight, epsilon), x)
+
     def forward(
         self, positions: torch.Tensor, hidden_states: torch.Tensor
     ) -> torch.Tensor:
-        orig_num_tokens = hidden_states.shape[0]
         residual = hidden_states
         if not self.fp32_residual_connection:
             hidden_states = self.input_layernorm(hidden_states)
@@ -1341,20 +2208,77 @@ class Step5DecoderLayer(nn.Module):
             hidden_states = self.post_attention_layernorm(hidden_states)
             return self._forward_ffn(hidden_states) + residual
 
-        hidden_states = self.input_layernorm(residual).to(self.compute_dtype)
-        hidden_states = self.self_attn(positions=positions, hidden_states=hidden_states)
-        hidden_states = self._cast_for_residual(hidden_states) + residual
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states).to(
-            self.compute_dtype
-        )
+        ffn_output, residual = self.forward_residual(positions, hidden_states)
+        return self._cast_for_residual(ffn_output) + residual
+
+    def forward_residual(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Keep the FFN contribution separate until the next input norm.
+
+        Public layer.forward and pipeline boundaries still materialize their
+        original FP32 sum. Only the internal FP32 decode loop carries the pair.
+        """
+        orig_num_tokens = hidden_states.shape[0]
+        norm_quanted = self._norm_attention_input(hidden_states, residual)
+        if norm_quanted is None:
+            residual = (
+                hidden_states
+                if residual is None
+                else self._cast_for_residual(hidden_states) + residual
+            )
+            hidden_states = self.input_layernorm(residual).to(self.compute_dtype)
+            hidden_states = self.self_attn(
+                positions=positions,
+                hidden_states=hidden_states,
+            )
+        else:
+            hidden_states, x_q, x_scale, residual = norm_quanted
+            hidden_states = self.self_attn(
+                positions=positions,
+                hidden_states=hidden_states,
+                x_and_scale_quanted=(x_q, x_scale),
+            )
+
+        shared_quanted = None
+        if (
+            INT8_ATTN_NORM_QUANT
+            and torch.compiler.is_compiling()
+            and self.compute_dtype == torch.bfloat16
+            and self.use_moe
+            and (self.moe.fold_shared_expert or self.moe._step5_ll_fused_restore)
+            and _can_fuse_int8_shared_expert(self.moe.share_expert)
+        ):
+            from vllm_hcu.ops.step5.attention_int8 import (
+                add_norm_quant_int8,
+                usable_add_norm_quant_int8,
+            )
+
+            weight = self.post_attention_layernorm.weight
+            if usable_add_norm_quant_int8(hidden_states, residual, weight):
+                hidden_states, x_q, x_scale, residual = add_norm_quant_int8(
+                    hidden_states,
+                    residual,
+                    weight,
+                    self.post_attention_layernorm.variance_epsilon,
+                )
+                shared_quanted = (x_q, x_scale)
+        if shared_quanted is None:
+            residual = self._cast_for_residual(hidden_states) + residual
+            hidden_states = self.post_attention_layernorm(residual).to(
+                self.compute_dtype
+            )
         ffn_output = self._forward_ffn(
             hidden_states,
             input_is_sequence_parallel=False,
             residual=None,
             orig_num_tokens=orig_num_tokens,
+            shared_x_and_scale_quanted=shared_quanted,
         )
-        return self._cast_for_residual(ffn_output) + residual
+        return ffn_output, residual
 
 
 @support_torch_compile
@@ -1373,7 +2297,14 @@ class Step5Model(nn.Module):
 
         self.moe_num_experts = config.moe_num_experts
         self.skipped_dsa_weights = 0
-        if FP8_BF16_MOE:
+        self.gptq_w4a8 = False
+        if os.environ.get("VLLM_HCU_STEP5_W4A8_PROFILE"):
+            from vllm_hcu.model_executor.layers.fused_moe.step5_w4a8_policy import (
+                compressed_w4a8_config,
+            )
+
+            self.gptq_w4a8 = compressed_w4a8_config(vllm_config)
+        if FP8_BF16_MOE and not self.gptq_w4a8:
             _unignore_bf16_experts(vllm_config.quant_config)
 
         # One Step4DSAState is shared by every DSA layer on this rank: the
@@ -1417,9 +2348,18 @@ class Step5Model(nn.Module):
         if get_pp_group().is_first_rank or (
             config.tie_word_embeddings and get_pp_group().is_last_rank
         ):
+            if (
+                REPLICATED_EMBEDDING
+                and config.tie_word_embeddings
+                and get_tensor_model_parallel_world_size() > 1
+            ):
+                raise ValueError(
+                    "Replicated Step5 input embeddings cannot tie a TP-sharded lm_head"
+                )
             self.embed_tokens = VocabParallelEmbedding(
                 self.vocab_size,
                 config.hidden_size,
+                disable_tp=REPLICATED_EMBEDDING,
             )
         else:
             self.embed_tokens = PPMissingLayer()
@@ -1465,9 +2405,28 @@ class Step5Model(nn.Module):
         if self.fp32_residual_connection:
             hidden_states = hidden_states.float()
 
-        for i in range(self.start_layer, self.end_layer):
-            layer = self.layers[i]
-            hidden_states = layer(positions, hidden_states)
+        if (
+            self.fp32_residual_connection
+            and INT8_ATTN_NORM_QUANT
+            and MIXED_DENSE_INT8
+            and not MIXED_DENSE_DEQUANT
+            and self.compute_dtype == torch.bfloat16
+            and torch.compiler.is_compiling()
+            and get_pp_group().world_size == 1
+        ):
+            residual = None
+            for i in range(self.start_layer, self.end_layer):
+                hidden_states, residual = self.layers[i].forward_residual(
+                    positions,
+                    hidden_states,
+                    residual,
+                )
+            if residual is not None:
+                hidden_states = hidden_states.to(torch.float32) + residual
+        else:
+            for i in range(self.start_layer, self.end_layer):
+                layer = self.layers[i]
+                hidden_states = layer(positions, hidden_states)
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors(
@@ -1497,6 +2456,8 @@ class Step5Model(nn.Module):
 
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
+        int8_scale_sources: set[str] = set()
+        required_int8_scales: set[str] = set()
         base_layer = (
             "base_layer." if any(".base_layer." in name for name in params_dict) else ""
         )
@@ -1544,9 +2505,24 @@ class Step5Model(nn.Module):
             weights = _place_experts(
                 weights,
                 [i for i, layer in enumerate(self.layers) if layer.use_moe],
+                per_expert=self.gptq_w4a8,
             )
-        if FP8_BF16_MOE:
+        if FP8_BF16_MOE and not self.gptq_w4a8:
             weights = _quantize_bf16_experts(weights)
+
+        gptq_layers = {
+            i
+            for i, layer in enumerate(self.layers)
+            if layer.use_moe
+            and getattr(layer.moe.routed_experts, "_hcu_step5_gptq_kind", None)
+            == "w4a8"
+        }
+        if gptq_layers:
+            from vllm_hcu.model_executor.layers.quantization.step5_gptq_w4a8 import (
+                checkpoint_names,
+            )
+
+            weights = checkpoint_names(weights, gptq_layers)
 
         for name, loaded_weight in weights:
             if name.startswith("model."):
@@ -1635,6 +2611,15 @@ class Step5Model(nn.Module):
                     continue
                 param = params_dict[replaced_name]
                 weight_loader = param.weight_loader
+                if MIXED_DENSE_INT8:
+                    _check_dense_int8_dtype(replaced_name, param, loaded_weight)
+                    if (
+                        local_name.endswith(".weight")
+                        and loaded_weight.dtype == torch.int8
+                    ):
+                        required_int8_scales.add(local_name + "_scale")
+                    elif local_name.endswith(".weight_scale"):
+                        int8_scale_sources.add(local_name)
                 weight_loader(param, loaded_weight, shard_id)
                 loaded_params.add(replaced_name)
                 break
@@ -1674,6 +2659,20 @@ class Step5Model(nn.Module):
                         logger.warning_once("ignore expert_bias")
                         continue
                     if local_name not in params_dict:
+                        if (
+                            MIXED_DENSE_INT8
+                            and not MIXED_DENSE_DEQUANT
+                            and local_name.endswith(_QUANT_TENSOR_SUFFIXES)
+                        ):
+                            raise ValueError(
+                                "step5: no parameter for quantization tensor "
+                                f"{local_name}; that layer was built "
+                                "unquantized, so its INT8 weights would load "
+                                "with no scale. Check that the checkpoint's "
+                                "config_groups target this module (note that "
+                                "hf_to_vllm_mapper renames '.share_expert.' to "
+                                "'.moe.share_expert.')."
+                            )
                         logger.warning_once(
                             "step5: no parameter for checkpoint tensor %s", local_name
                         )
@@ -1682,10 +2681,24 @@ class Step5Model(nn.Module):
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
                     )
+                    if MIXED_DENSE_INT8:
+                        _check_dense_int8_dtype(local_name, param, loaded_weight)
+                        if (
+                            local_name.endswith(".weight")
+                            and loaded_weight.dtype == torch.int8
+                        ):
+                            required_int8_scales.add(local_name + "_scale")
+                        elif local_name.endswith(".weight_scale"):
+                            int8_scale_sources.add(local_name)
                     weight_loader(param, loaded_weight)
                     loaded_params.add(local_name)
 
         self.skipped_dsa_weights = skipped_dsa
+        missing_scales = required_int8_scales - int8_scale_sources
+        if missing_scales:
+            raise ValueError(
+                f"step5: missing INT8 channel scales: {sorted(missing_scales)}"
+            )
         if skipped_dsa:
             logger.info(
                 "step5: VLLM_STEP5_DISABLE_DSA is set, so %d DSA indexer "
@@ -1717,9 +2730,28 @@ class Step5ForCausalLM(nn.Module, SupportsPP, MixtureOfExperts):
             self.lm_head = ParallelLMHead(
                 config.vocab_size,
                 config.hidden_size,
-                quant_config=None,  # lm_head is bf16 in the checkpoint.
+                # bf16 in the fp8 checkpoints, and INT8 weights from the mixed
+                # one are folded to bf16 at load time (_fold_int8_lm_head), so
+                # the head never needs a quantized storage class -- unless
+                # LM_HEAD_INT8_SKINNY asks for one, which swaps the parameters
+                # here and leaves the INT8 tensors to the loader unmodified.
+                quant_config=None,
                 prefix=maybe_prefix(prefix, "lm_head"),
             )
+            if LM_HEAD_INT8_SKINNY and MIXED_DENSE_INT8 and not MIXED_DENSE_DEQUANT:
+                from vllm_hcu.model_executor.layers import skinny_lm_head_int8
+
+                if skinny_lm_head_int8.install_int8_storage(self.lm_head):
+                    logger.info_once(
+                        "step5: lm_head keeps its INT8 weights, running the "
+                        "INT8 skinny GEMM for M <= %d",
+                        skinny_lm_head_int8.MAX_M,
+                    )
+                else:
+                    raise ValueError(
+                        "step5: INT8 lm_head storage could not be installed; "
+                        "refusing to cast checkpoint INT8 weights to BF16"
+                    )
             self.logits_processor = LogitsProcessor(config.vocab_size)
             self.logits_processor._step5_skinny_lm_head = True
         else:
@@ -1749,6 +2781,13 @@ class Step5ForCausalLM(nn.Module, SupportsPP, MixtureOfExperts):
         self.num_local_physical_experts = example_layer.n_local_physical_experts
         self.num_routed_experts = example_layer.n_routed_experts
         self.num_redundant_experts = example_layer.n_redundant_experts
+
+    def process_weights_after_loading(self) -> None:
+        """Finalize opt-in fused indexer weights after every linear is loaded."""
+        if INT8_QKV_INDEXER:
+            for module in self.model.modules():
+                if isinstance(module, Step5Attention):
+                    module._quantize_int8_indexer()
 
     def forward(
         self,
@@ -1803,8 +2842,16 @@ class Step5ForCausalLM(nn.Module, SupportsPP, MixtureOfExperts):
             layer.experts.update_expert_map()
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        if MIXED_DENSE_DEQUANT:
+            # Covers lm_head and every dense projection in one pass.
+            weights = _fold_int8_dense(weights)
+        elif MIXED_DENSE_INT8:
+            weights = _fold_int8_lm_head(weights)
         loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        loaded = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        if MIXED_DENSE_INT8 and not MIXED_DENSE_DEQUANT:
+            _validate_int8_loaded_scales(self, loaded)
+        return loaded
 
 
 def get_spec_layer_idx_from_weight_name(

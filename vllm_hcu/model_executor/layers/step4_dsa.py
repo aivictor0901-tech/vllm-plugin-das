@@ -173,7 +173,9 @@ _HOT_CONTEXT_EAGER_FALLBACK = (
     henvs.custom_ops_enabled()
     and int(os.environ.get("HCU_STEP5_CONTEXT_GRAPH_REGIONS", "0")) > 0
 )
-if _HOT_CONTEXT_EAGER_FALLBACK and GRAPH_REGIONS_OVERRIDE != int(os.environ["HCU_STEP5_CONTEXT_GRAPH_REGIONS"]):
+if _HOT_CONTEXT_EAGER_FALLBACK and GRAPH_REGIONS_OVERRIDE != int(
+    os.environ["HCU_STEP5_CONTEXT_GRAPH_REGIONS"]
+):
     raise ValueError("Step5 hot context width must match the decode graph width")
 
 # Debug switch for the host-side slot derivation in _decode_schedule. When set,
@@ -185,20 +187,16 @@ CHECK_SLOTS = os.environ.get("VLLM_STEP4_DSA_CHECK_SLOTS", "0") == "1"
 
 # Verify-batch indexer scores with one program per request (spec_indexer_logits)
 # instead of one per query token. Bit-identical; "0" restores the per-token kernel.
-_SPEC_INDEXER_PER_REQUEST = (
-    henvs.optional_custom_op_enabled(
-        os.environ.get("VLLM_STEP4_DSA_SPEC_INDEXER_PER_REQUEST", "1") == "1"
-    )
+_SPEC_INDEXER_PER_REQUEST = henvs.optional_custom_op_enabled(
+    os.environ.get("VLLM_STEP4_DSA_SPEC_INDEXER_PER_REQUEST", "1") == "1"
 )
 
 # ...and with the request's (token, head) pairs stacked into one fp8 x fp8 dot
 # (_spec_indexer_stacked_kernel). Same products, summed over heads in the same
 # order, but the dot's internal fp32 accumulation order differs: not
 # bit-identical. "0" restores the per-head bf16 dots.
-_SPEC_INDEXER_FP8_DOT = (
-    henvs.optional_custom_op_enabled(
-        os.environ.get("VLLM_STEP4_DSA_SPEC_INDEXER_FP8_DOT", "1") == "1"
-    )
+_SPEC_INDEXER_FP8_DOT = henvs.optional_custom_op_enabled(
+    os.environ.get("VLLM_STEP4_DSA_SPEC_INDEXER_FP8_DOT", "1") == "1"
 )
 
 # Depth of the pinned staging ring used to upload the per-step pending rows.
@@ -208,6 +206,8 @@ _SPEC_INDEXER_FP8_DOT = (
 # scheduler currently sustains; the events below make the depth a bound rather
 # than an assumption.
 _STAGING_DEPTH = 4
+# One opt-in enables metadata update graphs and prefix/suffix overlap together.
+_METADATA_OVERLAP = os.environ.get("HCU_STEP5_METADATA_OVERLAP", "0") == "1"
 
 # Which sparse-attention stages to run out of ``boltops.step4_dsa`` (the
 # operator team's library, contract ``step4-dsa-ops-v1``) instead of the
@@ -304,6 +304,7 @@ if _flash_attn_stages_raw is not None:
         else frozenset()
     )
 else:
+
     def _flash_attn_dsa_ops_available() -> bool:
         """Whether flash_attn here exposes the sparse ops at all.
 
@@ -839,10 +840,8 @@ def _spec_summaries_kernel(
 
 # Fold _update_summaries_spec into _spec_summaries_kernel. Bit-identical; "0"
 # restores the unfused torch path.
-_SPEC_FUSED_SUMMARIES = (
-    henvs.optional_custom_op_enabled(
-        os.environ.get("VLLM_STEP4_DSA_SPEC_FUSED_SUMMARIES", "1") == "1"
-    )
+_SPEC_FUSED_SUMMARIES = henvs.optional_custom_op_enabled(
+    os.environ.get("VLLM_STEP4_DSA_SPEC_FUSED_SUMMARIES", "1") == "1"
 )
 
 # One GEMM for the four indexer projections (Step4Indexer._merged_projection).
@@ -1359,6 +1358,51 @@ def _spec_indexer_stacked_kernel(
     )
 
 
+def _step5_lightop_spec_indexer(
+    index_q: torch.Tensor,
+    summary: torch.Tensor,
+    block_table: torch.Tensor,
+    weights: torch.Tensor,
+    nscore: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    out: torch.Tensor,
+    weight_scale: float,
+) -> None:
+    from lightop.attention import spec_indexer_logits as native_indexer
+
+    native_indexer(
+        index_q,
+        summary,
+        block_table,
+        weights,
+        nscore,
+        query_start_loc,
+        out,
+        weight_scale,
+    )
+
+
+def _step5_lightop_spec_indexer_fake(
+    index_q,
+    summary,
+    block_table,
+    weights,
+    nscore,
+    query_start_loc,
+    out,
+    weight_scale,
+):
+    return None
+
+
+direct_register_custom_op(
+    op_name="step5_lightop_spec_indexer",
+    op_func=_step5_lightop_spec_indexer,
+    mutates_args=["out"],
+    fake_impl=_step5_lightop_spec_indexer_fake,
+)
+
+
 def spec_indexer_logits(
     index_q: torch.Tensor,
     weights: torch.Tensor,
@@ -1374,6 +1418,7 @@ def spec_indexer_logits(
     weight_scale: float = 1.0,
     q_prerounded: bool = False,
     max_query: int | None = None,
+    use_lightop: bool = False,
 ) -> None:
     """``decode_indexer_logits`` for verify batches, one program per request.
 
@@ -1397,6 +1442,8 @@ def spec_indexer_logits(
         max_query: upper bound on any request's query length. When given
             (with 4 heads per group, an fp8 pool and ``q_prerounded``), the
             stacked fp8 kernel is used; see ``_spec_indexer_stacked_kernel``.
+        use_lightop: explicit Step5-only opt-in. Other model callers keep the
+            existing implementation by default; no batch-size dispatch is added.
     """
     num_tokens, groups, heads_per_group, proxy_dim = index_q.shape
     width = out.shape[1]
@@ -1422,6 +1469,20 @@ def spec_indexer_logits(
         and q_prerounded
         and summary.dtype == torch.float8_e4m3fn
     ):
+        if use_lightop:
+            if groups != 1 or proxy_dim != 256 or regions_per_page != 8:
+                raise ValueError("Step5 LightOp indexer requires G1/H4/D256/page8")
+            torch.ops.vllm.step5_lightop_spec_indexer(
+                index_q,
+                summary,
+                block_table[:num_reqs],
+                weights,
+                nscore[:num_tokens],
+                query_start_loc[: num_reqs + 1],
+                out,
+                float(weight_scale),
+            )
+            return
         # 32-key blocks on one warp: the dot is tiny, so more, smaller programs
         # keep more CUs busy (bk32/nw1 43us vs bk128/nw4 53us).
         _spec_indexer_stacked_kernel[(num_reqs, triton.cdiv(width, 32), groups)](
@@ -1634,6 +1695,9 @@ class Step4DSAMetadataBuilder(AttentionMetadataBuilder[Step4DSAMetadata]):
             # verify row was before the threshold was raised.
             num_decodes, num_prefills = 0, num_decodes + num_prefills
             num_decode_tokens, num_prefill_tokens = 0, m.num_actual_tokens
+        seq_lens_cpu = getattr(m, "_seq_lens_cpu", None)
+        if seq_lens_cpu is None:
+            seq_lens_cpu = m.seq_lens_cpu
         md = Step4DSAMetadata(
             num_decodes=num_decodes,
             num_prefills=num_prefills,
@@ -1645,7 +1709,7 @@ class Step4DSAMetadataBuilder(AttentionMetadataBuilder[Step4DSAMetadata]):
             seq_lens=m.seq_lens,
             query_start_loc=m.query_start_loc,
             query_start_loc_cpu=m.query_start_loc_cpu,
-            seq_lens_cpu=m.seq_lens_cpu,
+            seq_lens_cpu=seq_lens_cpu,
             positions=m.positions,
             max_seq_len=m.max_seq_len,
             block_size=self.block_size,
@@ -2543,14 +2607,28 @@ class Step4PendingTable:
         # retired earlier than that are dead and go first.
         fresh_retired = self.step - 1 - (1 << 40)
         oldest_row, oldest_step = -1, self.step
-        for row in range(self.capacity):
-            if self._slot_of_row[row] < 0:
-                return row
-            touched = self._touched[row]
-            if touched >= fresh_retired and touched < 0:
-                touched += 1 << 40
-            if touched < oldest_step:
-                oldest_row, oldest_step = row, touched
+        scan = True
+        if _METADATA_OVERLAP:
+            # Physical slots are nonnegative; -1 is the free-row sentinel.
+            # Native list scans avoid a Python loop on the common cases.
+            try:
+                return self._slot_of_row.index(-1)
+            except ValueError:
+                pass
+            raw_oldest = min(self._touched, default=self.step)
+            if raw_oldest >= 0 or raw_oldest < fresh_retired:
+                scan = False
+                if raw_oldest < self.step:
+                    oldest_row = self._touched.index(raw_oldest)
+        if scan:
+            for row in range(self.capacity):
+                if self._slot_of_row[row] < 0:
+                    return row
+                touched = self._touched[row]
+                if touched >= fresh_retired and touched < 0:
+                    touched += 1 << 40
+                if touched < oldest_step:
+                    oldest_row, oldest_step = row, touched
         if oldest_row < 0:
             raise RuntimeError(
                 f"Step-4 DSA: all {self.capacity} pending region buffers are in use "
@@ -2766,6 +2844,13 @@ class Step4DSAState:
         self._spec_ev: list[torch.cuda.Event] = []
         self._spec_stage = 0
 
+        self._spec_work = None
+        self._spec_host_np = []
+        self._spec_view_key = None
+        self._spec_views = {}
+        self._spec_meta_graphs = []
+        self._spec_input_table = None
+
         self._rope: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
         self._schedule_key: object | None = None
         self._schedule: Step4DSASchedule | None = None
@@ -2818,6 +2903,12 @@ class Step4DSAState:
         self._spec_host = []
         self._spec_ev = []
         self._spec_stage = 0
+        self._spec_work = None
+        self._spec_host_np = []
+        self._spec_view_key = None
+        self._spec_views = {}
+        self._spec_meta_graphs = []
+        self._spec_input_table = None
         self._schedule_key = None
         self._schedule = None
         self._layers_done = 0
@@ -3497,7 +3588,9 @@ class Step4DSAState:
                     f"VLLM_STEP4_DSA_GRAPH_REGIONS or --max-model-len; the width "
                     f"is a graph constant and cannot be grown per step."
                 )
-            sched.graph_regions = self.graph_regions if widest <= self.graph_regions else 0
+            sched.graph_regions = (
+                self.graph_regions if widest <= self.graph_regions else 0
+            )
         return sched
 
     def _trim_graph_width(self, md: Step4DSAMetadata) -> None:
@@ -3589,6 +3682,65 @@ class Step4DSAState:
             ev.record()
         self._spec_stage = 0
 
+    def _spec_cached_views(self, nd: int, ndt: int, nrm: int):
+        """Reuse only tensor views; every dynamic metadata value is refreshed."""
+        key = (nd, ndt, nrm)
+        if self._spec_view_key != key:
+            sizes = self._spec_fields(nd, nrm, ndt)
+            raw = self._spec_raw
+            views = {
+                name: (
+                    self._spec_i32[name][:n]
+                    if name in self._spec_i32
+                    else raw[off : off + n]
+                )
+                for name, (unused, n) in sizes.items()
+                for off in [self._spec_layout[name][0]]
+            }
+            views["starts"] = self._spec_starts[: nd * nrm]
+            views["tok_table"] = self._spec_table[:ndt]
+            self._spec_views, self._spec_view_key = views, key
+        return self._spec_views
+
+    def _ensure_spec_update_graphs(self, table):
+        """Replay existing torch updates; one graph per pinned staging slot.
+
+        All batch sizes share the same graphs and operators. Dynamic token
+        counts are staged on device; a stable input table accepts new source
+        allocations without changing the captured consumers' addresses.
+        """
+        if table.shape[0] > self.max_num_reqs:
+            table = table[: self.max_num_reqs]
+        if not self._spec_meta_graphs:
+            self._spec_input_table = torch.zeros(
+                (self.max_num_reqs + 1, table.shape[1]),
+                dtype=table.dtype,
+                device=table.device,
+            )
+
+            def update(stage):
+                self._spec_raw.copy_(self._spec_host[stage], non_blocking=True)
+                for name, dst in self._spec_i32.items():
+                    off, n = self._spec_layout[name]
+                    dst.copy_(self._spec_raw[off : off + n])
+                off, n = self._spec_layout["tok_req"]
+                torch.index_select(
+                    self._spec_input_table,
+                    0,
+                    self._spec_raw[off : off + n],
+                    out=self._spec_table,
+                )
+
+            self._spec_input_table[: table.shape[0]].copy_(table)
+            update(0)
+            torch.cuda.synchronize()
+            for stage in range(len(self._spec_host)):
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    update(stage)
+                self._spec_meta_graphs.append(graph)
+        self._spec_input_table[: table.shape[0]].copy_(table)
+
     def _spec_decode_schedule(
         self, md: Step4DSAMetadata, *, persistent: bool = False
     ) -> Step4DSASchedule:
@@ -3627,8 +3779,8 @@ class Step4DSAState:
         nrm = -(-(region - 1 + q_max) // region)
         trash = self.pending_trash_row
 
-        qsl = md.query_start_loc_cpu[: nd + 1].numpy().astype(np.int64, copy=False)
-        seq = md.seq_lens_cpu[:nd].numpy().astype(np.int64, copy=False)
+        qsl = md.query_start_loc_cpu.numpy()[: nd + 1].astype(np.int64, copy=False)
+        seq = md.seq_lens_cpu.numpy()[:nd].astype(np.int64, copy=False)
         # A non-monotonic query_start_loc would make np.repeat below raise and
         # take the whole engine down. Clamp instead, so a stale/garbage row
         # degrades into dead padding and is masked out by `alive` rather than
@@ -3655,7 +3807,15 @@ class Step4DSAState:
         else:
             layout = self._spec_fields(nd, nrm, ndt)
         total = sum(n for _, n in layout.values())
-        h = np.zeros(total, dtype=np.int64)
+        fused = persistent and _METADATA_OVERLAP and device.type == "cuda"
+        if fused:
+            if self._spec_work is None:
+                self._spec_work = np.empty(total, dtype=np.int64)
+                self._spec_host_np = [t.numpy() for t in self._spec_host]
+            h = self._spec_work
+            h.fill(0)
+        else:
+            h = np.zeros(total, dtype=np.int64)
 
         def field(name: str, n: int) -> np.ndarray:
             off, _ = layout[name]
@@ -3671,6 +3831,10 @@ class Step4DSAState:
             field("tok_buf", capacity)[:] = nd * nrm * region + np.arange(
                 capacity, dtype=np.int64
             )
+            # The graph gathers its full capacity. Inactive rows select a
+            # permanent zero row, producing the required padding in that gather.
+            # Tokens inside ndt retain their original mapping, including padding.
+            field("tok_req", capacity)[ndt:] = self.max_num_reqs
 
         head = field("head", nd)
         tail = field("tail", nd)
@@ -3718,29 +3882,67 @@ class Step4DSAState:
         tok_buf[:ntok] = r_of_t * (nrm * region) + hd[r_of_t] + i_of_t
         tok_buf[ntok:] = nd * nrm * region + np.arange(ntok, ndt, dtype=np.int64)
         widest = int(tok_ns.max()) if ndt else 0
+        if persistent:
+            if widest > self.graph_regions and not _HOT_CONTEXT_EAGER_FALLBACK:
+                raise RuntimeError(
+                    f"Step-4 DSA: a request needs {widest} region scores but the "
+                    f"captured decode width is {self.graph_regions}. Raise "
+                    f"VLLM_STEP4_DSA_GRAPH_REGIONS or --max-model-len; the width "
+                    f"is a graph constant and cannot be grown per step."
+                )
+            if self.num_kv_groups * ndt > self._decode_logits.shape[0]:
+                raise RuntimeError(
+                    f"Step-4 DSA: {ndt} verify rows overflow the score pool "
+                    f"({self._decode_logits.shape[0]} group-major rows)."
+                )
+            if fused and _METADATA_OVERLAP and widest > self.graph_regions:
+                from vllm_hcu.v1.step5_boundary import early_consumer_active
+
+                if early_consumer_active():
+                    raise RuntimeError(
+                        "Early Step5 consumer cannot use eager-fallback metadata"
+                    )
 
         self.end_step()  # see the note in _general_schedule
         self.pending.begin_step()
         sched = Step4DSASchedule()
         alive_rows = np.flatnonzero(alive).tolist()
         reg_slots_of: dict[int, list[int]] = {}
+        if fused:
+            # page0 was already read to validate each request. Reuse it for
+            # the first region, and use Python ints in the small control loop.
+            heads, queries, first_regions = hd.tolist(), qlen.tolist(), fr.tolist()
+            first_slots = (page0 * rpp + fr % rpp).tolist() if nd else []
         for r in alive_rows:
-            first = int(fr[r])
-            nreg = -(-(int(hd[r]) + int(qlen[r])) // region)
-            pages = table[r]
-            reg_slots_of[r] = [
-                int(pages[(first + j) // rpp]) * rpp + (first + j) % rpp
-                for j in range(nreg)
-            ]
+            if fused:
+                first = first_regions[r]
+                nreg = -(-(heads[r] + queries[r]) // region)
+                slots_r = [first_slots[r]]
+                for j in range(1, nreg):
+                    index = first + j
+                    slots_r.append(
+                        first_slots[r] + j
+                        if index // rpp == first // rpp
+                        else int(table[r, index // rpp]) * rpp + index % rpp
+                    )
+                reg_slots_of[r] = slots_r
+            else:
+                first = int(fr[r])
+                nreg = -(-(int(hd[r]) + int(qlen[r])) // region)
+                pages = table[r]
+                reg_slots_of[r] = [
+                    int(pages[(first + j) // rpp]) * rpp + (first + j) % rpp
+                    for j in range(nreg)
+                ]
         # Every head read first: get() touches its row for this step, so none of
         # the acquire() calls below can recycle a row another request is about
         # to resume from (a rolled-back request reads a retired row).
         for r in alive_rows:
-            if hd[r]:
+            if heads[r] if fused else hd[r]:
                 p_in[r] = self.pending.get(reg_slots_of[r][0])
         for r in alive_rows:
-            q = int(qlen[r])
-            hr = int(hd[r])
+            q = queries[r] if fused else int(qlen[r])
+            hr = heads[r] if fused else int(hd[r])
             nbuf = hr + q
             reg_slots = reg_slots_of[r]
             nreg = len(reg_slots)
@@ -3776,23 +3978,44 @@ class Step4DSAState:
             # write-after-read reason.
             stage = self._spec_stage
             self._spec_stage = (stage + 1) % _STAGING_DEPTH
+            if fused:
+                self._ensure_spec_update_graphs(md.block_table)
             ev = self._spec_ev[stage] if self._spec_ev else None
             if ev is not None:
                 ev.synchronize()
             host = self._spec_host[stage]
-            host.numpy()[:] = h
+            host_np = self._spec_host_np[stage] if fused else host.numpy()
+            host_np[:] = h
             raw = self._spec_raw
-            raw.copy_(host, non_blocking=ev is not None)
+            if fused:
+                self._spec_meta_graphs[stage].replay()
+            else:
+                raw.copy_(host, non_blocking=ev is not None)
             if ev is not None:
-                ev.record()
+                if fused:
+                    ev.record(torch.cuda.current_stream(device))
+                else:
+                    ev.record()
+            if fused and _METADATA_OVERLAP:
+                from vllm_hcu.v1.step5_boundary import metadata_ready
+
+                metadata_ready()
         else:
             raw = torch.from_numpy(h).to(device)
 
+        views = None
+        if fused:
+            views = self._spec_cached_views(nd, ndt, nrm)
+
         def dev(name: str, n: int) -> torch.Tensor:
+            if views is not None:
+                return views[name]
             off, _ = layout[name]
             return raw[off : off + n]
 
         def dev_i32(name: str, n: int) -> torch.Tensor:
+            if views is not None:
+                return views[name]
             if persistent:
                 backing = self._spec_i32[name]
                 # A previously captured larger slice still sees the backing
@@ -3809,7 +4032,7 @@ class Step4DSAState:
         sched.nrm = nrm
         sched.buf_len = nd * nrm * region + ndt
         sched.starts = (
-            self._spec_starts[: nd * nrm]
+            (views["starts"] if views is not None else self._spec_starts[: nd * nrm])
             if persistent
             else torch.arange(nd * nrm, dtype=torch.int32, device=device) * region
         )
@@ -3827,9 +4050,12 @@ class Step4DSAState:
         sched.tok_nscore = dev_i32("tok_nscore", ndt)
         tok_req_d = dev("tok_req", ndt)
         if persistent:
-            sched.tok_table = self._spec_table[:ndt]
-            self._spec_table[ndt:].zero_()
-            torch.index_select(md.block_table, 0, tok_req_d, out=sched.tok_table)
+            if views is not None:
+                sched.tok_table = views["tok_table"]
+            else:
+                sched.tok_table = self._spec_table[:ndt]
+                self._spec_table[ndt:].zero_()
+                torch.index_select(md.block_table, 0, tok_req_d, out=sched.tok_table)
         else:
             sched.tok_table = md.block_table.index_select(0, tok_req_d)
         sched.req_table = md.block_table
@@ -3837,19 +4063,9 @@ class Step4DSAState:
 
         sched.max_nscore = widest
         if persistent:
-            if widest > self.graph_regions and not _HOT_CONTEXT_EAGER_FALLBACK:
-                raise RuntimeError(
-                    f"Step-4 DSA: a request needs {widest} region scores but the "
-                    f"captured decode width is {self.graph_regions}. Raise "
-                    f"VLLM_STEP4_DSA_GRAPH_REGIONS or --max-model-len; the width "
-                    f"is a graph constant and cannot be grown per step."
-                )
-            if self.num_kv_groups * ndt > self._decode_logits.shape[0]:
-                raise RuntimeError(
-                    f"Step-4 DSA: {ndt} verify rows overflow the score pool "
-                    f"({self._decode_logits.shape[0]} group-major rows)."
-                )
-            sched.graph_regions = self.graph_regions if widest <= self.graph_regions else 0
+            sched.graph_regions = (
+                self.graph_regions if widest <= self.graph_regions else 0
+            )
         return sched
 
     def finish_layer(self) -> None:
@@ -3972,8 +4188,10 @@ class Step4Indexer:
         max_position: int,
         params_dtype: torch.dtype,
         num_attention_heads: int,
+        use_lightop_spec_indexer: bool = False,
     ) -> None:
         self.owner = owner
+        self._use_lightop_spec_indexer = use_lightop_spec_indexer
         # Set by the owner when its own projection GEMM also produces the
         # indexer's q | k | z | w columns (Step5 VLLM_HCU_STEP5_QKV_INDEXER):
         # forward then receives that [tokens, 1540]-wide view instead of
@@ -4141,6 +4359,12 @@ class Step4Indexer:
         index_q, index_k, index_z, weights = self._project(
             hidden_states[:num_tokens], positions[:num_tokens], num_tokens
         )
+        # Projection/Norm/RoPE read only the staged inputs and model weights.
+        # The following summary update is the first GPU schedule consumer.
+        if _METADATA_OVERLAP and self.slot == state.first_slot:
+            from vllm_hcu.v1.step5_boundary import mark_indexer_boundary
+
+            mark_indexer_boundary()
         self._update_summaries(sched, index_k, index_z)
         prefill_logits, decode_logits, width = self._score(md, sched, index_q, weights)
 
@@ -4168,11 +4392,15 @@ class Step4Indexer:
         proxy = self.geometry.proxy_dim
 
         q_norm_w, k_norm_w, k_norm_b, w_weight = self._cast_params(hidden_states.dtype)
-        merged = None if self.pre_projected else self._merged_projection(hidden_states.dtype)
+        merged = (
+            None if self.pre_projected else self._merged_projection(hidden_states.dtype)
+        )
         if merged is not None or self.pre_projected:
             # One GEMM for q | k | z | w; the outputs are column views of it.
             nq = self.num_heads * proxy
-            out = hidden_states if self.pre_projected else F.linear(hidden_states, merged)
+            out = (
+                hidden_states if self.pre_projected else F.linear(hidden_states, merged)
+            )
             index_q = out[:, :nq]
             index_k = out[:, nq : nq + proxy]
             index_z = out[:, nq + proxy : nq + 2 * proxy]
@@ -4759,6 +4987,7 @@ class Step4Indexer:
                 weight_scale=self.weight_prescale,
                 q_prerounded=True,
                 max_query=state.spec_query_len,
+                use_lightop=self._use_lightop_spec_indexer,
             )
             return None, decode_logits, width
 

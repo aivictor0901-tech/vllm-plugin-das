@@ -61,16 +61,12 @@ def apply_to_module(module: ModuleType) -> bool:
         use_monolithic=False,
         eep_stage=False,
     ):
-        if getattr(
-            moe.moe_parallel_config, "use_deepep_auto_kernels", False
-        ):
+        if getattr(moe.moe_parallel_config, "use_deepep_auto_kernels", False):
             if quant_config is None:
                 raise RuntimeError("DeepEP auto requires a FusedMoEQuantConfig")
             all2all_manager = target.get_ep_all2all_manager(eep_stage)
             if not getattr(all2all_manager, "is_deepep_auto_manager", False):
-                raise RuntimeError(
-                    "DeepEP auto requires DeepEPAutoAll2AllManager"
-                )
+                raise RuntimeError("DeepEP auto requires DeepEPAutoAll2AllManager")
             assert moe.dp_size == all2all_manager.dp_world_size
             if moe.num_experts % all2all_manager.world_size != 0:
                 raise ValueError(
@@ -94,6 +90,14 @@ def apply_to_module(module: ModuleType) -> bool:
                 speculative_config, "num_speculative_tokens", 0
             )
             max_tokens *= 1 + int(num_speculative_tokens or 0)
+            from vllm_hcu.runtime_compat.step5 import is_step5_owner
+
+            if is_step5_owner(moe) and moe.moe_parallel_config.is_sequence_parallel:
+                # Step5 removes the TP replicas before dispatch. Bound LL by
+                # each sender's actual token shard instead of reserving the
+                # whole DP batch again on every TP rank.
+                sp = moe.moe_parallel_config.sp_size
+                max_tokens = ((max_tokens + sp - 1) // sp + 15) // 16 * 16
             handle = all2all_manager.get_handle(
                 {
                     "max_num_tokens_per_dp_rank": max_tokens,
@@ -117,9 +121,7 @@ def apply_to_module(module: ModuleType) -> bool:
                 handle,
                 num_dispatchers=all2all_manager.world_size,
                 dp_size=all2all_manager.dp_world_size,
-                rank_expert_offset=(
-                    all2all_manager.rank * moe.num_local_experts
-                ),
+                rank_expert_offset=(all2all_manager.rank * moe.num_local_experts),
             )
             ll_prepare_finalize = target.DeepEPLLPrepareAndFinalize(
                 handle,
@@ -172,9 +174,7 @@ def apply_to_module(module: ModuleType) -> bool:
 
     @functools.wraps(roundup)
     def hcu_roundup(hidden_size, act_dtype, moe_parallel_config):
-        if not getattr(
-            moe_parallel_config, "use_deepep_auto_kernels", False
-        ):
+        if not getattr(moe_parallel_config, "use_deepep_auto_kernels", False):
             return roundup(hidden_size, act_dtype, moe_parallel_config)
         hidden_size = target.DeepEPHTPrepareAndFinalize.maybe_roundup_layer_hidden_size(
             hidden_size, act_dtype

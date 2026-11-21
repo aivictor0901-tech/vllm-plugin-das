@@ -64,6 +64,7 @@ from vllm.utils.torch_utils import (
 )
 from vllm_hcu.platforms import envs as henvs
 from vllm_hcu.model_executor.layers.fused_moe.combine_runtime import (
+    early_ep_combine_allowed,
     ep_shared_add_allowed,
 )
 
@@ -148,6 +149,9 @@ class _EpFusedCombineState:
         # aux-stream output is not ready yet at finalize time.
         if (
             shared_experts is not None
+            and early_ep_combine_allowed(
+                get_forward_context().dp_metadata.get_chunk_sizes_across_dp_rank()
+            )
             and shared_experts._determine_shared_experts_order(shared_input)
             == SharedExpertsOrder.NO_OVERLAP
         ):
@@ -158,7 +162,11 @@ class _EpFusedCombineState:
         """For the EP fused experts: (shared_output, row_start) to add into
         the rows of ``out`` the finalize hook would add it to, else None.
         Only when the hook is then guaranteed to take the fused path."""
-        if not ep_shared_add_allowed() or self.shared is None or self.added_to is not None:
+        if (
+            not ep_shared_add_allowed()
+            or self.shared is None
+            or self.added_to is not None
+        ):
             return None
         rows = _ep_fused_rows(out)
         if rows is None:
@@ -189,6 +197,8 @@ class _EpFusedCombineState:
 
 
 _EP_COMBINE = _EpFusedCombineState()
+
+
 def _install_step5_combine_hooks():
     from vllm_hcu.model_executor.layers.fused_moe.combine_runtime import (
         set_finalize_combine_hook,
@@ -271,6 +281,8 @@ def _moe_forward(
     topk_ids: torch.Tensor | None,
     layer_name: _layer_name_type,
     hidden_dim_unpadded: int,
+    shared_input_quanted: torch.Tensor | None = None,
+    shared_input_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     layer = get_layer_from_name(_resolve_layer_name(layer_name))
     return layer._forward_impl(
@@ -282,6 +294,8 @@ def _moe_forward(
         scale=scale,
         topk_weights=topk_weights,
         topk_ids=topk_ids,
+        shared_input_quanted=shared_input_quanted,
+        shared_input_scale=shared_input_scale,
     )
 
 
@@ -296,6 +310,8 @@ def _moe_forward_fake(
     topk_ids: torch.Tensor | None,
     layer_name: _layer_name_type,
     hidden_dim_unpadded: int,
+    shared_input_quanted: torch.Tensor | None = None,
+    shared_input_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     # `hidden_dim_unpadded > 0` only on the TRT-LLM MXFP4 path, where the
     # real kernel writes narrower than `hidden_states.shape[-1]`. Plumbed
@@ -317,6 +333,8 @@ def _moe_forward_shared(
     topk_ids: torch.Tensor | None,
     layer_name: _layer_name_type,
     hidden_dim_unpadded: int,
+    shared_input_quanted: torch.Tensor | None = None,
+    shared_input_scale: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     layer = get_layer_from_name(_resolve_layer_name(layer_name))
     shared_output, fused_output = layer._forward_impl(
@@ -328,6 +346,8 @@ def _moe_forward_shared(
         scale=scale,
         topk_weights=topk_weights,
         topk_ids=topk_ids,
+        shared_input_quanted=shared_input_quanted,
+        shared_input_scale=shared_input_scale,
     )
     if layer._ep_fused_combine:
         # Already a fresh all-reduce output that aliases no input.
@@ -350,6 +370,8 @@ def _moe_forward_shared_fake(
     topk_ids: torch.Tensor | None,
     layer_name: _layer_name_type,
     hidden_dim_unpadded: int,
+    shared_input_quanted: torch.Tensor | None = None,
+    shared_input_scale: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     # `fused_out`: see `_moe_forward_fake` for hidden_dim_unpadded semantics.
     # `shared_out`: matches `shared_experts_input` if provided (latent MoE),
@@ -884,9 +906,7 @@ class MoERunner(MoERunnerInterface):
         topk_weights: torch.Tensor | None = None,
         topk_ids: torch.Tensor | None = None,
         output_dtype: torch.dtype | None = None,
-        shared_experts_quanted_input: tuple[
-            torch.Tensor, torch.Tensor
-        ] | None = None,
+        shared_experts_quanted_input: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor | None, torch.Tensor]:
         """Run expert routing and the fused MoE kernel via the quant method.
 
@@ -1044,6 +1064,8 @@ class MoERunner(MoERunnerInterface):
         scale: torch.Tensor | None = None,
         topk_weights: torch.Tensor | None = None,
         topk_ids: torch.Tensor | None = None,
+        shared_input_quanted: torch.Tensor | None = None,
+        shared_input_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Invoke the fused moe layer.
 
@@ -1072,6 +1094,9 @@ class MoERunner(MoERunnerInterface):
             )
         if quanted_hidden_states is not None and scale is None:
             raise ValueError("HCU pre-quantized MoE input requires scale")
+
+        if (shared_input_quanted is None) != (shared_input_scale is None):
+            raise ValueError("shared INT8 input requires both payload and scale")
 
         # Apply transform for routed experts (e.g., latent projection
         # for latent MoE)
@@ -1104,6 +1129,8 @@ class MoERunner(MoERunnerInterface):
             self.moe_config.hidden_dim_unpadded
             if self._quant_method.has_unpadded_output
             else 0,
+            shared_input_quanted,
+            shared_input_scale,
         )
 
         #
@@ -1206,8 +1233,7 @@ class MoERunner(MoERunnerInterface):
         hidden_states: torch.Tensor,
     ) -> bool:
         return bool(
-            hidden_states.dtype is torch.bfloat16
-            and self.do_int8_allgatherv_dispatch
+            hidden_states.dtype is torch.bfloat16 and self.do_int8_allgatherv_dispatch
         )
 
     def _maybe_dispatch(
@@ -1369,7 +1395,10 @@ class MoERunner(MoERunnerInterface):
         return self._maybe_reduce_final_output(shared_output + hidden_states, None)
 
     def _wait_late_shared_experts(self) -> None:
-        if getattr(self, "_hcu_step5_owner", False) and self._shared_experts is not None:
+        if (
+            getattr(self, "_hcu_step5_owner", False)
+            and self._shared_experts is not None
+        ):
             self._shared_experts.wait_late()
 
     def _maybe_combine(
@@ -1420,6 +1449,8 @@ class MoERunner(MoERunnerInterface):
         scale: torch.Tensor | None = None,
         topk_weights: torch.Tensor | None = None,
         topk_ids: torch.Tensor | None = None,
+        shared_input_quanted: torch.Tensor | None = None,
+        shared_input_scale: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Entry point called by the custom op to run the MoE computation.
 
@@ -1454,23 +1485,37 @@ class MoERunner(MoERunnerInterface):
             if quanted_hidden_states is not None and scale is not None
             else None
         )
+        # These tensors belong only to the shared expert, before dispatch.
+        # They must never select the routed-expert prequantized execution path.
+        if shared_input_quanted is not None:
+            from vllm_hcu.model_executor.layers.quantization.int8_runtime import (
+                _validate_quantized_input,
+            )
+
+            if shared_experts_input is None:
+                raise ValueError("prequantized shared input has no shared consumer")
+            _validate_quantized_input(
+                shared_experts_input,
+                shared_input_quanted,
+                shared_input_scale,
+            )
+            shared_experts_x_and_scale_quanted = (
+                shared_input_quanted,
+                shared_input_scale,
+            )
         transport_x_and_scale_quanted = None
         if use_int8_allgatherv:
             from vllm_hcu.patch.worker.framework_opt.patch_agrs_int8 import (
                 _quantize_hidden_states,
             )
 
-            transport_x_and_scale_quanted = _quantize_hidden_states(
-                hidden_states
-            )
+            transport_x_and_scale_quanted = _quantize_hidden_states(hidden_states)
             if (
                 self._shared_experts is not None
                 and shared_experts_input is hidden_states
                 and self._shared_experts._layer_supports_x_and_scale_quanted()
             ):
-                shared_experts_x_and_scale_quanted = (
-                    transport_x_and_scale_quanted
-                )
+                shared_experts_x_and_scale_quanted = transport_x_and_scale_quanted
 
         # Sync aux and main stream for shared expert multi-stream overlap.
         self._maybe_sync_shared_experts_stream(
@@ -1486,13 +1531,22 @@ class MoERunner(MoERunnerInterface):
                 self._maybe_fuse_gate_weights()
                 router_logits = F.linear(hidden_states, self._combined_gate_weight)
             else:
-                router_logits, gate_aux = self.gate(hidden_states)
+                if shared_input_quanted is not None and getattr(
+                    self.gate, "accepts_shared_quanted_input", False
+                ):
+                    router_logits, gate_aux = self.gate(
+                        hidden_states,
+                        x_and_scale_quanted=shared_experts_x_and_scale_quanted,
+                    )
+                else:
+                    router_logits, gate_aux = self.gate(hidden_states)
                 if gate_aux is not None and getattr(
                     self.gate, "returns_fused_shared_activation", False
                 ):
                     shared_layer = (
                         self._shared_experts._layer
-                        if self._shared_experts is not None else None
+                        if self._shared_experts is not None
+                        else None
                     )
                     receive_activation = getattr(
                         shared_layer, "cache_fused_router_activation", None
@@ -1561,9 +1615,7 @@ class MoERunner(MoERunnerInterface):
                     topk_weights=topk_weights,
                     topk_ids=topk_ids,
                     output_dtype=dispatch_output_dtype,
-                    shared_experts_quanted_input=(
-                        shared_experts_x_and_scale_quanted
-                    ),
+                    shared_experts_quanted_input=(shared_experts_x_and_scale_quanted),
                 )
             return self._maybe_combine(
                 shared_output,

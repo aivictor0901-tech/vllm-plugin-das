@@ -12,7 +12,9 @@ from types import ModuleType
 from typing import Any
 
 from vllm_hcu.deepseek_v4_runtime import (
-    is_deepseek_v4, is_dspark_enabled, model_architectures,
+    is_deepseek_v4,
+    is_dspark_enabled,
+    model_architectures,
 )
 from vllm_hcu.patch.config import HcuFeatureConfig, get_hcu_config, set_hcu_config
 
@@ -77,24 +79,17 @@ def _normalize_dspark_draft_deepep_topology(
     """
 
     kernel_config = getattr(vllm_config, "kernel_config", None)
-    uses_megamoe = (
-        getattr(kernel_config, "moe_backend", None) == "deep_gemm_mega_moe"
-    )
-    if (
-        not (feature_config.deepep_auto or uses_megamoe)
-        or not is_deepseek_v4(vllm_config)
+    uses_megamoe = getattr(kernel_config, "moe_backend", None) == "deep_gemm_mega_moe"
+    if not (feature_config.deepep_auto or uses_megamoe) or not is_deepseek_v4(
+        vllm_config
     ):
         return feature_config
     speculative_config = getattr(vllm_config, "speculative_config", None)
     if getattr(speculative_config, "method", None) != "dspark":
         return feature_config
     parallel_config = getattr(vllm_config, "parallel_config", None)
-    draft_parallel_config = getattr(
-        speculative_config, "draft_parallel_config", None
-    )
-    target_parallel_config = getattr(
-        speculative_config, "target_parallel_config", None
-    )
+    draft_parallel_config = getattr(speculative_config, "draft_parallel_config", None)
+    target_parallel_config = getattr(speculative_config, "target_parallel_config", None)
     if (
         parallel_config is not draft_parallel_config
         or draft_parallel_config is target_parallel_config
@@ -180,9 +175,7 @@ def _require_hy4_pcp8_contract(vllm_config: object) -> None:
     )
     if (
         speculative_config is None
-        or _require_hcu_pcp_attribute(
-            speculative_config, "method", "SpeculativeConfig"
-        )
+        or _require_hcu_pcp_attribute(speculative_config, "method", "SpeculativeConfig")
         != "mtp"
         or int(
             _require_hcu_pcp_attribute(
@@ -201,42 +194,28 @@ def _require_hy4_pcp8_contract(vllm_config: object) -> None:
     kernel_config = _require_hcu_pcp_attribute(
         vllm_config, "kernel_config", "VllmConfig"
     )
-    cache_config = _require_hcu_pcp_attribute(
-        vllm_config, "cache_config", "VllmConfig"
-    )
+    cache_config = _require_hcu_pcp_attribute(vllm_config, "cache_config", "VllmConfig")
     if bool(getattr(parallel_config, "enable_eplb", False)):
         raise ValueError("HY V4 PCP8 does not support EPLB.")
     if (
-        _require_hcu_pcp_attribute(
-            parallel_config, "all2all_backend", "ParallelConfig"
-        )
+        _require_hcu_pcp_attribute(parallel_config, "all2all_backend", "ParallelConfig")
         != "deepep_high_throughput"
-        or _require_hcu_pcp_attribute(
-            kernel_config, "moe_backend", "KernelConfig"
-        )
+        or _require_hcu_pcp_attribute(kernel_config, "moe_backend", "KernelConfig")
         != "deep_gemm"
-        or _require_hcu_pcp_attribute(
-            cache_config, "cache_dtype", "CacheConfig"
-        )
+        or _require_hcu_pcp_attribute(cache_config, "cache_dtype", "CacheConfig")
         not in ("fp8_e4m3", "fp8_ds_mla")
     ):
-        raise ValueError(
-            "HY V4 PCP8 requires DeepEP HT, DeepGEMM and FP8 E4M3 KV."
-        )
+        raise ValueError("HY V4 PCP8 requires DeepEP HT, DeepGEMM and FP8 E4M3 KV.")
     from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
     attention_config = _require_hcu_pcp_attribute(
         vllm_config, "attention_config", "VllmConfig"
     )
     if (
-        _require_hcu_pcp_attribute(
-            attention_config, "backend", "AttentionConfig"
-        )
+        _require_hcu_pcp_attribute(attention_config, "backend", "AttentionConfig")
         != AttentionBackendEnum.FLASHMLA_SPARSE
     ):
-        raise ValueError(
-            "HY V4 PCP8 requires the FLASHMLA_SPARSE attention backend."
-        )
+        raise ValueError("HY V4 PCP8 requires the FLASHMLA_SPARSE attention backend.")
     from vllm_hcu.platforms import envs as hcu_envs
 
     gate_shard_enabled = hcu_envs.linear_gate_pcp_shard_enabled(
@@ -308,35 +287,25 @@ def _require_glm53_mtp_pcp_contract(vllm_config: object) -> None:
 def _require_mrv2_pcp_contract(vllm_config: object) -> None:
     """Reject every Model Runner V2 PCP configuration outside HCU support."""
 
-    if not _require_hcu_pcp_attribute(
-        vllm_config, "use_v2_model_runner", "VllmConfig"
-    ):
+    if not _require_hcu_pcp_attribute(vllm_config, "use_v2_model_runner", "VllmConfig"):
         raise ValueError("HCU PCP requires Model Runner V2.")
 
-    model_config = _require_hcu_pcp_attribute(
-        vllm_config, "model_config", "VllmConfig"
-    )
+    model_config = _require_hcu_pcp_attribute(vllm_config, "model_config", "VllmConfig")
     parallel_config = _require_hcu_pcp_attribute(
         vllm_config, "parallel_config", "VllmConfig"
     )
-    cache_config = _require_hcu_pcp_attribute(
-        vllm_config, "cache_config", "VllmConfig"
-    )
+    cache_config = _require_hcu_pcp_attribute(vllm_config, "cache_config", "VllmConfig")
 
     architectures = _require_hcu_pcp_attribute(
         model_config, "architectures", "ModelConfig"
     )
-    use_mla = bool(
-        _require_hcu_pcp_attribute(model_config, "use_mla", "ModelConfig")
-    )
+    use_mla = bool(_require_hcu_pcp_attribute(model_config, "use_mla", "ModelConfig"))
     from vllm_hcu.v1.dsa_cache_layer_split import is_hcu_dsa_mla_model
 
     is_dsa_mla = is_hcu_dsa_mla_model(model_config)
     is_glm52 = architectures == ["GlmMoeDsaForCausalLM"]
     is_hy4 = architectures == ["HYV4ForCausalLM"]
-    is_dsv4 = architectures in (
-        ["DeepseekV4ForCausalLM"], ["DeepSeekV4MTPModel"]
-    )
+    is_dsv4 = architectures in (["DeepseekV4ForCausalLM"], ["DeepSeekV4MTPModel"])
     is_glm53 = is_glm53_pcp(vllm_config)
     is_glm53_mtp = _is_glm53_mtp_pcp(vllm_config)
     # Arithmetic admission is relaxed for GLM5Next, not every runtime path.
@@ -379,17 +348,20 @@ def _require_mrv2_pcp_contract(vllm_config: object) -> None:
     if not use_mla and _require_hcu_pcp_attribute(
         model_config, "is_hybrid", "ModelConfig"
     ):
-        raise ValueError(
-            "FlashAttention PCP does not support hybrid KV cache groups."
-        )
+        raise ValueError("FlashAttention PCP does not support hybrid KV cache groups.")
     hy4_topology = _hy4_pcp_topology(parallel_config) if is_hy4 else None
     if is_hy4 and hy4_topology not in {(4, 2, 1), (1, 4, 2), (1, 8, 1)}:
         raise ValueError(f"HY V4 PCP topology is not validated: {hy4_topology}")
     if is_hy4 and hy4_topology == (1, 8, 1):
         _require_hy4_pcp8_contract(vllm_config)
-    if _require_hcu_pcp_attribute(
-        parallel_config, "pipeline_parallel_size", "ParallelConfig"
-    ) != 1 and hy4_topology != (1, 4, 2) and not relaxed_glm53_topology:
+    if (
+        _require_hcu_pcp_attribute(
+            parallel_config, "pipeline_parallel_size", "ParallelConfig"
+        )
+        != 1
+        and hy4_topology != (1, 4, 2)
+        and not relaxed_glm53_topology
+    ):
         raise ValueError("HCU PCP does not support pipeline parallelism.")
     dcp_size = int(
         _require_hcu_pcp_attribute(
@@ -402,14 +374,23 @@ def _require_mrv2_pcp_contract(vllm_config: object) -> None:
         raise ValueError(
             "FlashAttention PCP does not support decode context parallelism."
         )
-    if _require_hcu_pcp_attribute(
-        parallel_config, "data_parallel_size", "ParallelConfig"
-    ) != 1 and not relaxed_glm53_topology:
+    if (
+        _require_hcu_pcp_attribute(
+            parallel_config, "data_parallel_size", "ParallelConfig"
+        )
+        != 1
+        and not relaxed_glm53_topology
+    ):
         raise ValueError("HCU PCP does not support data parallelism.")
-    if relaxed_glm53_topology and _require_hcu_pcp_attribute(
-        parallel_config, "data_parallel_size", "ParallelConfig"
-    ) > 1 and not _require_hcu_pcp_attribute(
-        parallel_config, "enable_expert_parallel", "ParallelConfig"
+    if (
+        relaxed_glm53_topology
+        and _require_hcu_pcp_attribute(
+            parallel_config, "data_parallel_size", "ParallelConfig"
+        )
+        > 1
+        and not _require_hcu_pcp_attribute(
+            parallel_config, "enable_expert_parallel", "ParallelConfig"
+        )
     ):
         # PCP gathers expand token rows before MoE dispatch. Without EP, the
         # native DP split sizes still describe the pre-gather local rows.
@@ -417,12 +398,18 @@ def _require_mrv2_pcp_contract(vllm_config: object) -> None:
             "GLM-5.3 DP+PCP without expert parallelism is not supported; "
             "enable expert parallelism or use DP1."
         )
-    if use_mla and not relaxed_glm53_topology and not _require_hcu_pcp_attribute(
-        parallel_config, "enable_expert_parallel", "ParallelConfig"
+    if (
+        use_mla
+        and not relaxed_glm53_topology
+        and not _require_hcu_pcp_attribute(
+            parallel_config, "enable_expert_parallel", "ParallelConfig"
+        )
     ):
         raise ValueError("GLM-5.2 PCP requires expert parallelism.")
-    if use_mla and not relaxed_glm53_topology and not _require_hcu_pcp_attribute(
-        model_config, "enforce_eager", "ModelConfig"
+    if (
+        use_mla
+        and not relaxed_glm53_topology
+        and not _require_hcu_pcp_attribute(model_config, "enforce_eager", "ModelConfig")
     ):
         raise ValueError("GLM-5.2 PCP requires eager execution without graphs.")
     if relaxed_glm53_topology and not _require_hcu_pcp_attribute(
@@ -461,13 +448,15 @@ def _require_mrv2_pcp_contract(vllm_config: object) -> None:
             raise ValueError("HY V4 PP2 PCP+MTP requires exactly two draft tokens.")
     if _require_hcu_pcp_attribute(vllm_config, "lora_config", "VllmConfig") is not None:
         raise ValueError("HCU PCP does not support LoRA.")
-    if _require_hcu_pcp_attribute(
-        model_config, "is_multimodal_model", "ModelConfig"
-    ) and not is_glm53:
+    if (
+        _require_hcu_pcp_attribute(model_config, "is_multimodal_model", "ModelConfig")
+        and not is_glm53
+    ):
         raise ValueError("HCU PCP does not support multimodal models.")
-    if _require_hcu_pcp_attribute(
-        cache_config, "kv_offloading_size", "CacheConfig"
-    ) is not None:
+    if (
+        _require_hcu_pcp_attribute(cache_config, "kv_offloading_size", "CacheConfig")
+        is not None
+    ):
         raise ValueError("HCU PCP does not support KV offload.")
 
     kv_transfer_config = _require_hcu_pcp_attribute(
@@ -485,8 +474,7 @@ def _require_mrv2_pcp_contract(vllm_config: object) -> None:
             is_dsa_mla
             and kv_connector == "MooncakeConnector"
             and getattr(kv_transfer_config, "kv_role", None) == "kv_producer"
-            and getattr(kv_transfer_config, "kv_connector_module_path", None)
-            is None
+            and getattr(kv_transfer_config, "kv_connector_module_path", None) is None
         ):
             raise ValueError(
                 "HCU PCP P/D disaggregation requires a supported DSA MLA "
@@ -578,7 +566,8 @@ def _validate_dspark_pd_scope(vllm_config: object) -> None:
 
 
 def normalize_glm53_feature_scope(
-    vllm_config: object, feature_config: HcuFeatureConfig,
+    vllm_config: object,
+    feature_config: HcuFeatureConfig,
 ) -> HcuFeatureConfig:
     """Apply the same effective scope to validation and EngineArgs retention.
 
@@ -594,13 +583,15 @@ def normalize_glm53_feature_scope(
         ),
         glm53_pcp_mtp_sync=(
             feature_config.glm53_pcp_mtp_sync
-            if target_pcp and getattr(spec, "method", None) == "mtp" else False
+            if target_pcp and getattr(spec, "method", None) == "mtp"
+            else False
         ),
     )
 
 
 def _resolve_glm53_pcp_mtp_sync(
-    vllm_config: object, feature_config: HcuFeatureConfig,
+    vllm_config: object,
+    feature_config: HcuFeatureConfig,
 ) -> bool:
     """Resolve collective participation once, then retain the serialized policy."""
     spec = getattr(vllm_config, "speculative_config", None)
@@ -660,12 +651,14 @@ def validate_and_update_hcu_config(vllm_config: object) -> HcuFeatureConfig:
         # Revalidation of a serialized worker config keeps its frozen value.
         "glm53_kda_cp_head_shard": (
             glm53_kda_cp_head_shard_enabled(vllm_config)
-            if is_glm53_pcp(vllm_config) else False
+            if is_glm53_pcp(vllm_config)
+            else False
         ),
         # Collective participation must be identical on every PCP worker.
         # Never resolve this policy again from a worker-local environment.
         "glm53_pcp_mtp_sync": _resolve_glm53_pcp_mtp_sync(
-            vllm_config, feature_config,
+            vllm_config,
+            feature_config,
         ),
         "dp_int8_allgather": hcu_envs.dp_int8_allgather_enabled(),
     }
@@ -680,7 +673,9 @@ def validate_and_update_hcu_config(vllm_config: object) -> HcuFeatureConfig:
         for name in ("glm53_kda_cp_head_shard", "glm53_pcp_mtp_sync")
     )
     if glm53_policy_changed or getattr(
-        getattr(vllm_config, "model_config", None), "architectures", None,
+        getattr(vllm_config, "model_config", None),
+        "architectures",
+        None,
     ) == ["Glm5NextMTPModel"]:
         # Native with_hf_config()/replace() shares the target's additional_config.
         # A PCP1/non-MTP/other-model clone can change effective policy too, not
@@ -756,25 +751,35 @@ def validate_and_update_hcu_config(vllm_config: object) -> HcuFeatureConfig:
         # Only V4 restores global prefill phase evidence for PCP-only auto.
         # Its native MTP draft runs against the restored global target batch.
         # Other PCP models can disagree on HT/LL when a shard has no queries.
-        supports_pcp_only_auto = (
-            int(getattr(parallel_config, "prefill_context_parallel_size", 1)) > 1
-            and not {"DeepseekV4ForCausalLM", "DeepSeekV4MTPModel"}.isdisjoint(
-                model_architectures(vllm_config)
-            )
+        supports_pcp_only_auto = int(
+            getattr(parallel_config, "prefill_context_parallel_size", 1)
+        ) > 1 and not {"DeepseekV4ForCausalLM", "DeepSeekV4MTPModel"}.isdisjoint(
+            model_architectures(vllm_config)
+        )
+        # Step5 explicitly assigns each TP token shard to one EP dispatcher,
+        # so TP+EP also supports auto without multiple DP replicas. Keep the
+        # PCP-only guard for models without global phase synchronization.
+        from vllm_hcu.runtime_compat.step5 import is_step5_config
+
+        supports_step5_tp_auto = (
+            is_step5_config(vllm_config)
+            and bool(os.environ.get("VLLM_HCU_STEP5_W4A8_PROFILE", ""))
+            and int(getattr(parallel_config, "tensor_parallel_size", 1)) > 1
+            and int(getattr(parallel_config, "prefill_context_parallel_size", 1)) == 1
         )
         if (
             int(getattr(parallel_config, "data_parallel_size", 1)) <= 1
             and not supports_pcp_only_auto
+            and not supports_step5_tp_auto
         ):
             raise ValueError(
                 "HCU deepep_auto requires data_parallel_size > 1; "
                 "the PCP-only exception requires DeepSeek V4 or its native "
-                "MTP draft with prefill_context_parallel_size > 1."
+                "MTP draft with prefill_context_parallel_size > 1; "
+                "Step5 W4A8 also supports TP+EP token sharding."
             )
         if not getattr(parallel_config, "enable_expert_parallel", False):
-            raise ValueError(
-                "HCU deepep_auto requires enable_expert_parallel=True."
-            )
+            raise ValueError("HCU deepep_auto requires enable_expert_parallel=True.")
         if bool(getattr(parallel_config, "use_ubatching", False)):
             raise ValueError(
                 "deepep_auto with ubatching is not supported because HT/LL "
@@ -782,15 +787,12 @@ def validate_and_update_hcu_config(vllm_config: object) -> HcuFeatureConfig:
             )
         if feature_config.moe_backend not in ("auto", "deep_gemm"):
             raise ValueError(
-                "deepep_auto requires HCU moe_backend='auto' or "
-                "'deep_gemm'"
+                "deepep_auto requires HCU moe_backend='auto' or 'deep_gemm'"
             )
 
     if feature_config.enable_lightly_cp:
         if model_config is None:
-            raise PatchCompatibilityError(
-                "Lightly-CP requires VllmConfig.model_config"
-            )
+            raise PatchCompatibilityError("Lightly-CP requires VllmConfig.model_config")
         if not getattr(model_config, "enforce_eager", False):
             raise ValueError(
                 "Lightly context parallel currently only supports eager mode."
@@ -806,9 +808,7 @@ def validate_and_update_hcu_config(vllm_config: object) -> HcuFeatureConfig:
 
     if feature_config.moe_backend == "deep_gemm":
         if kernel_config is None:
-            raise PatchCompatibilityError(
-                "deep_gemm requires VllmConfig.kernel_config"
-            )
+            raise PatchCompatibilityError("deep_gemm requires VllmConfig.kernel_config")
         upstream_backend = getattr(kernel_config, "moe_backend", None)
         if upstream_backend != "deep_gemm":
             raise ValueError(
@@ -895,9 +895,7 @@ def apply_to_module(module: ModuleType) -> bool:
     if getattr(vllm_config, _MARKER, False):
         return False
 
-    maybe_enable_breakable = vars(vllm_config).get(
-        "_maybe_enable_breakable_cudagraph"
-    )
+    maybe_enable_breakable = vars(vllm_config).get("_maybe_enable_breakable_cudagraph")
     with_hf_config = vars(vllm_config).get("with_hf_config")
     set_cudagraph_sizes = vars(vllm_config).get("_set_cudagraph_sizes")
     get_v2_unsupported_features = vars(vllm_config).get(
@@ -992,9 +990,7 @@ def apply_to_module(module: ModuleType) -> bool:
                 "updated HuggingFace config does not expose get_text_config"
             )
         model_config.hf_text_config = get_text_config()
-        refresh_model_arch_config = getattr(
-            model_config, "get_model_arch_config", None
-        )
+        refresh_model_arch_config = getattr(model_config, "get_model_arch_config", None)
         if not callable(refresh_model_arch_config):
             raise PatchCompatibilityError(
                 "ModelConfig.get_model_arch_config is missing"

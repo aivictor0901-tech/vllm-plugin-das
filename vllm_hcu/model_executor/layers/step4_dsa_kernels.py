@@ -44,6 +44,7 @@ layouts. Producer and consumer are both in this file, so the layout is ours to p
 """
 
 
+import os
 import torch
 import triton
 import triton.language as tl
@@ -1746,6 +1747,7 @@ def _decode_pack_kernel(
     region_size: tl.constexpr,
     regions_per_page: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    SORT_IDS: tl.constexpr = False,
 ) -> None:
     """Pack selected logical regions into the int64 decode word.
 
@@ -1763,6 +1765,12 @@ def _decode_pack_kernel(
 
     slots = tl.arange(0, BLOCK_K)
     ids = tl.load(ids_ptr + row * stride_ids_row + slots, mask=slots < topk, other=-1)
+    if SORT_IDS:
+        # This LightOp build selects the exact set but need not sort IDs.
+        # Restore logical order before physical mapping and accumulation.
+        keys = tl.where((slots < topk) & (ids >= 0), ids, 2147483647)
+        keys = tl.sort(keys, descending=False)
+        ids = tl.where(keys == 2147483647, -1, keys)
 
     live = (slots < topk) & (ids >= 0) & (ids < valid_regions)
     safe_ids = tl.where(live, ids, 0)
@@ -1811,6 +1819,10 @@ def _decode_pack_kernel(
         tl.where(current_live, current_packed, 0),
     )
     tl.store(counts_ptr + row, count + current_live.to(tl.int32))
+    if BLOCK_K == topk:
+        # Sorting K IDs needs no K+1-wide vector. Define the final padding
+        # word separately when the appended current region is before it.
+        tl.store(out_ptr + row * stride_out_row + topk, 0, mask=count < topk)
 
 
 def prefill_sparse_meta(
@@ -1942,6 +1954,35 @@ def decode_rows_meta(
     return request_indices, history_lengths
 
 
+_STEP5_LIGHTOP_TOPK_IDENTITY = {}
+_STEP5_LIGHTOP_TOPK_MAX_REGIONS = 1 << 17
+
+
+def lightop_region_topk_ids(logits, lengths, *, topk):
+    # Step5's checkpoint uses K=512. Keep other geometries on their prior
+    # selector until their native API and numerical behavior are verified.
+    if topk != 512 or logits.shape[1] > _STEP5_LIGHTOP_TOPK_MAX_REGIONS:
+        return None
+    out = torch.empty((logits.shape[0], topk), device=logits.device, dtype=torch.int32)
+    if not logits.shape[0]:
+        return out
+    import lightop
+
+    key = logits.device
+    if key not in _STEP5_LIGHTOP_TOPK_IDENTITY:
+        # The expanded view has row stride zero. LightOp explicitly accepts
+        # row-contiguous page tables and honors their row stride, including 0.
+        # Keep the owner alive for every CUDA Graph using this device.
+        _STEP5_LIGHTOP_TOPK_IDENTITY[key] = torch.arange(
+            _STEP5_LIGHTOP_TOPK_MAX_REGIONS, device=key, dtype=torch.int32
+        )[None, :]
+    table = _STEP5_LIGHTOP_TOPK_IDENTITY[key].expand(logits.shape[0], -1)
+    # Unit pages + identity transform make the output logical region IDs.
+    # This does not apply Step5's physical mapping or append its current region.
+    lightop.topk_transform_512(logits, lengths, table, out, 1)
+    return out
+
+
 def decode_sparse_meta(
     logits: torch.Tensor,
     kv_seqlens: torch.Tensor,
@@ -1980,7 +2021,15 @@ def decode_sparse_meta(
         rows_meta = decode_rows_meta(kv_seqlens, rows, request_indices, region_size)
     request_indices, history_lengths = rows_meta
 
-    ids = region_topk_ids(logits, history_lengths, topk=topk)
+    ids = None
+    if (
+        henvs.optional_custom_op_enabled()
+        and os.environ.get("HCU_STEP5_DSA_LIGHTOP_TOPK", "0") == "1"
+    ):
+        ids = lightop_region_topk_ids(logits, history_lengths, topk=topk)
+    lightop_selected = ids is not None
+    if ids is None:
+        ids = region_topk_ids(logits, history_lengths, topk=topk)
 
     packed = torch.empty((rows, int(topk) + 1), device=logits.device, dtype=torch.int64)
     counts = torch.empty((rows,), device=logits.device, dtype=torch.int32)
@@ -1997,7 +2046,8 @@ def decode_sparse_meta(
         topk=int(topk),
         region_size=int(region_size),
         regions_per_page=int(regions_per_page),
-        BLOCK_K=triton.next_power_of_2(int(topk) + 1),
+        BLOCK_K=triton.next_power_of_2(int(topk) + (0 if lightop_selected else 1)),
+        SORT_IDS=lightop_selected,
     )
     return packed, counts
 

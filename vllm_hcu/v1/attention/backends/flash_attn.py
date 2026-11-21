@@ -71,6 +71,7 @@ else:
         del args, kwargs
         raise RuntimeError("SWA decode gate/quant provider is disabled")
 
+
 if is_flash_attn_varlen_func_available():
     from vllm_hcu.v1.attention.backends.fa_utils import (
         flash_attn_supports_sinks,
@@ -125,6 +126,7 @@ def _split_kv_cache(
             )
         return kv_cache.transpose(1, 2).split(head_size, dim=-1)
     raise ValueError(f"Unsupported KV cache shape {tuple(kv_cache.shape)}")
+
 
 if TYPE_CHECKING:
     from vllm_hcu.v1.pcp_manager import PCPPlan
@@ -496,7 +498,7 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
     #  https://github.com/vllm-project/vllm/issues/22945
     _cudagraph_support = (
         AttentionCGSupport.ALWAYS
-        if get_flash_attn_version() == 3  or current_platform.is_rocm()
+        if get_flash_attn_version() == 3 or current_platform.is_rocm()
         else AttentionCGSupport.UNIFORM_BATCH
     )
     supports_update_block_table: bool = True
@@ -826,16 +828,14 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
                     assert torch.all(nonzero_query_lens == decode_query_len)
             if num_decodes < num_reqs:
                 prefill_max_query_len = int(
-                    torch.diff(
-                        common_attn_metadata.query_start_loc_cpu[num_decodes:]
-                    ).max().item()
+                    torch.diff(common_attn_metadata.query_start_loc_cpu[num_decodes:])
+                    .max()
+                    .item()
                 )
 
         group_sliding_window = getattr(self.kv_cache_spec, "sliding_window", None)
         base_window = (
-            (-1, -1)
-            if group_sliding_window is None
-            else (group_sliding_window - 1, 0)
+            (-1, -1) if group_sliding_window is None else (group_sliding_window - 1, 0)
         )
         effective_sliding_window = _maybe_symmetrize_window(base_window, causal)
 
@@ -973,8 +973,7 @@ class FlashAttentionImpl(AttentionImpl):
             self.dcp_combine = cp_lse_ag_out_rs
         if self.use_pcp and self.dcp_world_size > 1:
             raise ValueError(
-                "FlashAttention PCP does not support decode context "
-                "parallelism."
+                "FlashAttention PCP does not support decode context parallelism."
             )
         # Retained only for the quarantined legacy PCP+DCP helper below. No
         # supported topology writes tensors into this dictionary.
@@ -1210,22 +1209,22 @@ class FlashAttentionImpl(AttentionImpl):
                         scope="local",
                     )
                     varlen_fwd_unified(
-                    q=query[:num_actual_tokens],
-                    k=key_cache,
-                    v=value_cache,
-                    cu_seqlens_q=cu_seqlens_q,
-                    seqused_k=seqused_k,
-                    block_table=block_table,
-                    max_seqlen_q=max_seqlen_q,
-                    max_seqlen_k=max_seqlen_k,
-                    softmax_scale=self.scale,
-                    causal=attn_metadata.causal,
-                    softcap=self.logits_soft_cap,
-                    window_size=sliding_window_size,
-                    alibi_slopes=self.alibi_slopes,
-                    s_aux=self.sinks,
-                    out=output[:num_actual_tokens],
-                    )   
+                        q=query[:num_actual_tokens],
+                        k=key_cache,
+                        v=value_cache,
+                        cu_seqlens_q=cu_seqlens_q,
+                        seqused_k=seqused_k,
+                        block_table=block_table,
+                        max_seqlen_q=max_seqlen_q,
+                        max_seqlen_k=max_seqlen_k,
+                        softmax_scale=self.scale,
+                        causal=attn_metadata.causal,
+                        softcap=self.logits_soft_cap,
+                        window_size=sliding_window_size,
+                        alibi_slopes=self.alibi_slopes,
+                        s_aux=self.sinks,
+                        out=output[:num_actual_tokens],
+                    )
 
                 else:
                     path_name = (
@@ -1446,7 +1445,8 @@ class FlashAttentionImpl(AttentionImpl):
         ):
             return False
         logger.info_once(
-            "[HCU FLASH_ATTN PATH] swa_decode_fp8_d192 + gate/fp8 quant epilogue",
+            "[HCU FLASH_ATTN PATH] swa_decode_fp8_d192 + gate/%s quant epilogue",
+            "int8" if xq.dtype == torch.int8 else "fp8",
             scope="local",
         )
         swa_decode_fp8_d192_gate_quant(
@@ -1481,18 +1481,11 @@ class FlashAttentionImpl(AttentionImpl):
         # No TMA kernel is invoked here, so stride canonicalization is not needed.
         key_cache, value_cache = _split_kv_cache(kv_cache, key.shape[-1])
 
-        if (
-            getattr(self, "use_pcp", False)
-            and slot_mapping.shape[0] > key.shape[0]
-        ):
+        if getattr(self, "use_pcp", False) and slot_mapping.shape[0] > key.shape[0]:
             num_local_tokens = slot_mapping.shape[0] // self.pcp_world_size
             pcp_group = get_pcp_group()
-            key = pcp_group.all_gather(
-                key[:num_local_tokens].contiguous(), dim=0
-            )
-            value = pcp_group.all_gather(
-                value[:num_local_tokens].contiguous(), dim=0
-            )
+            key = pcp_group.all_gather(key[:num_local_tokens].contiguous(), dim=0)
+            value = pcp_group.all_gather(value[:num_local_tokens].contiguous(), dim=0)
 
         # Reshape the input keys and values and store them in the cache.
         # Skip this if sharing KV cache with an earlier attention layer.
@@ -1566,8 +1559,8 @@ class FlashAttentionImpl(AttentionImpl):
             attn_metadata.causal,
         )
         n = query_across_dcp.shape[0]
-        context_heads = self.num_heads if use_pcp else (
-            self.num_heads * self.dcp_world_size
+        context_heads = (
+            self.num_heads if use_pcp else (self.num_heads * self.dcp_world_size)
         )
         (dcp_context_out,) = current_workspace_manager().get_simultaneous(
             (
@@ -1667,8 +1660,7 @@ class FlashAttentionImpl(AttentionImpl):
         query = query.contiguous()
         gathered_kv = self._pcp_kv.pop(layer.layer_name, None)
         assert gathered_kv is not None, (
-            "PCP+DCP step is missing write-gathered K/V for "
-            f"{layer.layer_name}."
+            f"PCP+DCP step is missing write-gathered K/V for {layer.layer_name}."
         )
         new_key = gathered_kv[0][plan.new_kv_idx]
         new_value = gathered_kv[1][plan.new_kv_idx]

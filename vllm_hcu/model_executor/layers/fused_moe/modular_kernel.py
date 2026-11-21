@@ -66,11 +66,11 @@ logger = init_logger(__name__)
 # inside the MoE custom op, must not change the compile hash.
 _DP_MOE_PIPE_MIN_TOKENS = (
     int(os.environ.get("HCU_DP_MOE_PIPE_MIN_TOKENS", "0"))
-    if henvs.custom_ops_enabled() else 0
+    if henvs.custom_ops_enabled()
+    else 0
 )
 _EP_DIRECT_SUM = (
-    int(os.environ.get("HCU_EP_DIRECT_SUM", "0"))
-    if henvs.custom_ops_enabled() else 0
+    int(os.environ.get("HCU_EP_DIRECT_SUM", "0")) if henvs.custom_ops_enabled() else 0
 )
 _DP_PIPE_UNIFORM = henvs.optional_custom_op_enabled(
     os.environ.get("HCU_DP_MOE_PIPE_UNIFORM", "0") == "1"
@@ -97,8 +97,11 @@ def _step5_ep_chunk_provider(experts, hidden_states, w1, w2):
 
     if type(experts) is TritonOrDeepGemmExperts:
         selected = experts._select_experts_impl(hidden_states, w1, w2)
-        return (getattr(selected, "_hcu_step5_ep_chunk_size", None)
-                if getattr(selected, "_hcu_step5_owner", False) else None)
+        return (
+            getattr(selected, "_hcu_step5_ep_chunk_size", None)
+            if getattr(selected, "_hcu_step5_owner", False)
+            else None
+        )
     return None
 
 
@@ -141,6 +144,7 @@ def _nccl_dtype(t: torch.Tensor):
     if t.element_size() == 1:
         t = t.view(torch.uint8)
     return ncclDataTypeEnum.from_torch(t.dtype)
+
 
 #
 # This file defines a set of base classes used to make MoE kernels more modular.
@@ -1172,6 +1176,7 @@ class FusedMoEKernelModularImpl:
         from vllm_hcu.runtime_compat.step5 import is_step5_owner
 
         self._hcu_step5_owner = is_step5_owner(fused_experts.moe_config)
+        self._hcu_step5_owner |= bool(getattr(fused_experts, "_hcu_step5_w4a8", False))
         self.prepare_finalize = prepare_finalize
         self.fused_experts = fused_experts
         self.shared_experts: SharedExperts | None = None
@@ -1250,7 +1255,8 @@ class FusedMoEKernelModularImpl:
                 _step5_ep_workspace_announced = True
                 print(
                     f"[step5_ep_workspace] active: full_M={M_full} "
-                    f"chunk_M={M_chunk} separate_output=True", flush=True,
+                    f"chunk_M={M_chunk} separate_output=True",
+                    flush=True,
                 )
             return workspace13, workspace2, fused_out
 
@@ -1271,8 +1277,7 @@ class FusedMoEKernelModularImpl:
             growth_mb = henvs.VLLM_HCU_MOE_WORKSPACE_GROWTH_MB
         common_workspace, workspace2 = get_moe_workspaces(
             current_workspace_manager(),
-            (((max_shape_size,), workspace_dtype),
-             (workspace2_shape, workspace_dtype)),
+            (((max_shape_size,), workspace_dtype), (workspace2_shape, workspace_dtype)),
             growth_mb * 1024 * 1024,
         )
         workspace13 = _resize_cache(common_workspace, workspace13_shape)
@@ -1324,7 +1329,10 @@ class FusedMoEKernelModularImpl:
         if begin_moe_call is not None:
             begin_moe_call()
 
-        if self.fused_experts.activation_format() == FusedMoEActivationFormat.BatchedExperts:
+        if (
+            self.fused_experts.activation_format()
+            == FusedMoEActivationFormat.BatchedExperts
+        ):
             num_tokens = hidden_states.shape[0]
             num_dispatchers = self.fused_experts.num_dispatchers
             topk = topk_ids.shape[1]
@@ -1453,7 +1461,9 @@ class FusedMoEKernelModularImpl:
         private_native_ep_output = False
         chunk_provider = _step5_ep_chunk_provider(self.fused_experts, a1q, w1, w2)
         if chunk_provider is not None and not dbo_enabled():
-            from vllm.model_executor.layers.fused_moe.prepare_finalize import naive_dp_ep
+            from vllm.model_executor.layers.fused_moe.prepare_finalize import (
+                naive_dp_ep,
+            )
 
             pf = self.prepare_finalize
             if (
@@ -1462,8 +1472,13 @@ class FusedMoEKernelModularImpl:
                 and pf._lora_context is None
             ):
                 ep_chunk = chunk_provider(
-                    w1, w2, activation, global_num_experts, expert_map,
-                    top_k, apply_router_weight_on_input,
+                    w1,
+                    w2,
+                    activation,
+                    global_num_experts,
+                    expert_map,
+                    top_k,
+                    apply_router_weight_on_input,
                 )
                 if ep_chunk is not None:
                     M_chunk = min(M_full, ep_chunk)
@@ -1619,6 +1634,11 @@ class FusedMoEKernelModularImpl:
         expert_map: torch.Tensor | None,
     ) -> torch.Tensor | None:
         """See _DP_MOE_PIPE_MIN_TOKENS.  None: not applicable, nothing done."""
+        if (
+            getattr(self.fused_experts, "_hcu_step5_w4a8", False)
+            and torch.cuda.is_current_stream_capturing()
+        ):
+            return None
         if not henvs.custom_ops_enabled():
             return None
         global _dp_pipe_stream, _dp_pipe_pending
@@ -1647,7 +1667,9 @@ class FusedMoEKernelModularImpl:
             and getattr(fe, "_lora_context", None) is None
             and fe.activation_format() == FusedMoEActivationFormat.Standard
             and not fe.expects_unquantized_inputs
-            and isinstance(fe.finalize_weight_and_reduce_impl(), TopKWeightAndReduceNoOP)
+            and isinstance(
+                fe.finalize_weight_and_reduce_impl(), TopKWeightAndReduceNoOP
+            )
         ):
             return None
         dp_meta = get_forward_context().dp_metadata
@@ -1703,8 +1725,11 @@ class FusedMoEKernelModularImpl:
         # The synchronized DP metadata makes this decision identical on peers.
         # Half-DP pipelines and nonuniform/empty shards retain the grouped path.
         uniform = (
-            _DP_PIPE_UNIFORM and dbo and len(sizes) == W
-            and sizes[0] > 0 and all(n == sizes[0] for n in sizes)
+            _DP_PIPE_UNIFORM
+            and dbo
+            and len(sizes) == W
+            and sizes[0] > 0
+            and all(n == sizes[0] for n in sizes)
         )
         if uniform and not getattr(self, "_step5_uniform_announced", False):
             self._step5_uniform_announced = True
@@ -1717,8 +1742,12 @@ class FusedMoEKernelModularImpl:
                 nccl.ncclGroupStart()
                 for src, dst in zip(local, gath):
                     nccl.ncclAllGather(
-                        buffer_type(src.data_ptr()), buffer_type(dst.data_ptr()),
-                        src.numel(), _nccl_dtype(src), ncomm, st,
+                        buffer_type(src.data_ptr()),
+                        buffer_type(dst.data_ptr()),
+                        src.numel(),
+                        _nccl_dtype(src),
+                        ncomm,
+                        st,
                     )
                 nccl.ncclGroupEnd()
                 return
@@ -1741,9 +1770,7 @@ class FusedMoEKernelModularImpl:
             a, b = offs[grp[0]], offs[grp[-1] + 1]
             if b <= a:
                 return
-            _, _, N, Kw, top_k = fe.moe_problem_size(
-                gath[0][a:b], w1, w2, gath[2][a:b]
-            )
+            _, _, N, Kw, top_k = fe.moe_problem_size(gath[0][a:b], w1, w2, gath[2][a:b])
             if self.N > 0:
                 N, Kw = self.N, self.K
             workspace13, workspace2, _ = self._allocate_buffers(
@@ -1794,8 +1821,13 @@ class FusedMoEKernelModularImpl:
             if uniform:
                 assert len(grp) == W and grp[0] == 0 and grp[-1] == W - 1
                 nccl.ncclReduceScatter(
-                    buffer_type(moe_out.data_ptr()), buffer_type(result.data_ptr()),
-                    result.numel(), _nccl_dtype(result), sum_op, ncomm, st,
+                    buffer_type(moe_out.data_ptr()),
+                    buffer_type(result.data_ptr()),
+                    result.numel(),
+                    _nccl_dtype(result),
+                    sum_op,
+                    ncomm,
+                    st,
                 )
                 return
             nccl.ncclGroupStart()

@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 
 from typing import TYPE_CHECKING, Any
+import os
 
 import torch
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
@@ -50,9 +51,7 @@ class SlimQuantW4A8Int8Config(QuantizationConfig):
     ) -> None:
         super().__init__()
         self.ignore = list(ignore or [])
-        self.w8a8_include = (
-            None if w8a8_include is None else list(w8a8_include)
-        )
+        self.w8a8_include = None if w8a8_include is None else list(w8a8_include)
         # The PLE ngram table entry parsed from the checkpoint's effective
         # ``mixed_precision`` map (e.g. ``{"format": "int8",
         # "weight_bits": 8}``), or None when the checkpoint does not declare
@@ -101,9 +100,7 @@ class SlimQuantW4A8Int8Config(QuantizationConfig):
     def apply_vllm_mapper(self, hf_to_vllm_mapper: "WeightsMapper") -> None:
         self.ignore = hf_to_vllm_mapper.apply_list(self.ignore)
         if self.w8a8_include is not None:
-            self.w8a8_include = hf_to_vllm_mapper.apply_list(
-                self.w8a8_include
-            )
+            self.w8a8_include = hf_to_vllm_mapper.apply_list(self.w8a8_include)
 
     def get_quant_method(
         self,
@@ -182,11 +179,7 @@ class SlimQuantW4A8Int8LinearMethod(LinearMethodBase):
         if scheme is None:
             raise ValueError("A scheme must be defined for each layer")
         supports = getattr(scheme, "supports_quanted_inputs", None)
-        if (
-            x_and_scale_quanted is not None
-            and callable(supports)
-            and bool(supports())
-        ):
+        if x_and_scale_quanted is not None and callable(supports) and bool(supports()):
             return scheme.apply_weights(
                 layer,
                 x,
@@ -235,9 +228,15 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
         self.moe_kernel: mk.FusedMoEKernel | None = None
         self._supports_int8_allgatherv_input = False
 
-    def get_fused_moe_quant_config(
-        self, layer: torch.nn.Module
-    ) -> FusedMoEQuantConfig:
+        self._step5_w4a8_profile = None
+        if os.environ.get("VLLM_HCU_STEP5_W4A8_PROFILE"):
+            from vllm_hcu.model_executor.layers.fused_moe.step5_w4a8_policy import (
+                resolve_profile,
+            )
+
+            self._step5_w4a8_profile = resolve_profile(moe)
+
+    def get_fused_moe_quant_config(self, layer: torch.nn.Module) -> FusedMoEQuantConfig:
         # Both contiguous HT and masked LL HIPC apply the packed INT4 x16
         # compensation internally. Pass checkpoint scales unchanged.
         w13_scale = layer.w13_weight_scale
@@ -320,6 +319,11 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
 
     @property
     def supports_eplb(self) -> bool:
+        if self._step5_w4a8_profile is not None:
+            from vllm_hcu.runtime_compat.step5 import allows_static_step5_ll_eplb
+
+            if allows_static_step5_ll_eplb(self.moe):
+                return True
         # Kimi fixed LL is safe for synchronous EPLB only because its masked
         # N32 views alias the same in-place packed Parameter storage. Keep the
         # capability limited to the exact model/backend/config combination.
@@ -404,8 +408,20 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
         w2_input_scale = None
         layer.register_parameter("w2_input_scale", w2_input_scale)
 
+        if self._step5_w4a8_profile is not None:
+            layer._hcu_step5_w4a8_declared = True
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         # Keep SlimQuant W4A8 weights in the raw packed checkpoint layout.
+        profile = getattr(self, "_step5_w4a8_profile", None)
+        if profile is not None:
+            from vllm_hcu.model_executor.layers.fused_moe.step5_w4a8 import (
+                prepare_step5_w4a8,
+            )
+
+            prepare_step5_w4a8(self, layer, profile)
+            return
+
         # AITER's channel-wise W4A8 Triton path consumes the raw [E, N, K // 2]
         # / [E, K, N // 2] tensors directly.  Pre-shuffling here routes the
         # weights into the MOE_C/Marlin layout and produces incorrect values
@@ -423,10 +439,7 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
             layer,
             _SLIMQUANT_MOE_LAYOUT_TENSORS,
         )
-        if (
-            getattr(layer, "_hcu_slimquant_post_load_generation", None)
-            == generation
-        ):
+        if getattr(layer, "_hcu_slimquant_post_load_generation", None) == generation:
             return
         self._supports_int8_allgatherv_input = False
         is_kimi_ht = self._is_kimi_ht()
@@ -441,9 +454,7 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
             )
 
             moe = getattr(self, "moe", None)
-            fixed_use_low_latency = slimquant_w4a8_fixed_deepep_use_low_latency(
-                moe
-            )
+            fixed_use_low_latency = slimquant_w4a8_fixed_deepep_use_low_latency(moe)
             uses_deepep_auto = slimquant_w4a8_uses_deepep_auto(moe)
         weight_generation = _slimquant_moe_tensor_generation(
             layer,
@@ -649,11 +660,9 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
                 _SLIMQUANT_MOE_WEIGHT_TENSORS,
             )
         )
-        layer._hcu_slimquant_post_load_generation = (
-            _slimquant_moe_tensor_generation(
-                layer,
-                _SLIMQUANT_MOE_LAYOUT_TENSORS,
-            )
+        layer._hcu_slimquant_post_load_generation = _slimquant_moe_tensor_generation(
+            layer,
+            _SLIMQUANT_MOE_LAYOUT_TENSORS,
         )
 
     def apply(
@@ -669,7 +678,6 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
         output_dtype: torch.dtype | None = None,
         **_,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-
         if (i_q is None) != (i_s is None):
             raise ValueError(
                 "SlimQuant W4A8 prequantized input requires i_q and i_s together"
@@ -726,6 +734,8 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
             native_expert_map, _ = resolve_aiter_expert_maps(
                 getattr(layer, "expert_map", None),
                 global_num_experts,
+                # Modular experts consume the native map, not AITER's mask.
+                create_mask=False,
             )
             return moe_kernel.apply(
                 hidden_states=expert_input,
@@ -757,8 +767,7 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
 
         operation = (
             moe_runtime.apply_vllm_w4a8_moe
-            if getattr(getattr(self, "moe", None), "moe_backend", "auto")
-            == "triton"
+            if getattr(getattr(self, "moe", None), "moe_backend", "auto") == "triton"
             else moe_runtime.apply_aiter_w4a8_moe
         )
         if i_q is None:

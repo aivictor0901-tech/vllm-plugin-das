@@ -12,9 +12,12 @@ def is_dsa_disabled() -> bool:
     return os.getenv("VLLM_STEP5_DISABLE_DSA", "0").strip().lower() in ("1", "true")
 
 
-# These names were exported by the old adapter but have no runtime consumers.
-# Do not translate them into different optimizations with different semantics.
+# Obsolete settings keep their old meaning visible without selecting another
+# optimization or changing the current producer/consumer layout.
 IGNORED_ENVIRONMENT_VARIABLES = {
+    "HCU_STEP5_W4A8_MODE": (
+        "Contiguous Decode mode selection was retired; Decode uses masked DeepGEMM."
+    ),
     "VLLM_STEP5_DSA_INDEX_TP_SIZE": "Indexer sharding follows the model TP layout.",
     "VLLM_STEP5_ENABLE_QKVG_PROJ": (
         "Use VLLM_HCU_STEP5_FUSE_QKVG to control QKV/gate projection fusion."
@@ -38,6 +41,29 @@ def warn_ignored_step5_envs() -> None:
 
 
 ENVIRONMENT_VARIABLES = {
+    # Changing embedding TP layout also changes the compiled main graph.
+    "HCU_STEP5_REPLICATED_EMBEDDING": lambda: (
+        os.getenv("HCU_STEP5_REPLICATED_EMBEDDING", "0") == "1"
+    ),
+    # One cache factor covers metadata update graphs and prefix/suffix overlap.
+    "HCU_STEP5_METADATA_OVERLAP": lambda: (
+        os.getenv("HCU_STEP5_METADATA_OVERLAP", "0") == "1"
+    ),
+    "VLLM_STEP5_LIGHTOP_SPEC_INDEXER": lambda: (
+        os.getenv("VLLM_STEP5_LIGHTOP_SPEC_INDEXER", "0") == "1"
+    ),
+    "VLLM_HCU_STEP5_SHARED_INT8_EPILOGUE": lambda: (
+        os.getenv("VLLM_HCU_STEP5_SHARED_INT8_EPILOGUE", "0") == "1"
+    ),
+    "VLLM_HCU_STEP5_LIGHTOP_INT8_PERMUTE": lambda: (
+        os.getenv("VLLM_HCU_STEP5_LIGHTOP_INT8_PERMUTE", "0") == "1"
+    ),
+    "VLLM_HCU_STEP5_SWA_INT8_EPILOGUE": lambda: (
+        os.getenv("VLLM_HCU_STEP5_SWA_INT8_EPILOGUE", "0") == "1"
+    ),
+    "VLLM_HCU_STEP5_W4A8_GEMM_BACKEND": lambda: os.getenv(
+        "VLLM_HCU_STEP5_W4A8_GEMM_BACKEND", "deepgemm"
+    ),
     "VLLM_STEP_CC_LEVEL": lambda: int(os.getenv("VLLM_STEP_CC_LEVEL", "0")),
     "VLLM_STEP5_DISABLE_DSA": is_dsa_disabled,
     "VLLM_STEP5_TOOL_PARSER_MAX_HEADER_CHARS": lambda: int(

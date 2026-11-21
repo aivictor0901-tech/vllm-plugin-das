@@ -27,6 +27,21 @@ if TYPE_CHECKING:
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 
+def apply_allocator_limit(device, torch_module=None):
+    raw = os.environ.get("VLLM_HCU_ALLOCATOR_LIMIT_GIB")
+    if raw is None:
+        return None
+    gib = float(raw)
+    if not math.isfinite(gib) or gib <= 0:
+        raise ValueError("VLLM_HCU_ALLOCATOR_LIMIT_GIB must be finite and positive")
+    if torch_module is None:
+        import torch as torch_module
+    total = torch_module.cuda.get_device_properties(device).total_memory
+    cap = int(gib * 2**30)
+    torch_module.cuda.set_per_process_memory_fraction(min(cap / total, 0.98), device)
+    return cap
+
+
 def _num_workspace_lanes(
     vllm_config: VllmConfig,
     use_v2_model_runner: bool,
@@ -34,9 +49,7 @@ def _num_workspace_lanes(
     spec_config = vllm_config.speculative_config
     return (
         2
-        if use_v2_model_runner
-        and spec_config is not None
-        and spec_config.use_dspark()
+        if use_v2_model_runner and spec_config is not None and spec_config.use_dspark()
         else 1
     )
 
@@ -63,7 +76,9 @@ def _create_model_runner(
             from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
             runner = GPUModelRunner(vllm_config, device)
-            runner_logger.info("Kimi reference model runner constructed: %s", type(runner).__name__)
+            runner_logger.info(
+                "Kimi reference model runner constructed: %s", type(runner).__name__
+            )
             return runner
         raise RuntimeError(
             "vllm-plugin-das for vLLM main supports only Model Runner V2"
@@ -125,16 +140,42 @@ class HcuGPUWorker(Worker):
     def load_model(self, *, load_dummy_weights: bool = False) -> None:
         """Load the model, then require every enabled patch chain to be live."""
 
+        step5_w4a8_profile = None
+        if os.environ.get("VLLM_HCU_STEP5_W4A8_PROFILE"):
+            from vllm_hcu.model_executor.layers.fused_moe.step5_w4a8_policy import (
+                profile_for_model,
+            )
+
+            step5_w4a8_profile = profile_for_model(self.vllm_config)
+        if step5_w4a8_profile is not None:
+            from vllm_hcu.ops.step5.w4a8 import require_gemm_op
+
+            require_gemm_op()
         super().load_model(load_dummy_weights=load_dummy_weights)
+        if step5_w4a8_profile is not None:
+            from vllm_hcu.model_executor.layers.fused_moe.step5_w4a8 import (
+                validate_loaded_model,
+            )
+
+            validate_loaded_model(self.model_runner.get_model())
         from vllm_hcu.patch.worker import validate_worker_patches
+
         model_runner = getattr(self, "model_runner", None)
-        from vllm_hcu.model_executor.layers.kimi_k3_mixed_precision import record_kimi_kda_offload_ownership
+        from vllm_hcu.model_executor.layers.kimi_k3_mixed_precision import (
+            record_kimi_kda_offload_ownership,
+        )
+
         record_kimi_kda_offload_ownership(getattr(model_runner, "model", None))
         get_draft_model = getattr(model_runner, "get_draft_model", None)
         if callable(get_draft_model):
             record_kimi_kda_offload_ownership(get_draft_model())
-        if os.environ.get("VLLM_KIMI_KDA_PREFILL_BACKEND", "legacy").lower() == "boltops":
-            from vllm_hcu.model_executor.layers.kimi_k3_kda import validate_loaded_kda_model
+        if (
+            os.environ.get("VLLM_KIMI_KDA_PREFILL_BACKEND", "legacy").lower()
+            == "boltops"
+        ):
+            from vllm_hcu.model_executor.layers.kimi_k3_kda import (
+                validate_loaded_kda_model,
+            )
 
             validate_loaded_kda_model(getattr(model_runner, "model", None))
         num_compressor_weights = getattr(
@@ -146,9 +187,7 @@ class HcuGPUWorker(Worker):
                 num_compressor_weights,
             )
 
-        num_router_gates = getattr(
-            model_runner, "_vllm_hcu_num_router_gates", 0
-        )
+        num_router_gates = getattr(model_runner, "_vllm_hcu_num_router_gates", 0)
         if num_router_gates:
             runner_logger.info(
                 "GLM5Next FP32 router GEMV bound to %d layers", num_router_gates
@@ -166,7 +205,10 @@ class HcuGPUWorker(Worker):
 
         refresh_glm53_router_gates(self.model_runner.model)
         refresh_compressor_nt_weights(self.model_runner.model)
-        from vllm_hcu.model_executor.layers.kimi_k3_mixed_precision import refresh_kimi_kda_fused_qkv
+        from vllm_hcu.model_executor.layers.kimi_k3_mixed_precision import (
+            refresh_kimi_kda_fused_qkv,
+        )
+
         refresh_kimi_kda_fused_qkv(self.model_runner.model)
 
     def _start_weight_update(self, is_draft: bool = False) -> None:
@@ -195,7 +237,9 @@ class HcuGPUWorker(Worker):
         else:
             prior_model = self.model_runner.model
         previous_grouped_owners = getattr(
-            self, "_grouped_w4a16_scale_owners", None,
+            self,
+            "_grouped_w4a16_scale_owners",
+            None,
         )
         if previous_grouped_owners is None:
             previous_grouped_owners = snapshot_grouped_w4a16_scale_owners(prior_model)
@@ -222,7 +266,10 @@ class HcuGPUWorker(Worker):
         refresh_hcu_w4a8_scale_caches(model)
         refresh_grouped_w4a16_scale_caches(model, previous_grouped_owners)
         self._grouped_w4a16_scale_owners = None
-        from vllm_hcu.model_executor.layers.kimi_k3_mixed_precision import refresh_kimi_kda_fused_qkv
+        from vllm_hcu.model_executor.layers.kimi_k3_mixed_precision import (
+            refresh_kimi_kda_fused_qkv,
+        )
+
         refresh_kimi_kda_fused_qkv(model)
         if not self._weight_update_is_draft:
             from vllm_hcu.model_executor.layers.fused_moe.glm53_router_gemv import (
@@ -292,6 +339,9 @@ class HcuGPUWorker(Worker):
 
             self.device = torch.device(f"cuda:{self.local_rank}")
             torch.accelerator.set_device_index(self.device)
+
+            if os.environ.get("VLLM_HCU_ALLOCATOR_LIMIT_GIB") is not None:
+                apply_allocator_limit(self.device, torch)
 
             current_platform.check_if_supports_dtype(self.model_config.dtype)
 

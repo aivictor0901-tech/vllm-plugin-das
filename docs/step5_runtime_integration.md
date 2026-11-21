@@ -134,6 +134,42 @@ Rebuild the plugin extension when upgrading to this native operation.
 Router top-k uses a padded power-of-two internal vector with masked writes.
 Non-power-of-two values remain valid, while topk8 retains its original layout.
 
+## W4A8 Prefill and masked Decode
+
+`VLLM_HCU_STEP5_W4A8_PROFILE` selects the explicit Step5 W4A8 adapter.
+The supported profiles are `prefill`, `decode` and `auto`; unrelated models do
+not opt in by inheriting this setting.
+
+- Prefill retains contiguous DeepGEMM kernels and the existing static
+  TP1/DP8/EP8 AG/RS profile with 64-row expert routing. DeepEP HT communication
+  and its metadata keep their existing alignment contract.
+- Decode uses DeepEP low-latency dispatch and masked DeepGEMM for both expert
+  projections. Select `--all2all-backend deepep_low_latency` for a fixed Decode
+  service. The existing HCU DeepEP-auto configuration retains per-forward
+  HT Prefill / LL Decode selection through the forward context.
+  Decode/auto requires an EP collective; local EP1 or ordinary-TP configurations
+  fail early instead of falling back to contiguous experts.
+- The old W4A8 static AG/RS contiguous Decode implementation, MODE1006 batch
+  whitelist, and its 128/256-row expert-padding plans are retired. A Decode
+  or auto profile with a fixed high-throughput backend fails configuration
+  instead of silently selecting contiguous Decode.
+- `HCU_STEP5_W4A8_MODE` is obsolete and produces a Step5-only warning. FP8
+  masked modes 1000/1001/1101 remain separate from contiguous Prefill modes.
+- TP token ownership padding, LL dispatch capacity, expert live-row counts,
+  and changed-input Graph replay contracts remain required. They are distinct
+  from the removed contiguous Decode padding plans.
+
+Step5-specific topology and offline EPLB policy live in the existing
+`runtime_compat/step5.py` owner. Native kernels and custom-op registration retain
+lazy provider imports. This integration is a source candidate; CPU and static
+checks do not establish native masked-kernel accuracy, model accuracy, or
+multi-node performance on a new wheel/environment.
+
+The inherited `VLLM_STEP5_MIXED_DENSE_INT8=dequant` BF16 diagnostic does not
+cover quantized MTP blocks: the MTP loader does not fold their INT8 weights.
+Do not use that combination as an MTP validation baseline. The normal mixed
+INT8 path and its MTP weight mapping remain separate from this diagnostic.
+
 ## Pending-region ownership
 
 Decode, speculative verification and mixed prefill schedules resolve and touch

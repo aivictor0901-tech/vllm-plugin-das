@@ -39,6 +39,8 @@ def _uses_global_pcp_batch(vllm_config) -> bool:
     parallel_config = getattr(vllm_config, "parallel_config", None)
     pcp_size = int(getattr(parallel_config, "prefill_context_parallel_size", 1))
     return is_glm53_pcp(vllm_config) or (pcp_size > 1 and is_deepseek_v4(vllm_config))
+
+
 from vllm_hcu.platforms import envs as henvs
 
 logger = init_logger(__name__)
@@ -257,6 +259,51 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
         finally:
             zeroer.owners = None
 
+    def capture_model(self, profile_only: bool = False):
+        from vllm_hcu.v1.step5_boundary import ENABLED, EARLY_SUFFIX, retain_graphs
+
+        if profile_only or not ENABLED or not is_step5_config(self.vllm_config):
+            return super().capture_model(profile_only=profile_only)
+        parallel = self.parallel_config
+        if (
+            parallel.pipeline_parallel_size != 1
+            or parallel.prefill_context_parallel_size != 1
+            or self.lora_config is not None
+        ):
+            raise ValueError("Step5 metadata overlap requires PP1/PCP1 without LoRA")
+        for groups in self.attn_groups:
+            for group in groups:
+                if getattr(group.get_metadata_builder(0), "aot_schedule", False):
+                    raise ValueError(
+                        "Step5 early graph work requires metadata-free SWA scheduling"
+                    )
+        if EARLY_SUFFIX:
+            from vllm_hcu.model_executor.layers.step4_dsa import Step4DSAMetadataBuilder
+
+            builders = [
+                group.get_metadata_builder(0)
+                for groups in self.attn_groups
+                for group in groups
+            ]
+            dsa_builders = [
+                builder
+                for builder in builders
+                if isinstance(builder, Step4DSAMetadataBuilder)
+            ]
+            if len(dsa_builders) != 1 or builders[-1] is not dsa_builders[0]:
+                raise ValueError(
+                    "Early Step5 suffix requires one final DSA metadata producer"
+                )
+        with retain_graphs(self.cudagraph_manager):
+            result = super().capture_model(profile_only=profile_only)
+        pairs = self.cudagraph_manager._step5_boundary_pairs
+        logger.info(
+            "[step5-boundary] retained %d target graphs; first partition: %s",
+            len(pairs),
+            next(iter(pairs.values())).stats,
+        )
+        return result
+
     def load_model(self, load_dummy_weights: bool = False) -> None:
         """Load and materialize derived weights in the worker weights pool."""
 
@@ -319,17 +366,13 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
         is_profiling=False,
         kv_cache_allocation_context=None,
     ):
-        pcp_size = int(
-            self.vllm_config.parallel_config.prefill_context_parallel_size
-        )
+        pcp_size = int(self.vllm_config.parallel_config.prefill_context_parallel_size)
         if (
             pcp_size > 1
             and len(kv_cache_config.kv_cache_groups) != 1
             and not _uses_global_pcp_batch(self.vllm_config)
         ):
-            raise ValueError(
-                "HCU PCP requires exactly one KV cache group."
-            )
+            raise ValueError("HCU PCP requires exactly one KV cache group.")
         from copy import deepcopy
 
         from vllm_hcu.v1.dsa_cache_layer_split import (
@@ -357,16 +400,14 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
             super_initialize_kv_cache = super().initialize_kv_cache
             import inspect
 
-            initialize_params = inspect.signature(
-                super_initialize_kv_cache
-            ).parameters
+            initialize_params = inspect.signature(super_initialize_kv_cache).parameters
             initialize_kwargs = {}
             if "is_profiling" in initialize_params:
                 initialize_kwargs["is_profiling"] = is_profiling
             if "kv_cache_allocation_context" in initialize_params:
-                initialize_kwargs[
-                    "kv_cache_allocation_context"
-                ] = kv_cache_allocation_context
+                initialize_kwargs["kv_cache_allocation_context"] = (
+                    kv_cache_allocation_context
+                )
             super_initialize_kv_cache(kv_cache_config, **initialize_kwargs)
         if pcp_size > 1 and self.pcp_manager is None:
             raise RuntimeError(
@@ -375,7 +416,10 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
         self._init_host_seq_lens()
         if not is_profiling:
             install_glm53_pcp_mtp_sync(self)
-        if is_step5_config(self.vllm_config) and getattr(self, "ubatch_runner", None) is not None:
+        if (
+            is_step5_config(self.vllm_config)
+            and getattr(self, "ubatch_runner", None) is not None
+        ):
             from vllm_hcu.v1.hcu_dbo import install_runner
 
             install_runner(self)
@@ -429,7 +473,12 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
                 self._hsl_resolve()
                 self._hsl_attach(input_batch)
                 from vllm_hcu.v1.step5_hot_context import check_hot_graph_context
-                check_hot_graph_context(input_batch, args[0] if args else None, getattr(self, "_step5_hot_context_real_batch", False))
+
+                check_hot_graph_context(
+                    input_batch,
+                    args[0] if args else None,
+                    getattr(self, "_step5_hot_context_real_batch", False),
+                )
             return original_prepare_attn(input_batch, *args, **kwargs)
 
         model_state.prepare_attn = prepare_attn
@@ -548,10 +597,7 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
                 dummy_scope = replicated_mtp_batch_scope()
         with deepep_auto_request_phase_scope(), scope, dummy_scope:
             dummy_phase = _DEEPEP_AUTO_DUMMY_PHASE.get()
-            if (
-                dummy_phase is not None
-                and get_hcu_config(self.vllm_config).deepep_auto
-            ):
+            if dummy_phase is not None and get_hcu_config(self.vllm_config).deepep_auto:
                 set_deepep_auto_request_phase(dummy_phase)
             if henvs.custom_ops_enabled() and is_step5_config(
                 getattr(self, "vllm_config", None)
@@ -659,9 +705,7 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
                     n = int(input_ids.shape[0])
                 else:
                     n = int(num_tokens)
-                hidden = torch.zeros(
-                    n, hidden_size, dtype=dtype, device=device
-                )
+                hidden = torch.zeros(n, hidden_size, dtype=dtype, device=device)
                 if use_aux:
                     return hidden, []
                 return hidden
@@ -740,7 +784,7 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
                 restored_residual = self.pcp_manager.restore_hidden_states(
                     residual[:num_local_tokens]
                 )
-                residual[:restored_residual.shape[0]].copy_(restored_residual)
+                residual[: restored_residual.shape[0]].copy_(restored_residual)
         if use_replicated_mtp_batch or restore_nonfinal_pp_batch:
             (
                 restored_hidden_states,

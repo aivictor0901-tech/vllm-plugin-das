@@ -1,0 +1,740 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Step5 routed experts: DeepEP HT prefill / LL decode, shared DeepGEMM weights.
+
+TP token ownership is handled by Step5's FusedMoEBlock before routing. This adapter never
+infers a phase from batch size and never caches a previous layer's routing.
+"""
+
+from functools import lru_cache
+import math
+import os
+
+import torch
+import triton
+import triton.language as tl
+import vllm.model_executor.layers.fused_moe  # initialize upstream before HCU
+import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+from vllm.logger import init_logger
+from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
+    TopKWeightAndReduceNoOP,
+)
+from vllm.model_executor.layers.fused_moe.utils import _resize_cache
+from vllm_hcu.model_executor.layers.fused_moe.experts.batched_deep_gemm_moe import (
+    BatchedDeepGemmExperts,
+)
+from vllm_hcu.model_executor.layers.fused_moe.experts.dpsk_v4_deep_gemm_moe import (
+    DeepEPAutoDeepGemmExperts,
+    DeepEPAutoW4A8Experts,
+    DeepEPDeepGemmContiguousExperts,
+    DeepEPDeepGemmMaskedExperts,
+)
+from vllm_hcu.model_executor.layers.fused_moe.step5_w4a8_kernels import (
+    activation_masked,
+)
+from vllm_hcu.model_executor.layers.fused_moe.step5_w4a8_policy import uses_step5_deepep
+
+logger = init_logger("vllm.hcu.step5_deepep")
+
+
+@lru_cache(maxsize=1)
+def decode_mode():
+    mode = int(os.environ.get("HCU_STEP5_FP8_DECODE_MODE", "1000"))
+    if mode not in (1000, 1001, 1101):
+        raise ValueError("HCU_STEP5_FP8_DECODE_MODE must be 1000, 1001 or 1101")
+    return mode
+
+
+def pack_decode_weight(weight):
+    import deepgemm
+
+    if decode_mode() == 1101:
+        # This byte permutation is different from gfx936's shuffled W6.
+        # The latter has the same shape but produces incorrect FP8 results.
+        from deepgemm.m_group_gemm import pack_int8_weight_enk_to_w6_low_latency_inplace
+
+        return pack_int8_weight_enk_to_w6_low_latency_inplace(weight).detach()
+    return deepgemm.marlin_fp8_masked_weight(weight).detach()
+
+
+def grouped_fp8(a, b, output, layout, expected_m, *, decode):
+    import deepgemm
+
+    if not decode:
+        return deepgemm.m_grouped_fp8_gemm_nt_contiguous(
+            a, b, output, layout, config={"MODE": 1000}
+        )
+    mode = decode_mode()
+    fn = (
+        deepgemm.m_grouped_fp8_gemm_nt_masked_ll
+        if mode == 1101
+        else deepgemm.m_grouped_fp8_gemm_nt_masked
+    )
+    expected_rank = 6 if mode == 1101 else 7
+    if b[0].ndim != expected_rank:
+        raise ValueError(
+            f"Step5 FP8 decode MODE={mode} requires rank-{expected_rank} weights"
+        )
+    return fn(a, b, output, layout, expected_m, config={"MODE": mode})
+
+
+def _gemm(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    out: torch.Tensor,
+    a_scale: torch.Tensor,
+    b_scale: torch.Tensor,
+    layout: torch.Tensor,
+    expected_m: int,
+    int4: bool,
+    masked: bool,
+) -> None:
+    if int4:
+        import deepgemm
+
+        fn = (
+            deepgemm.m_grouped_w4a8_gemm_nt_masked_hipc
+            if masked
+            else deepgemm.m_grouped_w4a8_gemm_nt_contiguous_hipc
+        )
+        if masked:
+            # Auto-selected large-M kernels require the canonical rank-3
+            # handle. The N32 view aliases the same packed bytes: reshape
+            # only the metadata, never repack weights on the forward path.
+            b = b.view(a.shape[0], out.shape[2], a.shape[2] // 2)
+        args = ((a, a_scale), (b, b_scale), out, layout)
+        # Masked kernels select the architecture/shape-specific plan from
+        # expected_m; contiguous HT keeps its existing weight/layout contract.
+        fn(
+            *args,
+            *([expected_m] if masked else []),
+            config=None if masked else {"MODE": 1002},
+        )
+    else:
+        grouped_fp8((a, a_scale), (b, b_scale), out, layout, expected_m, decode=masked)
+
+
+def _gemm_fake(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    out: torch.Tensor,
+    a_scale: torch.Tensor,
+    b_scale: torch.Tensor,
+    layout: torch.Tensor,
+    expected_m: int,
+    int4: bool,
+    masked: bool,
+) -> None:
+    pass
+
+
+@lru_cache(maxsize=1)
+def gemm_op():
+    try:
+        return torch.ops.vllm.step5_deepep_gemm.default
+    except AttributeError:
+        from vllm.utils.torch_utils import direct_register_custom_op
+
+        direct_register_custom_op(
+            op_name="step5_deepep_gemm",
+            op_func=_gemm,
+            mutates_args=["out"],
+            fake_impl=_gemm_fake,
+        )
+        return torch.ops.vllm.step5_deepep_gemm.default
+
+
+class Step5FP8HTExperts(DeepEPDeepGemmContiguousExperts):
+    _hcu_step5_owner = True
+
+    @staticmethod
+    def _supports_activation(activation):
+        return activation == MoEActivation.SWIGLUSTEP
+
+    @staticmethod
+    def adjust_N_for_activation(n, activation):
+        return n // 2
+
+    def apply(
+        self,
+        output,
+        hidden_states,
+        w1,
+        w2,
+        topk_weights,
+        topk_ids,
+        activation,
+        global_num_experts,
+        expert_map,
+        a1q_scale,
+        a2_scale,
+        workspace13,
+        workspace2,
+        expert_tokens_meta,
+        apply_router_weight_on_input,
+    ):
+        if apply_router_weight_on_input or activation != MoEActivation.SWIGLUSTEP:
+            raise ValueError("Step5 requires output-side weights and SwigluStep7")
+        from vllm_hcu.model_executor.layers.fused_moe.deep_gemm_utils import (
+            compute_aligned_M,
+            deepgemm_moe_permute,
+            deepgemm_unpermute_and_reduce,
+        )
+
+        if getattr(expert_tokens_meta, "_hcu_deepep_ht_local_counts", False):
+            expert_tokens_meta._hcu_step5_compact_rows = True
+        e, _, n, k, topk = self.moe_problem_size(hidden_states, w1, w2, topk_ids)
+        rows = compute_aligned_M(
+            topk_ids.shape[0], topk, e, self.ALIGNMENT, expert_tokens_meta
+        )
+        fused = getattr(expert_tokens_meta, "_hcu_step5_fused_scatter", None)
+        if fused is None:
+            gathered = _resize_cache(workspace13.view(hidden_states.dtype), (rows, k))
+            aq, scales, indices, inverse, _ = deepgemm_moe_permute(
+                aq=hidden_states,
+                aq_scale=self._ensure_2d_scale(a1q_scale),
+                topk_ids=topk_ids,
+                local_num_experts=e,
+                expert_map=expert_map,
+                expert_tokens_meta=expert_tokens_meta,
+                aq_out=gathered,
+            )
+        else:
+            aq, scales, indices, inverse = fused
+            rows = aq.shape[0]
+        gateup = _resize_cache(workspace2, (rows, n))
+        op = gemm_op()
+        op(
+            aq,
+            self._deepgemm_w13,
+            gateup,
+            scales.contiguous(),
+            self.w1_scale.contiguous(),
+            indices,
+            0,
+            False,
+            False,
+        )
+        # Preserve Step5's post-SiLU clamp and BF16 rounding; LightOp's
+        # pre-SiLU clamp API is a different activation and must not replace it.
+        q = _resize_cache(workspace13.view(torch.float8_e4m3fn), (rows, n // 2))
+        if n == 3072:
+            from vllm_hcu.model_executor.layers.fused_moe.ep_fused_moe import (
+                ep_swiglustep_quant_deepgemm,
+            )
+
+            q, qs = ep_swiglustep_quant_deepgemm(gateup, indices, q, limit=7.0)
+        else:
+            counts = torch.full((1,), rows, dtype=torch.int32, device=q.device)
+            qs = torch.empty((1, rows, 1), dtype=torch.float32, device=q.device)
+            activation_masked[(1, 8)](
+                gateup.view(1, rows, n),
+                q.view(1, rows, n // 2),
+                qs,
+                counts,
+                rows,
+                n // 2,
+                False,
+                triton.next_power_of_2(n // 2),
+                num_warps=4,
+            )
+            qs = qs.view(rows, 1)
+        down = _resize_cache(workspace2, (rows, k))
+        op(
+            q,
+            self._deepgemm_w2,
+            down,
+            qs.contiguous(),
+            self.w2_scale.contiguous(),
+            indices,
+            0,
+            False,
+            False,
+        )
+        deepgemm_unpermute_and_reduce(
+            a=down,
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+            inv_perm=inverse,
+            expert_map=expert_map,
+            output=output,
+        )
+        finish_scatter(expert_tokens_meta)
+
+
+class Step5LLExperts(BatchedDeepGemmExperts):
+    _hcu_step5_owner = True
+
+    @staticmethod
+    def _supports_activation(activation):
+        return activation == MoEActivation.SWIGLUSTEP
+
+    @staticmethod
+    def adjust_N_for_activation(n, activation):
+        return n // 2
+
+    def moe_problem_size(self, a1, w1, w2, topk_ids):
+        return (
+            a1.shape[0],
+            a1.shape[1],
+            self._hcu_logical_n,
+            self._hcu_logical_k,
+            topk_ids.shape[1],
+        )
+
+    def apply(
+        self,
+        output,
+        hidden_states,
+        w1,
+        w2,
+        topk_weights,
+        topk_ids,
+        activation,
+        global_num_experts,
+        expert_map,
+        a1q_scale,
+        a2_scale,
+        workspace13,
+        workspace2,
+        expert_tokens_meta,
+        apply_router_weight_on_input,
+    ):
+        if apply_router_weight_on_input or activation != MoEActivation.SWIGLUSTEP:
+            raise ValueError("Step5 requires output-side weights and SwigluStep7")
+        int4 = self.quant_config.weight_quant_dtype == "int4"
+        dtype = torch.int8 if int4 else torch.float8_e4m3fn
+        if (
+            hidden_states.dtype != dtype
+            or a1q_scale is None
+            or expert_tokens_meta is None
+        ):
+            raise ValueError(
+                "Step5 LL requires quantized input, scales and device expert counts"
+            )
+        e, capacity, k = hidden_states.shape
+        n = self._hcu_logical_n
+        if not capacity:
+            return
+        counts = expert_tokens_meta.expert_num_tokens
+        expected = max(
+            1,
+            math.ceil(
+                topk_ids.shape[0]
+                * topk_ids.shape[1]
+                * self.num_dispatchers
+                / global_num_experts
+            ),
+        )
+        gateup = _resize_cache(workspace13, (e, capacity, n))
+        op = gemm_op()
+        op(
+            hidden_states,
+            self._deepgemm_w13,
+            gateup,
+            a1q_scale.contiguous(),
+            self.w1_scale.contiguous(),
+            counts,
+            expected,
+            int4,
+            True,
+        )
+        q = _resize_cache(workspace2.view(dtype), (e, capacity, n // 2))
+        scales = torch.empty((e, capacity, 1), device=q.device, dtype=torch.float32)
+        # More independent row programs reduce tails from uneven expert loads.
+        activation_masked[(e, 32)](
+            gateup,
+            q,
+            scales,
+            counts,
+            capacity,
+            n // 2,
+            int4,
+            triton.next_power_of_2(n // 2),
+            ROWS=32,
+            num_warps=4,
+        )
+        op(
+            q,
+            self._deepgemm_w2,
+            output,
+            scales,
+            self.w2_scale.contiguous(),
+            counts,
+            expected,
+            int4,
+            True,
+        )
+
+
+class Step5FP8LLExperts(Step5LLExperts):
+    # Reuse the library-specific FP8 packers and logical-shape decoder.
+    process_weights_after_loading = (
+        DeepEPDeepGemmMaskedExperts.process_weights_after_loading
+    )
+    _can_pack_channel_weights = staticmethod(
+        DeepEPDeepGemmMaskedExperts._can_pack_channel_weights
+    )
+    _packed_deepgemm_problem_shape = staticmethod(
+        DeepEPDeepGemmMaskedExperts._packed_deepgemm_problem_shape
+    )
+    WEIGHT_LAYOUT = "masked"
+
+    def _pack_channel_weights(self, w13, w2):
+        return pack_decode_weight(w13), pack_decode_weight(w2)
+
+
+def finish_scatter(meta):
+    fused = getattr(meta, "_hcu_step5_fused_scatter", None)
+    guard = getattr(meta, "_hcu_step5_fused_scatter_guard", None)
+    if fused is not None and guard is not None:
+        stream = torch.cuda.current_stream()
+        for tensor in fused:
+            tensor.record_stream(stream)
+        event = torch.cuda.Event()
+        event.record(stream)
+        guard["last_use"] = event
+
+
+@lru_cache(maxsize=2)
+def auto_experts_class(int4):
+    base = DeepEPAutoW4A8Experts if int4 else DeepEPAutoDeepGemmExperts
+
+    class Step5AutoExperts(base):
+        _hcu_step5_owner = True
+
+        def __init__(
+            self,
+            moe_config,
+            quant_config,
+            max_num_tokens,
+            num_dispatchers,
+            fixed_use_low_latency=None,
+            global_ht_token_bound=False,
+        ):
+            self.moe_config = moe_config
+            self.quant_config = quant_config
+            self.max_num_tokens = max_num_tokens
+            self.num_dispatchers = num_dispatchers
+            self._fixed_use_low_latency = fixed_use_low_latency
+            self._global_ht_token_bound = global_ht_token_bound
+            self._use_low_latency_snapshot = bool(fixed_use_low_latency)
+            if int4:
+                from .step5_w4a8 import _make_experts_class
+
+                ht_type = _make_experts_class("prefill", "deepgemm")
+                ll_type = Step5LLExperts
+            else:
+                ht_type, ll_type = Step5FP8HTExperts, Step5FP8LLExperts
+            if fixed_use_low_latency is not True:
+                self.ht_experts = ht_type(moe_config, quant_config)
+            if fixed_use_low_latency is not False:
+                self.ll_experts = ll_type(
+                    moe_config,
+                    quant_config,
+                    max_num_tokens=max_num_tokens,
+                    num_dispatchers=num_dispatchers,
+                )
+            if fixed_use_low_latency is True:
+                self.ht_experts = self.ll_experts
+            elif fixed_use_low_latency is False:
+                self.ll_experts = self.ht_experts
+
+        @staticmethod
+        def _supports_activation(activation):
+            return activation == MoEActivation.SWIGLUSTEP
+
+        @staticmethod
+        def _supports_parallel_config(parallel_config):
+            return True
+
+        def process_weights_after_loading(self, layer):
+            base.process_weights_after_loading(self, layer)
+            if int4:
+                from .step5_w4a8 import _generation
+
+                layer._hcu_step5_w4a8_owner = _generation(layer)
+
+    return Step5AutoExperts
+
+
+def prepare_step5_deepep(method, layer, int4):
+    """Build the normal modular kernel, sharing the HT/LL communication handle."""
+    phase = os.environ.get("VLLM_HCU_STEP5_W4A8_PROFILE", "")
+    parallel = method.moe.moe_parallel_config
+    if phase in ("decode", "auto") and (
+        not getattr(parallel, "use_all2all_kernels", True)
+        or parallel.all2all_backend == "deepep_high_throughput"
+    ):
+        raise ValueError(
+            "Step5 Decode requires distributed EP with DeepEP masked experts; "
+            "local and fixed HT contiguous experts are Prefill-only"
+        )
+    from vllm.model_executor.layers.fused_moe.all2all_utils import (
+        maybe_make_prepare_finalize,
+    )
+    from vllm_hcu.model_executor.layers.fused_moe.prepare_finalize.deepep_auto import (
+        DeepEPAutoPrepareAndFinalize,
+    )
+
+    if not uses_step5_deepep(method.moe):
+        raise ValueError("Step5 DeepEP adapter requires a DeepEP backend")
+    from vllm_hcu.runtime_compat.step5 import allows_static_step5_ll_eplb
+
+    if method.moe.moe_parallel_config.enable_eplb and not allows_static_step5_ll_eplb(
+        method.moe
+    ):
+        raise ValueError("Step5 packed weights require static expert placement")
+    gemm_op()
+    shared_reduce_op()
+    restore_ll_op()
+    quant = method.get_fused_moe_quant_config(layer)
+    backend = method.moe.moe_parallel_config.all2all_backend
+    prepare_moe = method.moe
+    if backend == "deepep_low_latency" and method.moe.is_sequence_parallel:
+        from dataclasses import replace
+
+        # Each TP rank dispatches only its token shard. Keep the scheduler
+        # bound (including profiling/prefill), rounded up for LL alignment.
+        sp = method.moe.moe_parallel_config.sp_size
+        sender_tokens = (method.moe.max_num_tokens + sp - 1) // sp
+        prepare_moe = replace(
+            method.moe, max_num_tokens=((sender_tokens + 15) // 16) * 16
+        )
+    prepare = maybe_make_prepare_finalize(
+        moe=prepare_moe,
+        quant_config=quant,
+        routing_tables=layer._expert_routing_tables(),
+        allow_new_interface=True,
+        use_monolithic=False,
+    )
+    fixed = None
+    local = not method.moe.moe_parallel_config.use_all2all_kernels
+    if local:
+        # EP1 and ordinary TP need no DeepEP collective. Keep the same
+        # contiguous DeepGEMM experts and the framework's TP reduction.
+        fixed = False
+        ht = ll = prepare
+    elif not isinstance(prepare, DeepEPAutoPrepareAndFinalize):
+        if backend not in ("deepep_high_throughput", "deepep_low_latency"):
+            raise RuntimeError(
+                "Step5 DeepEP auto did not construct its prepare/finalize"
+            )
+        fixed = backend == "deepep_low_latency"
+        prepare = DeepEPAutoPrepareAndFinalize(
+            prepare, prepare, fixed_use_low_latency=fixed
+        )
+    else:
+        fixed = prepare._fixed_use_low_latency
+    if not local:
+        ht, ll = prepare.ht_prepare_finalize, prepare.ll_prepare_finalize
+    # INT8 dispatch is native. Channel FP8 remains FN, so use BF16 wire data
+    # and the FN receiver quantizer instead of silently reinterpreting FNUZ.
+    if fixed is not False:
+        ll.use_int8_dispatch = bool(int4)
+        ll.use_fp8_dispatch = False
+        ll.use_ue8m0_dispatch = False
+        ll._hcu_step5_live_row_fp8 = (
+            not int4
+            and quant.quant_dtype == torch.float8_e4m3fn
+            and quant.per_act_token_quant
+            and quant.block_shape is None
+        )
+    if fixed is True:
+        from .step5_ll_runtime import install_counter_reset
+
+        install_counter_reset(ll.buffer)
+    capacity = ll.max_num_tokens_per_rank() if fixed is not False else 1
+    experts = auto_experts_class(int4)(
+        method.moe,
+        quant,
+        capacity,
+        ht.num_dispatchers(),
+        fixed_use_low_latency=fixed,
+        global_ht_token_bound=(
+            method.moe.moe_parallel_config.pcp_size == 1
+            or bool(getattr(method.moe, "_hcu_global_ht_token_bound", False))
+        ),
+    )
+    experts.process_weights_after_loading(layer)
+    # A single HT scatter cache is reused across layers; last_use fences its
+    # lifetime. DBO buffer pairs are deliberately outside this adapter.
+    if (
+        not local
+        and fixed is not True
+        and int4
+        and os.environ.get("HCU_STEP5_DEEPEP_FUSED_SCATTER", "0") == "1"
+    ):
+        manager = None
+        from vllm.model_executor.layers.fused_moe.all2all_utils import (
+            get_ep_all2all_manager,
+        )
+
+        manager = get_ep_all2all_manager()
+        if not hasattr(manager, "_hcu_step5_scatter_buffers"):
+            manager._hcu_step5_scatter_buffers = {}
+            manager._hcu_step5_scatter_guards = {}
+        ht._hcu_step5_scatter_buffers = manager._hcu_step5_scatter_buffers
+        ht._hcu_step5_scatter_guards = manager._hcu_step5_scatter_guards
+        ht._hcu_step5_fused_scatter_enabled = True
+    method.moe_quant_config = quant
+    method.moe_kernel = mk.FusedMoEKernel(prepare, experts)
+    layer._hcu_step5_deepep = dict(
+        int4=int4,
+        backend=backend,
+        local_experts=layer.w13_weight.shape[0],
+        fixed_use_low_latency=fixed,
+        shared_w4_storage=bool(int4),
+    )
+    logger.info_once(
+        "[step5-deepep] HT/LL SwigluStep7, local_experts=%d, INT4=%s, backend=%s",
+        layer.w13_weight.shape[0],
+        int4,
+        backend,
+    )
+
+
+def pad_token_rows(x, multiple):
+    padding = (-x.shape[0]) % multiple
+    # Keep modulo padding in the dynamic graph. A Python ``if padding``
+    # specializes the no-pad sample and breaks vLLM's range-compiled graph
+    # when it is subsequently used for a non-divisible token count.
+    return torch.nn.functional.pad(x, (0, 0, 0, padding))
+
+
+def shared_expert_token_slice(shared, tp_group):
+    """Sum TP weight shards and scatter token rows in one collective."""
+    if tp_group.world_size == 1:
+        return shared
+    return shared_reduce_op()(shared, tp_group.world_size, tp_group.unique_name)
+
+
+def _shared_reduce_impl(x: torch.Tensor, tp_size: int, group_name: str) -> torch.Tensor:
+    from vllm.distributed import get_tp_group
+
+    group = get_tp_group()
+    if group.world_size != tp_size or group.unique_name != group_name:
+        raise RuntimeError("Step5 shared expert TP group changed")
+    # This branch runs inside the opaque op on real shapes, not in Dynamo.
+    padded = x if x.shape[0] % tp_size == 0 else pad_token_rows(x, tp_size)
+    return group.reduce_scatter(padded, dim=0)
+
+
+def _shared_reduce_fake(x: torch.Tensor, tp_size: int, group_name: str) -> torch.Tensor:
+    rows = (x.shape[0] + tp_size - 1) // tp_size
+    return x.new_empty((rows, *x.shape[1:]))
+
+
+@lru_cache(maxsize=1)
+def shared_reduce_op():
+    try:
+        return torch.ops.vllm.step5_shared_reduce_scatter.default
+    except AttributeError:
+        from vllm.utils.torch_utils import direct_register_custom_op
+
+        direct_register_custom_op(
+            op_name="step5_shared_reduce_scatter",
+            op_func=_shared_reduce_impl,
+            mutates_args=[],
+            fake_impl=_shared_reduce_fake,
+        )
+        return torch.ops.vllm.step5_shared_reduce_scatter.default
+
+
+@triton.jit
+def _ll_shared_routed_partial(
+    shared,
+    routed,
+    out,
+    N: tl.constexpr,
+    LOCAL_N: tl.constexpr,
+    H: tl.constexpr,
+    TP: tl.constexpr,
+    RANK: tl.constexpr,
+    BLOCK: tl.constexpr,
+    COUNTERS=None,
+    RESET_COUNTERS: tl.constexpr = False,
+):
+    if RESET_COUNTERS and tl.program_id(0) == 0:
+        tl.store(COUNTERS, 0)
+        tl.store(COUNTERS + 1, 0)
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    row = offsets // H
+    shared_value = tl.load(shared + offsets, mask=row < N, other=0.0).to(tl.float32)
+    local_offset = offsets - RANK * LOCAL_N * H
+    owner = (row >= RANK * LOCAL_N) & (row < (RANK + 1) * LOCAL_N)
+    routed_value = tl.load(routed + local_offset, mask=owner, other=0.0).to(tl.float32)
+    tl.store(out + offsets, shared_value + routed_value, mask=row < TP * LOCAL_N)
+
+
+def restore_ll_shared_and_routed(shared, routed, tp_group):
+    """Restore uniquely owned LL tokens and sum shared TP partials once."""
+    return restore_ll_op()(shared, routed, tp_group.world_size, tp_group.unique_name)
+
+
+def _restore_ll_impl(
+    shared: torch.Tensor, routed: torch.Tensor, tp_size: int, group_name: str
+) -> torch.Tensor:
+    from vllm.distributed import get_tp_group
+
+    group = get_tp_group()
+    if group.world_size != tp_size or group.unique_name != group_name:
+        raise RuntimeError("Step5 LL restore TP group changed")
+    if (
+        shared.dim() != 2
+        or routed.dim() != 2
+        or not shared.is_contiguous()
+        or not routed.is_contiguous()
+        or shared.shape[1] != routed.shape[1]
+        or routed.shape[0] != (shared.shape[0] + tp_size - 1) // tp_size
+    ):
+        raise ValueError("Step5 LL restore input/token ownership mismatch")
+    n, h = shared.shape
+    local_n = routed.shape[0]
+    out = torch.empty((local_n * tp_size, h), dtype=torch.float32, device=shared.device)
+    from .step5_ll_runtime import take_pending_counters, finish_pending_counter_reset
+
+    counters = take_pending_counters(shared.device)
+    if out.numel() or counters is not None:
+        _ll_shared_routed_partial[(max(1, triton.cdiv(out.numel(), 1024)),)](
+            shared,
+            routed,
+            out,
+            N=n,
+            LOCAL_N=local_n,
+            H=h,
+            TP=tp_size,
+            RANK=group.rank_in_group,
+            BLOCK=1024,
+            COUNTERS=counters,
+            RESET_COUNTERS=counters is not None,
+            num_warps=4,
+        )
+        finish_pending_counter_reset()
+    if tp_size > 1 and out.numel():
+        out = group.all_reduce(out)
+    return out
+
+
+def _restore_ll_fake(
+    shared: torch.Tensor, routed: torch.Tensor, tp_size: int, group_name: str
+) -> torch.Tensor:
+    return shared.new_empty(
+        (routed.shape[0] * tp_size, shared.shape[1]), dtype=torch.float32
+    )
+
+
+@lru_cache(maxsize=1)
+def restore_ll_op():
+    try:
+        return torch.ops.vllm.step5_ll_shared_restore.default
+    except AttributeError:
+        from vllm.utils.torch_utils import direct_register_custom_op
+
+        direct_register_custom_op(
+            op_name="step5_ll_shared_restore",
+            op_func=_restore_ll_impl,
+            mutates_args=[],
+            fake_impl=_restore_ll_fake,
+        )
+        return torch.ops.vllm.step5_ll_shared_restore.default

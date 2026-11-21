@@ -43,8 +43,7 @@ def _sidecar_config(config):
     if vllm_config is None:
         parallel_config = getattr(config, "moe_parallel_config", None)
         deepep_auto = bool(
-            getattr(parallel_config, "all2all_backend", None)
-            == "deepep_auto"
+            getattr(parallel_config, "all2all_backend", None) == "deepep_auto"
             or getattr(parallel_config, "use_deepep_auto_kernels", False)
         )
         official_backend = getattr(config, "moe_backend", "auto")
@@ -174,9 +173,14 @@ def apply_to_module(module: ModuleType) -> bool:
         is_channel_fp8 = (weight_key, activation_key) == channel_fp8_scheme
         if sidecar.deepep_auto:
             architectures = _model_architectures(config)
-            if not any(architecture in architectures for architecture in (
-                "DeepseekV4ForCausalLM", "DeepSeekV4MTPModel",
-            )):
+            step5_mixed = bool(getattr(config, "_hcu_step5_deepep_mixed_fp8", False))
+            if not step5_mixed and not any(
+                architecture in architectures
+                for architecture in (
+                    "DeepseekV4ForCausalLM",
+                    "DeepSeekV4MTPModel",
+                )
+            ):
                 raise ValueError(
                     "HCU Channel-FP8 deepep_auto is validated only for "
                     "DeepSeek-V4 and its native MTP draft; use an explicit "
@@ -186,8 +190,7 @@ def apply_to_module(module: ModuleType) -> bool:
                 )
             if sidecar.moe_backend not in ("auto", "deep_gemm"):
                 raise ValueError(
-                    "deepep_auto requires moe_backend='auto' or "
-                    "'deep_gemm'"
+                    "deepep_auto requires moe_backend='auto' or 'deep_gemm'"
                 )
             expected_backend = sidecar.moe_backend
             if getattr(config, "moe_backend", "auto") != expected_backend:
@@ -200,6 +203,12 @@ def apply_to_module(module: ModuleType) -> bool:
                     "deepep_auto HCU DeepGEMM supports only channel-wise "
                     "FP8 weights with dynamic per-token FP8 activations"
                 )
+            if step5_mixed:
+                from vllm_hcu.model_executor.layers.fused_moe.step5_deepep import (
+                    Step5FP8HTExperts,
+                )
+
+                return hcu_enum.HCU_DEEPGEMM, Step5FP8HTExperts
             from vllm_hcu.model_executor.layers.fused_moe.experts.dpsk_v4_deep_gemm_moe import (
                 DeepEPDeepGemmContiguousExperts,
             )
@@ -231,6 +240,13 @@ def apply_to_module(module: ModuleType) -> bool:
                 activation_key,
                 allow_vllm_cutlass,
             )
+        if getattr(config, "_hcu_step5_deepep_mixed_fp8", False):
+            # Fixed HT/LL uses the same Step5-specific load adapter as auto.
+            from vllm_hcu.model_executor.layers.fused_moe.step5_deepep import (
+                Step5FP8HTExperts,
+            )
+
+            return hcu_enum.HCU_DEEPGEMM, Step5FP8HTExperts
         activation_format = (
             target.mk.FusedMoEActivationFormat.BatchedExperts
             if config.moe_parallel_config.use_batched_activation_format
@@ -268,9 +284,10 @@ def apply_to_module(module: ModuleType) -> bool:
             return w13, w2, w13_scale, w2_scale
         if fp8_backend == hcu_enum.AITER:
             return w13, w2, w13_scale, w2_scale
-        if fp8_backend in (hcu_enum.DEEPGEMM, hcu_enum.BATCHED_DEEPGEMM) and getattr(
-            layer, "weight_block_size", None
-        ) is None:
+        if (
+            fp8_backend in (hcu_enum.DEEPGEMM, hcu_enum.BATCHED_DEEPGEMM)
+            and getattr(layer, "weight_block_size", None) is None
+        ):
             # Channel-FP8 on HCU DeepGemmExperts: the deepgemm FP8 grouped
             # kernels consume the Marlin 6D layout [E, K/64, N/16, 4, 16, 16],
             # mirroring hcu_convert_to_int8_moe_kernel_format.
@@ -313,7 +330,10 @@ def apply_to_module(module: ModuleType) -> bool:
                 )
 
                 ep_fused = supports_channel_ep_fused(
-                    w13, w2, w13_scale, w2_scale,
+                    w13,
+                    w2,
+                    w13_scale,
+                    w2_scale,
                     block_shape=getattr(layer, "weight_block_size", None),
                     activation=getattr(layer, "activation", None),
                     expert_map=getattr(layer, "expert_map", None),
@@ -391,9 +411,10 @@ def apply_to_module(module: ModuleType) -> bool:
             fp8_backend,
             routing_tables,
         )
-        if henvs.custom_ops_enabled() and os.environ.get(
-            "HCU_STEP5_DEEPEP_PROFILE_DBO_OUTPUT", "0"
-        ) == "1":
+        if (
+            henvs.custom_ops_enabled()
+            and os.environ.get("HCU_STEP5_DEEPEP_PROFILE_DBO_OUTPUT", "0") == "1"
+        ):
             from vllm_hcu.model_executor.layers.fused_moe.deepep_runtime import (
                 configure_step5_ht_kernel,
             )

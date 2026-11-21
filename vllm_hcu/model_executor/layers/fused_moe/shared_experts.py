@@ -38,7 +38,8 @@ logger = init_logger("vllm.hcu.shared_experts")
 # custom op, not the traced graph, so it must not change the compile hash.
 _LATE_STREAM_MIN_TOKENS = (
     int(os.environ.get("HCU_SHARED_EXPERTS_STREAM_MIN_TOKENS", "0"))
-    if henvs.custom_ops_enabled() else 0
+    if henvs.custom_ops_enabled()
+    else 0
 )
 _fused_router_stream_announced = False
 
@@ -149,9 +150,7 @@ class SharedExperts(torch.nn.Module):
                     f"{type(self._layer).__name__}.forward does not accept "
                     "x_and_scale_quanted"
                 )
-            hcu_forward = getattr(
-                self._layer, "_forward_with_hcu_quanted", None
-            )
+            hcu_forward = getattr(self._layer, "_forward_with_hcu_quanted", None)
             if callable(hcu_forward):
                 return hcu_forward(shared_experts_input, x_and_scale_quanted)
             return self._layer(
@@ -182,10 +181,7 @@ class SharedExperts(torch.nn.Module):
 
     @property
     def _disable_shared_experts_overlap(self) -> bool:
-        if (
-            henvs.VLLM_HCU_USE_CUSTOM_OPS
-            and henvs.VLLM_HCU_SHARED_EXPERTS_STREAM_FORCE
-        ):
+        if henvs.VLLM_HCU_USE_CUSTOM_OPS and henvs.VLLM_HCU_SHARED_EXPERTS_STREAM_FORCE:
             return False
         if self._can_overlap_deepep_eplb():
             return False
@@ -209,9 +205,11 @@ class SharedExperts(torch.nn.Module):
             "requires_main_stream_for_fused_activation",
             None,
         )
-        return bool(requires_main_stream(hidden_states)) if callable(
-            requires_main_stream
-        ) else False
+        return (
+            bool(requires_main_stream(hidden_states))
+            if callable(requires_main_stream)
+            else False
+        )
 
     def _determine_shared_experts_order(
         self,
@@ -261,9 +259,7 @@ class SharedExperts(torch.nn.Module):
             return SharedExpertsOrder.MULTI_STREAM_OVERLAPPED
         return SharedExpertsOrder.NO_OVERLAP
 
-    def maybe_launch_fused_router_activation(
-        self, hidden_states: torch.Tensor
-    ) -> bool:
+    def maybe_launch_fused_router_activation(self, hidden_states: torch.Tensor) -> bool:
         """Launch only after the internal router has handed off its activation.
 
         Take the cache on its producer stream, then record the dependency and
@@ -290,10 +286,12 @@ class SharedExperts(torch.nn.Module):
         activation = take(hidden_states)
         if activation is None:
             return False
-        assert activation.device == hidden_states.device
-        assert activation.shape[0] == hidden_states.shape[0]
+        tensors = activation if isinstance(activation, tuple) else (activation,)
+        assert all(value.device == hidden_states.device for value in tensors)
+        assert all(value.shape[0] == hidden_states.shape[0] for value in tensors)
         self._stream.wait_stream(current_stream())
-        activation.record_stream(self._stream)
+        for value in tensors:
+            value.record_stream(self._stream)
         with torch.cuda.stream(self._stream):
             self._output[index] = project(activation)
         self._output_pending_on_stream[index] = True
@@ -387,8 +385,10 @@ class SharedExperts(torch.nn.Module):
 
             if (
                 henvs.VLLM_HCU_USE_CUSTOM_OPS
-                and (henvs.VLLM_HCU_SHARED_EXPERTS_EARLY_LAUNCH
-                     or self._can_overlap_deepep_eplb())
+                and (
+                    henvs.VLLM_HCU_SHARED_EXPERTS_EARLY_LAUNCH
+                    or self._can_overlap_deepep_eplb()
+                )
                 and not self._late_stream(shared_experts_input)
             ):
                 if self._can_overlap_deepep_eplb():
@@ -465,8 +465,10 @@ class SharedExperts(torch.nn.Module):
         if (
             order == SharedExpertsOrder.MULTI_STREAM_OVERLAPPED
             and henvs.VLLM_HCU_USE_CUSTOM_OPS
-            and (henvs.VLLM_HCU_SHARED_EXPERTS_EARLY_LAUNCH
-                 or self._can_overlap_deepep_eplb())
+            and (
+                henvs.VLLM_HCU_SHARED_EXPERTS_EARLY_LAUNCH
+                or self._can_overlap_deepep_eplb()
+            )
             and self._output[self._output_idx] is not None
         ):
             return None
