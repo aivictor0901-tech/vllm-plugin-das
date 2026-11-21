@@ -159,9 +159,14 @@ not opt in by inheriting this setting.
   and changed-input Graph replay contracts remain required. They are distinct
   from the removed contiguous Decode padding plans.
 
-Step5-specific topology and offline EPLB policy live in the existing
-`runtime_compat/step5.py` owner. Native kernels and custom-op registration retain
-lazy provider imports. This integration is a source candidate; CPU and static
+`runtime_compat/step5.py` owns the Step5 W4A8 profile, topology and offline
+EPLB policy. The existing DeepGEMM API adapter owns lazy W4A8 op registration,
+and `v1/step5_metadata.py` owns the retained graph and its HIP partitioning.
+The Step5 expert providers, GPTQ conversion and INT8 kernels retain dedicated
+modules to keep their imports and custom ops behind the selected model path.
+The Step5 INT8 linear contract and DeepEP HT INT4 alignment require explicit
+Step5 layer or prepare/finalize ownership. The optional allocator cap applies
+to Step5 workers. This integration is a source candidate. CPU and static
 checks do not establish native masked-kernel accuracy, model accuracy, or
 multi-node performance on a new wheel/environment.
 

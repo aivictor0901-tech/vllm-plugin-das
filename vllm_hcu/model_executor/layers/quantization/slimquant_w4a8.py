@@ -230,7 +230,7 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
 
         self._step5_w4a8_profile = None
         if os.environ.get("VLLM_HCU_STEP5_W4A8_PROFILE"):
-            from vllm_hcu.model_executor.layers.fused_moe.step5_w4a8_policy import (
+            from vllm_hcu.runtime_compat.step5 import (
                 resolve_profile,
             )
 

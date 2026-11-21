@@ -99,6 +99,98 @@ def apply_int8_linear(
             f"{input.ndim} and {weight.ndim}"
         )
 
+    try:
+        from vllm_hcu.platforms import envs as henvs
+    except Exception as exc:
+        raise HcuInt8LinearError("HCU environment flags are unavailable") from exc
+
+    use_fused_input = (
+        bool(henvs.VLLM_HCU_USE_CUSTOM_OPS)
+        and (
+            bool(henvs.VLLM_HCU_USE_FUSED_SILU_MUL_QUANT)
+            or bool(henvs.VLLM_HCU_USE_FUSED_RMS_QUANT)
+        )
+        and x_and_scale_quanted is not None
+    )
+    if use_fused_input:
+        if (
+            not isinstance(x_and_scale_quanted, tuple)
+            or len(x_and_scale_quanted) != 2
+            or not all(isinstance(item, torch.Tensor) for item in x_and_scale_quanted)
+        ):
+            raise HcuInt8LinearError(
+                "fused HCU W8A8 input must be a (quantized_tensor, scale) tuple"
+            )
+        x_q, x_scale = x_and_scale_quanted
+    else:
+        try:
+            from lightop.quant import per_token_quant_int8
+        except (ImportError, AttributeError) as exc:
+            raise HcuInt8LinearError(
+                "HCU W8A8 linear requires lightop.quant.per_token_quant_int8"
+            ) from exc
+        x_q, x_scale = per_token_quant_int8(input)
+
+    if x_q.shape != input.shape or x_scale.shape != (*input.shape[:-1], 1):
+        raise HcuInt8LinearError(
+            "HCU W8A8 quantized input/scale shapes do not match the activation"
+        )
+    if x_q.dtype is not torch.int8 or x_scale.dtype is not torch.float32:
+        raise HcuInt8LinearError(
+            "HCU W8A8 requires an int8 activation and float32 per-token scale"
+        )
+    if weight.dtype is not torch.int8 or weight_scale.dtype is not torch.float32:
+        raise HcuInt8LinearError(
+            "HCU W8A8 requires int8 weights and float32 weight scales"
+        )
+
+    m = input.numel() // input.shape[-1]
+    n, k = weight.shape
+    if x_q.shape[-1] != k:
+        raise HcuInt8LinearError(
+            f"HCU W8A8 K mismatch: activation K={x_q.shape[-1]}, weight K={k}"
+        )
+    out_dtype = (
+        params_dtype
+        if params_dtype in (torch.bfloat16, torch.float16)
+        else torch.bfloat16
+    )
+    if bias is not None and bias.dtype is not out_dtype:
+        raise HcuInt8LinearError(
+            f"HCU W8A8 bias dtype {bias.dtype} does not match output {out_dtype}"
+        )
+
+    return _run_int8_linear(
+        input, weight, weight_scale, x_q, x_scale, m, n, k, out_dtype, bias,
+        normalize_weight_scale=False,
+    )
+
+
+def apply_step5_int8_linear(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    params_dtype: torch.dtype,
+    input_scale: torch.Tensor | None = None,
+    input_zero_point: torch.Tensor | None = None,
+    azp_adj: torch.Tensor | None = None,
+    bias: torch.Tensor | None = None,
+    x_and_scale_quanted: tuple[torch.Tensor, torch.Tensor] | None = None,
+) -> torch.Tensor:
+    """Apply symmetric W8A8 linear and preserve arbitrary token dimensions."""
+
+    del input_scale  # Dynamic and fused paths supply their actual per-token scale.
+    if input_zero_point is not None or azp_adj is not None:
+        raise HcuInt8LinearError(
+            "HCU hipBLASLt W8A8 linear supports symmetric activations only; "
+            "input_zero_point/azp_adj must be None"
+        )
+    if input.ndim < 2 or weight.ndim != 2:
+        raise HcuInt8LinearError(
+            f"HCU W8A8 linear expects input rank >=2 and weight rank 2, got "
+            f"{input.ndim} and {weight.ndim}"
+        )
+
     # Validate storage and geometry before any activation quantization. Empty
     # token owners in DeepEP must still reject malformed checkpoint metadata,
     # but must not launch a quantizer or a zero-M hipBLASLt GEMM.
@@ -159,6 +251,16 @@ def apply_int8_linear(
         x_q, x_scale = per_token_quant_int8(input)
         _validate_quantized_input(input, x_q, x_scale)
 
+    return _run_int8_linear(
+        input, weight, weight_scale, x_q, x_scale, m, n, k, out_dtype, bias,
+        normalize_weight_scale=True,
+    )
+
+
+def _run_int8_linear(
+    input, weight, weight_scale, x_q, x_scale, m, n, k, out_dtype, bias,
+    *, normalize_weight_scale,
+):
     try:
         from lightop.gemm_ops import hipblaslt_w8a8_gemm
     except (ImportError, AttributeError) as exc:
@@ -169,7 +271,8 @@ def apply_int8_linear(
     x_q_2d = x_q.reshape(m, k).contiguous()
     x_scale_2d = x_scale.reshape(m, 1).contiguous()
     weight = weight.contiguous()
-    weight_scale = weight_scale.reshape(n, 1).contiguous()
+    weight_scale = weight_scale.reshape(n, 1) if normalize_weight_scale else weight_scale
+    weight_scale = weight_scale.contiguous()
     try:
         status, output = hipblaslt_w8a8_gemm(
             x_q_2d,
@@ -193,7 +296,6 @@ def apply_int8_linear(
     if bias is not None:
         output = output + bias
     return output.view(*input.shape[:-1], n)
-
 
 __all__ = [
     "HcuInt8LinearError",

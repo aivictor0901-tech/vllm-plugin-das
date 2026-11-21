@@ -14,8 +14,10 @@ from types import ModuleType
 from vllm_hcu.deepseek_v4_runtime import (
     config_field,
     dspark_mooncake_pd_use_low_latency,
+    model_architectures,
 )
 from vllm_hcu.patch.config import HcuFeatureConfig, get_hcu_config
+from vllm_hcu.runtime_compat.step5 import is_step5_config
 
 from ._common import PatchCompatibilityError, apply_once, load_exact_module
 
@@ -37,20 +39,21 @@ _BOUND_CONFIGS: dict[
         HcuFeatureConfig,
         bool | None,
         int,
+        bool,
     ],
 ] = {}
 
 
 def _bound_policy(
     compilation_config: object,
-) -> tuple[HcuFeatureConfig, bool | None, int] | None:
+) -> tuple[HcuFeatureConfig, bool | None, int, bool] | None:
     with _BOUND_CONFIGS_LOCK:
         entry = _BOUND_CONFIGS.get(id(compilation_config))
         if entry is None:
             return None
-        reference, feature_config, fixed_use_low_latency, parallel_size = entry
+        reference, feature_config, fixed_use_low_latency, parallel_size, is_step5 = entry
         if reference() is compilation_config:
-            return feature_config, fixed_use_low_latency, parallel_size
+            return feature_config, fixed_use_low_latency, parallel_size, is_step5
         _BOUND_CONFIGS.pop(id(compilation_config), None)
         return None
 
@@ -58,6 +61,12 @@ def _bound_policy(
 def _bound_hcu_config(compilation_config: object) -> HcuFeatureConfig | None:
     policy = _bound_policy(compilation_config)
     return None if policy is None else policy[0]
+
+
+def is_bound_step5_compilation(compilation_config: object) -> bool:
+    """Whether the live compilation object belongs to a Step5 model."""
+    policy = _bound_policy(compilation_config)
+    return policy is not None and policy[3]
 
 
 def _parallel_size(vllm_config: object) -> int:
@@ -89,6 +98,10 @@ def bind_hcu_config(vllm_config: object) -> HcuFeatureConfig:
         compilation_config = getattr(vllm_config, "compilation_config", None)
     if compilation_config is None:
         raise PatchCompatibilityError("VllmConfig.compilation_config is missing")
+    step5_model = is_step5_config(vllm_config) or (
+        isinstance(vllm_config, Mapping)
+        and any(name.startswith("Step5") for name in model_architectures(vllm_config))
+    )
     key = id(compilation_config)
 
     def remove_binding(reference: weakref.ReferenceType[object]) -> None:
@@ -109,6 +122,7 @@ def bind_hcu_config(vllm_config: object) -> HcuFeatureConfig:
             feature_config,
             dspark_mooncake_pd_use_low_latency(vllm_config),
             _parallel_size(vllm_config),
+            step5_model,
         )
     return feature_config
 
@@ -191,7 +205,7 @@ def normalize_bound_deepep_auto_cudagraph_mode(vllm_config: object) -> object:
 
     from vllm.config.compilation import CUDAGraphMode
 
-    feature_config, fixed_use_low_latency, parallel_size = policy
+    feature_config, fixed_use_low_latency, parallel_size, _ = policy
     effective_mode, reason = _normalize_deepep_auto_cudagraph_mode(
         getattr(compilation_config, "cudagraph_mode", None),
         feature_config=feature_config,
@@ -289,8 +303,8 @@ def apply_to_module(module: ModuleType) -> bool:
     ):
         policy = _bound_policy(self)
         if policy is None:
-            policy = HcuFeatureConfig(), None, 1
-        feature_config, fixed_use_low_latency, bound_parallel_size = policy
+            policy = HcuFeatureConfig(), None, 1, False
+        feature_config, fixed_use_low_latency, bound_parallel_size, _ = policy
         self.cudagraph_mode, reason = _normalize_deepep_auto_cudagraph_mode(
             getattr(self, "cudagraph_mode", None),
             feature_config=feature_config,

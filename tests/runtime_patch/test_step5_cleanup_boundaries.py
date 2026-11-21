@@ -170,6 +170,45 @@ def test_dense_build_dependency_is_explicit(monkeypatch, build):
     extension = ns["ext_modules"][0]
     assert ("hipblaslt" in extension["libraries"]) is build
     assert ("vllm_hcu/csrc/step5_fp8_dense.cpp" in extension["sources"]) is build
+    assert extension["extra_compile_args"]["nvcc"] == ["-O3", "-fno-gpu-rdc"]
+
+
+@pytest.mark.parametrize("step5_layer", [False, True])
+def test_w8a8_dispatch_uses_step5_path_only_for_step5_linears(step5_layer):
+    fn = function(
+        "vllm_hcu/patch/worker/op_opt/patch_compressed_tensors_w8a8_int8.py",
+        "hcu_apply_weights",
+        dict(
+            _custom_quantization_enabled=lambda: True,
+            apply_int8_linear=lambda **kwargs: ("legacy", kwargs),
+            apply_step5_int8_linear=lambda **kwargs: ("step5", kwargs),
+        ),
+    )
+    layer = SimpleNamespace(weight=object(), weight_scale=object(), params_dtype=object())
+    if step5_layer:
+        layer._hcu_step5_int8_linear = True
+    pair = (object(), object())
+    route, args = fn(None, layer, object(), None, pair)
+    assert route == ("step5" if step5_layer else "legacy")
+    assert args["x_and_scale_quanted"] is pair
+
+
+def test_step5_int8_owner_covers_mtp_head_without_tagging_non_linear_layers():
+    class Linear:
+        pass
+
+    class MtpHead:
+        pass
+
+    mark = function(
+        "vllm_hcu/models/step5_text.py",
+        "_mark_step5_int8_linears",
+        dict(LinearBase=Linear, ParallelLMHead=MtpHead),
+    )
+    linear, head, other = Linear(), MtpHead(), SimpleNamespace()
+    mark(SimpleNamespace(modules=lambda: (linear, head, other)))
+    assert linear._hcu_step5_int8_linear and head._hcu_step5_int8_linear
+    assert not hasattr(other, "_hcu_step5_int8_linear")
 
 
 def test_retired_runtime_and_tuning_artifacts_are_absent():
@@ -283,7 +322,7 @@ def step5_decode_policy(monkeypatch):
         function("vllm_hcu/runtime_compat/step5.py", name, namespace)
     for name in ("uses_step5_deepep", "profile_for_model", "resolve_profile"):
         function(
-            "vllm_hcu/model_executor/layers/fused_moe/step5_w4a8_policy.py",
+            "vllm_hcu/runtime_compat/step5.py",
             name,
             namespace,
         )

@@ -1634,12 +1634,12 @@ class FusedMoEKernelModularImpl:
         expert_map: torch.Tensor | None,
     ) -> torch.Tensor | None:
         """See _DP_MOE_PIPE_MIN_TOKENS.  None: not applicable, nothing done."""
+        if not henvs.custom_ops_enabled():
+            return None
         if (
             getattr(self.fused_experts, "_hcu_step5_w4a8", False)
             and torch.cuda.is_current_stream_capturing()
         ):
-            return None
-        if not henvs.custom_ops_enabled():
             return None
         global _dp_pipe_stream, _dp_pipe_pending
         from vllm.distributed import get_dp_group

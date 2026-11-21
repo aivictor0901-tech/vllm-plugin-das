@@ -84,6 +84,7 @@ from vllm.model_executor.layers.fused_moe import (
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
+    LinearBase,
     LinearMethodBase,
     MergedColumnParallelLinear,
     QKVParallelLinear,
@@ -367,6 +368,12 @@ def _check_dense_int8_dtype(
             "the quantization config must target it or it needs "
             "VLLM_STEP5_MIXED_DENSE_INT8=dequant."
         )
+
+
+def _mark_step5_int8_linears(model: nn.Module) -> None:
+    for layer in model.modules():
+        if isinstance(layer, (LinearBase, ParallelLMHead)):
+            layer._hcu_step5_int8_linear = True
 
 
 def _validate_int8_loaded_scales(module: nn.Module, loaded: set[str]) -> None:
@@ -1518,10 +1525,10 @@ class Step5Attention(nn.Module):
             raise ValueError("prequantized Step5 attention requires INT8 QKVG weights")
         if self.qkvg_int8_weight is not None:
             from vllm_hcu.model_executor.layers.quantization.int8_runtime import (
-                apply_int8_linear,
+                apply_step5_int8_linear,
             )
 
-            qkvg = apply_int8_linear(
+            qkvg = apply_step5_int8_linear(
                 hidden_states,
                 self.qkvg_int8_weight,
                 self.qkvg_int8_scale,
@@ -1741,7 +1748,7 @@ class FusedMoEBlock(nn.Module):
         self.fuse_all_reduce, reduce_results = _step5_moe_reduce_policy(
             self.tp_size, get_dp_group().world_size
         )
-        from vllm_hcu.model_executor.layers.fused_moe.step5_w4a8_policy import (
+        from vllm_hcu.runtime_compat.step5 import (
             uses_step5_deepep,
         )
 
@@ -2299,7 +2306,7 @@ class Step5Model(nn.Module):
         self.skipped_dsa_weights = 0
         self.gptq_w4a8 = False
         if os.environ.get("VLLM_HCU_STEP5_W4A8_PROFILE"):
-            from vllm_hcu.model_executor.layers.fused_moe.step5_w4a8_policy import (
+            from vllm_hcu.runtime_compat.step5 import (
                 compressed_w4a8_config,
             )
 
@@ -2757,6 +2764,7 @@ class Step5ForCausalLM(nn.Module, SupportsPP, MixtureOfExperts):
         else:
             self.lm_head = PPMissingLayer()
 
+        _mark_step5_int8_linears(self.model)
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors
         )

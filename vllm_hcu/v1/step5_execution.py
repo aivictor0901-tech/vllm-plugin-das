@@ -208,7 +208,7 @@ def execute_model(
         and batch_desc.num_ubatches == 1
         and getattr(self.cudagraph_manager, "_step5_boundary_enabled", False)
     ):
-        from vllm_hcu.v1.step5_boundary import start_prefix
+        from vllm_hcu.v1.step5_metadata import start_prefix
 
         prepared_model_inputs = self.model_state.prepare_inputs(
             input_batch, self.req_states
@@ -243,19 +243,19 @@ def execute_model(
                 [g for g in groups if not isinstance(g.kv_cache_spec, MambaSpec)]
                 for groups in attn_groups
             ]
-        from vllm_hcu.v1.step5_boundary import metadata_consumer_scope
         from contextlib import nullcontext
 
         early = boundary_started and getattr(
             self.cudagraph_manager, "_step5_boundary_early", False
         )
-        consumer_scope = (
-            metadata_consumer_scope(
+        if early:
+            from vllm_hcu.v1.step5_metadata import metadata_consumer_scope
+
+            consumer_scope = metadata_consumer_scope(
                 self.cudagraph_manager._step5_boundary_pairs[batch_desc]
             )
-            if early
-            else nullcontext()
-        )
+        else:
+            consumer_scope = nullcontext()
         with consumer_scope:
             attn_metadata = self.model_state.prepare_attn(
                 input_batch,

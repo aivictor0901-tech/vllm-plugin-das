@@ -17,7 +17,7 @@ from vllm.model_executor.layers.fused_moe import (
     UnquantizedFusedMoEMethod,
 )
 from vllm_hcu.platforms import envs as henvs
-from vllm_hcu.model_executor.layers.fused_moe.step5_w4a8_policy import (
+from vllm_hcu.runtime_compat.step5 import (
     compressed_w4a8_config,
     profile_for_model,
     static_agrs_local_experts,
@@ -192,7 +192,7 @@ class Step5BF16ToFP8MoEMethod(CompressedTensorsW8A8Fp8MoEMethod):
 
             prepare_step5_deepep(self, layer, int4=False)
         else:
-            from vllm_hcu.model_executor.layers.fused_moe.step5_fp8_agrs import (
+            from vllm_hcu.model_executor.layers.fused_moe.step5_deepep import (
                 prepare_step5_fp8_agrs,
             )
 
@@ -215,7 +215,7 @@ class Step5GPTQW4A8MoEMethod(SlimQuantW4A8Int8AiterMoEMethod):
         params_dtype,
         **attrs,
     ):
-        from vllm_hcu.ops.step5.w4a8 import gemm_backend, require_gemm_op
+        from vllm_hcu.model_executor.layers.fused_moe.deep_gemm_api_runtime import gemm_backend, require_gemm_op
 
         if gemm_backend() == "deepgemm" or uses_step5_deepep(self.moe):
             # Fail before reading the 335 GiB checkpoint when an incompatible

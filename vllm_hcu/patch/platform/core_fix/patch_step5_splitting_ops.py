@@ -9,6 +9,7 @@ from vllm_hcu.runtime_compat.step5_patch_contract import (
     require_signatures,
 )
 from ._common import load_exact_module, require_callable
+from .patch_compilation_config import is_bound_step5_compilation
 
 TARGET_MODULE = "vllm.config.compilation"
 PATCH_ID = "platform.core_fix.step5_splitting_ops"
@@ -48,8 +49,11 @@ def apply_to_module(module: ModuleType) -> bool:
                 os.environ.get("VLLM_HCU_STEP5_SWA_FUSED_QK", "0") == "1"
             )
             requested_ops = []
-            int8_epilogue = henvs.optional_custom_op_enabled(
-                os.environ.get("VLLM_HCU_STEP5_SWA_INT8_EPILOGUE", "0") == "1"
+            int8_epilogue = (
+                is_bound_step5_compilation(self)
+                and henvs.optional_custom_op_enabled(
+                    os.environ.get("VLLM_HCU_STEP5_SWA_INT8_EPILOGUE", "0") == "1"
+                )
             )
             if (fused_gate or int8_epilogue) and swa_fused_qk:
                 requested_ops.append("vllm::step5_swa_attention_gate_quant")

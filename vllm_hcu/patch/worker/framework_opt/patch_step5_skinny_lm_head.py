@@ -66,7 +66,7 @@ def apply_to_module(module: ModuleType) -> bool:
         ):
             from vllm_hcu.model_executor.layers import skinny_lm_head_int8
             from vllm_hcu.model_executor.layers.quantization.int8_runtime import (
-                apply_int8_linear,
+                apply_step5_int8_linear,
             )
 
             if not skinny_lm_head_int8.HcuLmHeadInt8Storage.matches(lm_head):
@@ -100,7 +100,7 @@ def apply_to_module(module: ModuleType) -> bool:
                 return skinny_lm_head_int8.skinny_w8a8_linear(
                     hidden_states, lm_head.weight, lm_head.weight_scale.reshape(-1)
                 )
-            return apply_int8_linear(
+            return apply_step5_int8_linear(
                 hidden_states,
                 lm_head.weight,
                 lm_head.weight_scale,

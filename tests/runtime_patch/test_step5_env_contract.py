@@ -4,6 +4,7 @@
 import subprocess
 import sys
 import warnings
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
@@ -93,3 +94,74 @@ def test_env_helpers_remain_dependency_light():
         text=True,
     )
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize(
+    ("architecture", "master", "fused_gate", "serialized", "expect_gate_split"),
+    [
+        ("Step5ForCausalLM", "1", "0", False, True),
+        ("Step5ForCausalLM", "1", "0", True, True),
+        ("Qwen3ForCausalLM", "1", "0", False, False),
+        ("Step5ForCausalLM", "0", "0", False, False),
+        ("Qwen3ForCausalLM", "1", "1", False, True),
+    ],
+)
+def test_swa_int8_split_uses_bound_step5_compilation_owner(
+    monkeypatch, architecture, master, fused_gate, serialized, expect_gate_split
+):
+    from vllm_hcu.patch.platform.core_fix import (
+        patch_compilation_config,
+        patch_step5_splitting_ops,
+    )
+
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", master)
+    monkeypatch.setenv("VLLM_HCU_STEP5_SWA_FUSED_QK", "1")
+    monkeypatch.setenv("VLLM_HCU_STEP5_SWA_INT8_EPILOGUE", "1")
+    monkeypatch.setenv("VLLM_HCU_STEP5_FUSED_GATE", fused_gate)
+
+    class CompilationConfig:
+        def __init__(self):
+            self.splitting_ops = None
+
+        def adjust_cudagraph_sizes_for_spec_decode(
+            self, uniform_decode_query_len, tensor_parallel_size
+        ):
+            return uniform_decode_query_len
+
+        def set_splitting_ops_for_v1(self, all2all_backend, data_parallel_size):
+            self.splitting_ops = ["vllm::baseline"]
+
+    target = ModuleType(patch_step5_splitting_ops.TARGET_MODULE)
+    target.CUDAGraphMode = SimpleNamespace(
+        NONE=object(),
+        FULL=object(),
+        PIECEWISE=object(),
+        FULL_AND_PIECEWISE=object(),
+        FULL_DECODE_ONLY=object(),
+    )
+    target.CompilationConfig = CompilationConfig
+    patch_compilation_config.apply_to_module(target)
+    patch_step5_splitting_ops.apply_to_module(target)
+    compilation = CompilationConfig()
+    if serialized:
+        config = {
+            "compilation_config": compilation,
+            "model_config": {"architectures": [architecture]},
+        }
+    else:
+        config = SimpleNamespace(
+            additional_config={},
+            compilation_config=compilation,
+            model_config=SimpleNamespace(
+                hf_config=SimpleNamespace(architectures=[architecture])
+            ),
+        )
+    patch_compilation_config.bind_hcu_config(config)
+    compilation.set_splitting_ops_for_v1("allgather_reducescatter", 8)
+
+    assert ("vllm::step5_swa_attention_gate_quant" in compilation.splitting_ops) is (
+        expect_gate_split
+    )
+    assert ("vllm::step5_swa_qk_norm_rope_cache" in compilation.splitting_ops) is (
+        master == "1"
+    )

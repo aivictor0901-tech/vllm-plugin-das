@@ -285,6 +285,14 @@ def _moe_forward(
     shared_input_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     layer = get_layer_from_name(_resolve_layer_name(layer_name))
+    shared_kwargs = (
+        dict(
+            shared_input_quanted=shared_input_quanted,
+            shared_input_scale=shared_input_scale,
+        )
+        if shared_input_quanted is not None
+        else {}
+    )
     return layer._forward_impl(
         hidden_states,
         router_logits,
@@ -294,8 +302,7 @@ def _moe_forward(
         scale=scale,
         topk_weights=topk_weights,
         topk_ids=topk_ids,
-        shared_input_quanted=shared_input_quanted,
-        shared_input_scale=shared_input_scale,
+        **shared_kwargs,
     )
 
 
@@ -337,6 +344,14 @@ def _moe_forward_shared(
     shared_input_scale: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     layer = get_layer_from_name(_resolve_layer_name(layer_name))
+    shared_kwargs = (
+        dict(
+            shared_input_quanted=shared_input_quanted,
+            shared_input_scale=shared_input_scale,
+        )
+        if shared_input_quanted is not None
+        else {}
+    )
     shared_output, fused_output = layer._forward_impl(
         hidden_states,
         router_logits,
@@ -346,8 +361,7 @@ def _moe_forward_shared(
         scale=scale,
         topk_weights=topk_weights,
         topk_ids=topk_ids,
-        shared_input_quanted=shared_input_quanted,
-        shared_input_scale=shared_input_scale,
+        **shared_kwargs,
     )
     if layer._ep_fused_combine:
         # Already a fresh all-reduce output that aliases no input.
@@ -1097,6 +1111,13 @@ class MoERunner(MoERunnerInterface):
 
         if (shared_input_quanted is None) != (shared_input_scale is None):
             raise ValueError("shared INT8 input requires both payload and scale")
+        # Existing runner adapters use the original argument list when no
+        # Step5 shared quantization pair was supplied.
+        shared_args = (
+            ()
+            if shared_input_quanted is None
+            else (shared_input_quanted, shared_input_scale)
+        )
 
         # Apply transform for routed experts (e.g., latent projection
         # for latent MoE)
@@ -1129,8 +1150,7 @@ class MoERunner(MoERunnerInterface):
             self.moe_config.hidden_dim_unpadded
             if self._quant_method.has_unpadded_output
             else 0,
-            shared_input_quanted,
-            shared_input_scale,
+            *shared_args,
         )
 
         #

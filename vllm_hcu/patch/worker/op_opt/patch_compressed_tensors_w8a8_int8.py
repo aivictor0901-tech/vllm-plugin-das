@@ -101,6 +101,7 @@ def apply_to_module(module: ModuleType) -> bool:
 
     from vllm_hcu.model_executor.layers.quantization.int8_runtime import (
         apply_int8_linear,
+        apply_step5_int8_linear,
     )
 
     @functools.wraps(original_process)
@@ -148,7 +149,12 @@ def apply_to_module(module: ModuleType) -> bool:
             # scales and zero points use the same rows as the GEMM.
             output = original_apply(self, layer, x.reshape(-1, x.shape[-1]), bias)
             return output.reshape(x.shape[:-1] + (output.shape[-1],))
-        return apply_int8_linear(
+        apply_linear = (
+            apply_step5_int8_linear
+            if getattr(layer, "_hcu_step5_int8_linear", False)
+            else apply_int8_linear
+        )
+        return apply_linear(
             input=x,
             weight=layer.weight,
             weight_scale=layer.weight_scale,

@@ -142,13 +142,13 @@ class HcuGPUWorker(Worker):
 
         step5_w4a8_profile = None
         if os.environ.get("VLLM_HCU_STEP5_W4A8_PROFILE"):
-            from vllm_hcu.model_executor.layers.fused_moe.step5_w4a8_policy import (
+            from vllm_hcu.runtime_compat.step5 import (
                 profile_for_model,
             )
 
             step5_w4a8_profile = profile_for_model(self.vllm_config)
         if step5_w4a8_profile is not None:
-            from vllm_hcu.ops.step5.w4a8 import require_gemm_op
+            from vllm_hcu.model_executor.layers.fused_moe.deep_gemm_api_runtime import require_gemm_op
 
             require_gemm_op()
         super().load_model(load_dummy_weights=load_dummy_weights)
@@ -341,7 +341,10 @@ class HcuGPUWorker(Worker):
             torch.accelerator.set_device_index(self.device)
 
             if os.environ.get("VLLM_HCU_ALLOCATOR_LIMIT_GIB") is not None:
-                apply_allocator_limit(self.device, torch)
+                from vllm_hcu.runtime_compat.step5 import is_step5_config
+
+                if is_step5_config(self.vllm_config):
+                    apply_allocator_limit(self.device, torch)
 
             current_platform.check_if_supports_dtype(self.model_config.dtype)
 

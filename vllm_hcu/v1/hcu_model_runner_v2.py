@@ -260,9 +260,16 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
             zeroer.owners = None
 
     def capture_model(self, profile_only: bool = False):
-        from vllm_hcu.v1.step5_boundary import ENABLED, EARLY_SUFFIX, retain_graphs
+        if (
+            profile_only
+            or not is_step5_config(self.vllm_config)
+            or os.environ.get("HCU_STEP5_METADATA_OVERLAP", "0") != "1"
+        ):
+            return super().capture_model(profile_only=profile_only)
 
-        if profile_only or not ENABLED or not is_step5_config(self.vllm_config):
+        from vllm_hcu.v1.step5_metadata import ENABLED, EARLY_SUFFIX, retain_graphs
+
+        if not ENABLED:
             return super().capture_model(profile_only=profile_only)
         parallel = self.parallel_config
         if (

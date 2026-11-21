@@ -373,27 +373,18 @@ class ProfileSelectionTest(unittest.TestCase):
             "re": re,
             "allows_static_step5_ll_eplb": lambda config: False,
         }
-        for relative_path, names in (
-            (
-                "vllm_hcu/runtime_compat/step5.py",
-                {"is_step5_config", "is_step5_owner"},
-            ),
-            (
-                "vllm_hcu/model_executor/layers/fused_moe/step5_w4a8_policy.py",
-                None,
-            ),
-        ):
-            path = root / relative_path
-            nodes = [
-                node
-                for node in ast.parse(path.read_text(encoding="utf-8")).body
-                if isinstance(node, ast.FunctionDef)
-                and (names is None or node.name in names)
-            ]
-            exec(
-                compile(ast.Module(body=nodes, type_ignores=[]), str(path), "exec"),
-                self.scope,
-            )
+        path = root / "vllm_hcu/runtime_compat/step5.py"
+        # Use the actual policy while substituting only the static EPLB gate.
+        nodes = [
+            node
+            for node in ast.parse(path.read_text(encoding="utf-8")).body
+            if isinstance(node, ast.FunctionDef)
+            and node.name != "allows_static_step5_ll_eplb"
+        ]
+        exec(
+            compile(ast.Module(body=nodes, type_ignores=[]), str(path), "exec"),
+            self.scope,
+        )
         config_module = ModuleType("vllm_hcu.patch.config")
         config_module.get_hcu_config = lambda config: config.additional_config
         modules = patch.dict("sys.modules", {config_module.__name__: config_module})

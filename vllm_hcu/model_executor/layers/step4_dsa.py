@@ -3896,7 +3896,7 @@ class Step4DSAState:
                     f"({self._decode_logits.shape[0]} group-major rows)."
                 )
             if fused and _METADATA_OVERLAP and widest > self.graph_regions:
-                from vllm_hcu.v1.step5_boundary import early_consumer_active
+                from vllm_hcu.v1.step5_metadata import early_consumer_active
 
                 if early_consumer_active():
                     raise RuntimeError(
@@ -3997,7 +3997,7 @@ class Step4DSAState:
                 else:
                     ev.record()
             if fused and _METADATA_OVERLAP:
-                from vllm_hcu.v1.step5_boundary import metadata_ready
+                from vllm_hcu.v1.step5_metadata import metadata_ready
 
                 metadata_ready()
         else:
@@ -4362,7 +4362,7 @@ class Step4Indexer:
         # Projection/Norm/RoPE read only the staged inputs and model weights.
         # The following summary update is the first GPU schedule consumer.
         if _METADATA_OVERLAP and self.slot == state.first_slot:
-            from vllm_hcu.v1.step5_boundary import mark_indexer_boundary
+            from vllm_hcu.v1.step5_metadata import mark_indexer_boundary
 
             mark_indexer_boundary()
         self._update_summaries(sched, index_k, index_z)

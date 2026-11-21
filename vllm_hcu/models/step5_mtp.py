@@ -38,6 +38,7 @@ from .step5_text import (
     _QUANT_TENSOR_SUFFIXES,
     _check_dense_int8_dtype,
     _fp32_gemma_rms_norm,
+    _mark_step5_int8_linears,
     _validate_int8_loaded_scales,
 )
 
@@ -300,6 +301,7 @@ class Step5MTP(nn.Module, MixtureOfExperts):
         self.model = Step5MultiTokenPredictor(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
+        _mark_step5_int8_linears(self.model)
         # Initialize MoE metadata (simplified for vLLM 0.28)
         self.num_moe_layers = 0
         self.num_expert_groups = 1

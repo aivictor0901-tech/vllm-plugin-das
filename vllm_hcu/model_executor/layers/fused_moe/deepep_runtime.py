@@ -630,7 +630,10 @@ def ht_do_dispatch(
                 (
                     quant_config.use_int8_w8a8
                     or quant_config.use_fp8_w8a8
-                    or getattr(quant_config, "weight_quant_dtype", None) == "int4"
+                    or (
+                        getattr(self, "_hcu_step5_align_int4", False)
+                        and getattr(quant_config, "weight_quant_dtype", None) == "int4"
+                    )
                 )
                 and quant_config.is_per_act_token
                 and not quant_config.is_block_quantized
