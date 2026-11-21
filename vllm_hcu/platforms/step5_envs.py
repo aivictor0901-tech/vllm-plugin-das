@@ -38,6 +38,10 @@ def warn_ignored_step5_envs() -> None:
 
 
 ENVIRONMENT_VARIABLES = {
+    # One cache factor covers metadata update graphs and prefix/suffix overlap.
+    "HCU_STEP5_METADATA_OVERLAP": lambda: (
+        os.getenv("HCU_STEP5_METADATA_OVERLAP", "0") == "1"
+    ),
     "VLLM_STEP5_LIGHTOP_SPEC_INDEXER": lambda: (
         os.getenv("VLLM_STEP5_LIGHTOP_SPEC_INDEXER", "0") == "1"
     ),

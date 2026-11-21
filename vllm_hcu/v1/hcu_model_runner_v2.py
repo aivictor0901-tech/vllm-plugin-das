@@ -257,6 +257,36 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
         finally:
             zeroer.owners = None
 
+    def capture_model(self, profile_only: bool = False):
+        from vllm_hcu.v1.step5_boundary import ENABLED, EARLY_SUFFIX, retain_graphs
+
+        if profile_only or not ENABLED or not is_step5_config(self.vllm_config):
+            return super().capture_model(profile_only=profile_only)
+        parallel = self.parallel_config
+        if (parallel.pipeline_parallel_size != 1
+                or parallel.prefill_context_parallel_size != 1
+                or self.lora_config is not None):
+            raise ValueError("Step5 metadata overlap requires PP1/PCP1 without LoRA")
+        for groups in self.attn_groups:
+            for group in groups:
+                if getattr(group.get_metadata_builder(0), "aot_schedule", False):
+                    raise ValueError("Step5 early graph work requires metadata-free SWA scheduling")
+        if EARLY_SUFFIX:
+            from vllm_hcu.model_executor.layers.step4_dsa import Step4DSAMetadataBuilder
+
+            builders = [group.get_metadata_builder(0)
+                        for groups in self.attn_groups for group in groups]
+            dsa_builders = [builder for builder in builders
+                            if isinstance(builder, Step4DSAMetadataBuilder)]
+            if len(dsa_builders) != 1 or builders[-1] is not dsa_builders[0]:
+                raise ValueError("Early Step5 suffix requires one final DSA metadata producer")
+        with retain_graphs(self.cudagraph_manager):
+            result = super().capture_model(profile_only=profile_only)
+        pairs = self.cudagraph_manager._step5_boundary_pairs
+        logger.info("[step5-boundary] retained %d target graphs; first partition: %s",
+                    len(pairs), next(iter(pairs.values())).stats)
+        return result
+
     def load_model(self, load_dummy_weights: bool = False) -> None:
         """Load and materialize derived weights in the worker weights pool."""
 
