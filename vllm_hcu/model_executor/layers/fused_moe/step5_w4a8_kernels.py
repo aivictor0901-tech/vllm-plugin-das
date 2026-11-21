@@ -7,10 +7,10 @@ from .step5_w4a8_policy import padded_route_rows
 
 @triton.jit
 def activation_masked(x, q, scale, counts, CAP: tl.constexpr, I: tl.constexpr,
-                      INT8: tl.constexpr, BLOCK: tl.constexpr):
+                      INT8: tl.constexpr, BLOCK: tl.constexpr, ROWS: tl.constexpr = 8):
     """Existing Step5 activation math over valid expert rows only."""
     expert = tl.program_id(0)
-    for row in range(tl.program_id(1), tl.minimum(tl.load(counts + expert), CAP), 8):
+    for row in range(tl.program_id(1), tl.minimum(tl.load(counts + expert), CAP), ROWS):
         col = tl.arange(0, BLOCK)
         offset = (expert.to(tl.int64) * CAP + row) * 2 * I + col
         gate = tl.load(x + offset, mask=col < I, other=0).to(tl.float32)
