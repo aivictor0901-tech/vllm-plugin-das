@@ -149,7 +149,8 @@ ext_modules = [
             [('VLLM_HCU_BUILD_STEP5_DENSE', '1')] if _BUILD_STEP5_DENSE else []),
         extra_compile_args={
             'cxx': ['-O3'],
-            'nvcc': ['-O3', '-fno-gpu-rdc']
+            # Keep the remaining plugin kernels on the validated HCU ABI.
+            'nvcc': ['-O3', '-fno-gpu-rdc', '-mcode-object-version=5']
         }
     )
 ]
@@ -205,6 +206,7 @@ setup(
             "csrc/*.cuh",
             "csrc/*.cu",
             "csrc/*.cpp",
+            "csrc/*_LICENSE",
         ]
     },
     ext_modules=ext_modules,
