@@ -14,6 +14,18 @@ def ep_shared_add_allowed():
     return _ep_shared_add_allowed.get()
 
 
+def early_ep_combine_allowed(sizes):
+    """Gate the early shared+routed collective using the global DP layout.
+
+    Shared experts choose inline/auxiliary execution from the local row count.
+    Uneven DP batches can therefore have shared output ready on only some EP
+    ranks. Those ranks must not enter EP all-reduce while peers enter the
+    ordinary DP reduce-scatter. Leave uneven batches to normal finalize/tail;
+    the uniform Decode fast path still folds both reductions into one.
+    """
+    return bool(sizes) and len(set(sizes)) == 1
+
+
 @contextmanager
 def suspend_ep_shared_add():
     """A pipeline that owns combine must leave shared output to its runner."""
