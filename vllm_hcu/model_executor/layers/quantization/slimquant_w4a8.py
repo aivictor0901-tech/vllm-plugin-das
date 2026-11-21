@@ -740,6 +740,8 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
             native_expert_map, _ = resolve_aiter_expert_maps(
                 getattr(layer, "expert_map", None),
                 global_num_experts,
+                # Modular experts consume the native map, not AITER's mask.
+                create_mask=False,
             )
             return moe_kernel.apply(
                 hidden_states=expert_input,

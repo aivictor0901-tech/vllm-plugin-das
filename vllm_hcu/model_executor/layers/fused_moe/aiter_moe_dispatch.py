@@ -519,8 +519,14 @@ def _validate_expert_mapping_tensor(
 def resolve_aiter_expert_maps(
     expert_map: torch.Tensor | None,
     global_num_experts: int,
+    *,
+    create_mask: bool = True,
 ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
-    """Recover vLLM's native map and AITER's sentinel mask as a pair."""
+    """Recover the native map, optionally constructing AITER's sentinel mask.
+
+    Native-map-only consumers can skip mask construction. Already paired masks
+    are still validated and returned; no routing tensor is copied or cached.
+    """
 
     if expert_map is None:
         return None, None
@@ -547,6 +553,8 @@ def resolve_aiter_expert_maps(
             "AITER received an unpaired expert mask; the original vLLM "
             "global-to-local map is required for non-ASM routing and fallback"
         )
+    if not create_mask:
+        return expert_map, None
     sentinel = torch.zeros((1,), dtype=torch.int32, device=expert_map.device)
     expert_mask = torch.cat(((expert_map >= 0).to(torch.int32), sentinel))
     return expert_map, expert_mask
