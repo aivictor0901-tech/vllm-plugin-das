@@ -1847,9 +1847,7 @@ class FusedMoEBlock(nn.Module):
         install_int64_eplb_mapping(self.experts.router, vllm_config)
 
         if self._step5_ll_fused_restore:
-            from vllm_hcu.model_executor.layers.fused_moe.step5_ll_runtime import (
-                router_shared_op,
-            )
+            from vllm_hcu.models.step5.kernels import router_shared_op
 
             router_shared_op()
             self.experts._hcu_step5_ll_router_shared = self._ll_router_shared_eager

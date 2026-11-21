@@ -780,7 +780,7 @@ def prepare_step5_deepep(method, layer, int4):
             and quant.block_shape is None
         )
     if fixed is True:
-        from .step5_ll_runtime import install_counter_reset
+        from vllm_hcu.models.step5.kernels import install_counter_reset
 
         install_counter_reset(ll.buffer)
     capacity = ll.max_num_tokens_per_rank() if fixed is not False else 1
@@ -931,7 +931,10 @@ def _restore_ll_impl(
     n, h = shared.shape
     local_n = routed.shape[0]
     out = torch.empty((local_n * tp_size, h), dtype=torch.float32, device=shared.device)
-    from .step5_ll_runtime import take_pending_counters, finish_pending_counter_reset
+    from vllm_hcu.models.step5.kernels import (
+        finish_pending_counter_reset,
+        take_pending_counters,
+    )
 
     counters = take_pending_counters(shared.device)
     if out.numel() or counters is not None:
