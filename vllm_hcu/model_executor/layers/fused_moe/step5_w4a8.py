@@ -240,16 +240,24 @@ def _make_experts_class(phase, backend="deepgemm"):
                     raise ValueError("Step5 W4A8 fused scatter requires matching INT8 expert rows")
                 aligned = aq.shape[0]
             elif use_small:
-                aq, scales, indices, inverse, _ = small_permute(
-                    hidden_states,
-                    self._ensure_2d_scale(a1q_scale),
-                    topk_ids,
-                    expert_map,
-                    E,
-                    gathered,
-                    global_num_experts,
-                    alignment,
-                )
+                if os.getenv("VLLM_HCU_STEP5_LIGHTOP_INT8_PERMUTE", "0") == "1":
+                    from lightop.moe import ep_permute_int8_small
+
+                    aq, scales, indices, inverse = ep_permute_int8_small(
+                        hidden_states, self._ensure_2d_scale(a1q_scale),
+                        topk_ids, expert_map, E, alignment, gathered,
+                    )
+                else:
+                    aq, scales, indices, inverse, _ = small_permute(
+                        hidden_states,
+                        self._ensure_2d_scale(a1q_scale),
+                        topk_ids,
+                        expert_map,
+                        E,
+                        gathered,
+                        global_num_experts,
+                        alignment,
+                    )
             elif use_large64:
                 aq, scales, indices, inverse, _ = permute64(
                     hidden_states,
