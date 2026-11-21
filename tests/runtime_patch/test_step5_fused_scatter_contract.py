@@ -168,7 +168,7 @@ class FusedScatterContractTest(unittest.TestCase):
         buffer = object()
         key = (id(buffer), 0)
         pf = SimpleNamespace(
-            rank_expert_offset=0, buffer=buffer, num_dispatchers_=16,
+            rank_expert_offset=0, buffer=buffer,
             _hcu_step5_fused_scatter_enabled=scatter,
             _hcu_step5_scatter_buffers={key: (
                 Tensor((sum(counts), 4096)),

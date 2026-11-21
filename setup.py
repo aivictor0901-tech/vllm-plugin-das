@@ -62,7 +62,9 @@ def _sanitized_ninja_build():
                 error_prefix,
             )
         except RuntimeError as error:
-            raise RuntimeError(_sanitize_hcu_build_output(str(error))) from None
+            raise RuntimeError(
+                _sanitize_hcu_build_output(str(error))
+            ) from None
 
     torch_cpp_extension._run_ninja_build = run_ninja_build
     try:
@@ -128,7 +130,6 @@ def get_version() -> str:
     version_suffix = build_hcu_version()
     return f"{BASE_VERSION}+{version_suffix}"
 
-
 # =========================================================
 # --- 2. 定义 C++ 扩展模块 ---
 # =========================================================
@@ -137,24 +138,21 @@ _BUILD_STEP5_DENSE = os.getenv("VLLM_HCU_BUILD_STEP5_DENSE", "0") == "1"
 
 ext_modules = [
     CUDAExtension(
-        name="vllm_hcu.hcu_ops",
-        sources=[
-            "vllm_hcu/csrc/hcu_cache_kernel.cu",
-            "vllm_hcu/csrc/torch_bindings.cpp",
-            "vllm_hcu/csrc/custom_all_reduce.cu",
-            "vllm_hcu/csrc/fused_deepseek_v4_inv_rope_kernel.cu",
-        ]
-        + (["vllm_hcu/csrc/step5_fp8_dense.cpp"] if _BUILD_STEP5_DENSE else []),
-        libraries=["hipblaslt", "dl"] if _BUILD_STEP5_DENSE else [],
-        define_macros=[("TORCH_EXTENSION_NAME", "hcu_ops")]
-        + ([("VLLM_HCU_BUILD_STEP5_DENSE", "1")] if _BUILD_STEP5_DENSE else []),
+        name='vllm_hcu.hcu_ops',
+        sources=['vllm_hcu/csrc/hcu_cache_kernel.cu',
+                 'vllm_hcu/csrc/torch_bindings.cpp',
+                 'vllm_hcu/csrc/custom_all_reduce.cu',
+                 'vllm_hcu/csrc/fused_deepseek_v4_inv_rope_kernel.cu',
+                 ] + (['vllm_hcu/csrc/step5_fp8_dense.cpp'] if _BUILD_STEP5_DENSE else []),
+        libraries=['hipblaslt', 'dl'] if _BUILD_STEP5_DENSE else [],
+        define_macros=[('TORCH_EXTENSION_NAME', 'hcu_ops')] + (
+            [('VLLM_HCU_BUILD_STEP5_DENSE', '1')] if _BUILD_STEP5_DENSE else []),
         extra_compile_args={
-            "cxx": ["-O3"],
-            "nvcc": ["-O3", "-fno-gpu-rdc"],
-        },
+            'cxx': ['-O3'],
+            'nvcc': ['-O3', '-fno-gpu-rdc']
+        }
     )
 ]
-
 
 # =========================================================
 # --- 3. 自定义并行编译并拷贝的类 ---
@@ -188,7 +186,6 @@ class CustomBuildExt(BuildExtension.with_options(use_ninja=True)):
             shutil.copyfile(ext_path, target_path)
             print(f"\n[CustomBuildExt] Success: {file_name} -> {target_path}")
 
-
 # =========================================================
 # setup
 # =========================================================
@@ -208,12 +205,11 @@ setup(
             "csrc/*.cuh",
             "csrc/*.cu",
             "csrc/*.cpp",
-            "csrc/*_LICENSE",
         ]
     },
     ext_modules=ext_modules,
     cmdclass={
-        "build_ext": CustomBuildExt,
+        'build_ext': CustomBuildExt,
     },
     entry_points={
         "console_scripts": [
