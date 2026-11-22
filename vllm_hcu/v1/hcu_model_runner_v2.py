@@ -213,6 +213,12 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
         self._hsl_enabled = False
         self._hsl_pending = None
         self._hsl_batch = None
+        self._step5_decode_inputs = None
+        if (os.getenv("HCU_STEP5_CACHE_DECODE_METADATA") == "1"
+                and henvs.custom_ops_enabled() and is_step5_config(vllm_config)):
+            from vllm_hcu.v1.step5_decode_inputs import Step5DecodeInputs
+
+            self._step5_decode_inputs = Step5DecodeInputs()
 
     def _init_kv_zero_meta(self) -> None:
         """Build one upstream zeroer per cache group for mixed KV caches."""
@@ -542,11 +548,14 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
         return out
 
     def prepare_inputs(self, scheduler_output, batch_req_state, batch_desc):
-        input_batch = super().prepare_inputs(
-            scheduler_output,
-            batch_req_state,
-            batch_desc,
-        )
+        cache = self._step5_decode_inputs
+        if (cache is not None and scheduler_output.scheduled_spec_decode_tokens
+                and not batch_req_state.has_prefill and self.adaptive_verification is None
+                and self.pcp_manager is None and batch_desc.num_ubatches == 1
+                and batch_req_state.idx_mapping_np.dtype == np.int64):
+            input_batch = cache.prepare_inputs(self, scheduler_output, batch_req_state, batch_desc)
+        else:
+            input_batch = super().prepare_inputs(scheduler_output, batch_req_state, batch_desc)
         if self._hsl_enabled:
             # The mirror is resolved lazily in model_state.prepare_attn (see
             # _hsl_wrap_model_state), so all host work before the metadata
