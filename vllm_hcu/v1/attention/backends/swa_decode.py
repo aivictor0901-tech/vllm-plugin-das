@@ -107,15 +107,16 @@ def _swa_split_kernel(
         kb = _fp8e4m3_to_bf16(kb_r)
         va = _fp8e4m3_to_bf16(va_r)
         vb = _fp8e4m3_to_bf16(vb_r)
-        n1 = tl.minimum(n0 + BLOCK_N, end - 1)
-        page = tl.load(bt_row + n1 // PAGE).to(tl.int64)
-        n1 = (n1 // BLOCK_N) * BLOCK_N
-        kp = k_cache + page * stride_kb + (n1 % PAGE) * stride_ks + k_off
-        vp = v_cache + page * stride_vb + (n1 % PAGE) * stride_vs + v_off
-        ka_r = tl.load(kp + offs_d1[:, None])
-        kb_r = tl.load(kp + offs_d2[:, None])
-        va_r = tl.load(vp + offs_d1[None, :])
-        vb_r = tl.load(vp + offs_d2[None, :])
+        if n0 + BLOCK_N < end:
+            n1 = tl.minimum(n0 + BLOCK_N, end - 1)
+            page = tl.load(bt_row + n1 // PAGE).to(tl.int64)
+            n1 = (n1 // BLOCK_N) * BLOCK_N
+            kp = k_cache + page * stride_kb + (n1 % PAGE) * stride_ks + k_off
+            vp = v_cache + page * stride_vb + (n1 % PAGE) * stride_vs + v_off
+            ka_r = tl.load(kp + offs_d1[:, None])
+            kb_r = tl.load(kp + offs_d2[:, None])
+            va_r = tl.load(vp + offs_d1[None, :])
+            vb_r = tl.load(vp + offs_d2[None, :])
         s = tl.dot(qa, ka) + tl.dot(qb, kb)
         kpos = n0 + offs_n
         valid = (kpos[None, :] >= lo_row[:, None]) & (kpos[None, :] <= pos[:, None])

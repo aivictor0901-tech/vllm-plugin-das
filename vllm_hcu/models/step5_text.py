@@ -760,6 +760,7 @@ class BF16FP32RouterLinear(ReplicatedLinear):
     def _forward_fused_shared(
         self, x2: torch.Tensor,
         x_and_scale_quanted: tuple[torch.Tensor, torch.Tensor] | None = None,
+        *, router_tp_size: int = 1, router_tp_rank: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor] | None:
         if self._fused_shared_int8:
             from vllm_hcu.ops.step5.router_shared_int8 import usable_router_shared_int8
@@ -783,6 +784,7 @@ class BF16FP32RouterLinear(ReplicatedLinear):
                 mlp.limit,
                 workspace=self._rsg_int8_workspace,
                 x_and_scale_quanted=x_and_scale_quanted,
+                router_tp_size=router_tp_size, router_tp_rank=router_tp_rank,
             )
         from vllm_hcu.ops.step5.router_gemm import RSG_MAX_M
 
@@ -1785,6 +1787,18 @@ class FusedMoEBlock(nn.Module):
         """Keep shape-dependent dispatch inside the opaque runtime boundary."""
         quanted = None if xq is None else (xq, xs)
         if self.share_expert.requires_main_stream_for_fused_activation(full_input):
+            if (self.tp_size == 4 and getattr(self.gate, "_fused_shared_int8", False)
+                    and self.share_expert._shared_output_int8):
+                # All rows need the TP-sharded shared projection. Only the
+                # local rows need router logits before the LL dispatch.
+                self.share_expert.fused_act = None
+                fused = self.gate._forward_fused_shared(
+                    full_input, quanted, router_tp_size=self.tp_size,
+                    router_tp_rank=get_tp_group().rank_in_group,
+                )
+                if fused is not None:
+                    logits, activation = fused
+                    return self.share_expert.forward_fused_router_activation(activation), logits
             logits, activation = self.gate(full_input, x_and_scale_quanted=quanted)
             shared = (self.share_expert.forward_fused_router_activation(activation)
                       if activation is not None else self.share_expert(

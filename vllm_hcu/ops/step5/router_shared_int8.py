@@ -38,19 +38,40 @@ def _router_shared_int8_kernel(
     BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
     SPLIT_K: tl.constexpr,
     DEFER_SHARED: tl.constexpr = False,
+    ROUTER_TP_SIZE: tl.constexpr = 1, ROUTER_TP_RANK: tl.constexpr = 0,
 ):
     pid = tl.program_id(0)
     pid_k = tl.program_id(1)
     num_m = tl.cdiv(M, BM)
     R_TILES: tl.constexpr = tl.cdiv(NR, BN)
-    pid_n = pid // num_m
-    pid_m = pid % num_m
-    rm = pid_m * BM + tl.arange(0, BM)
-    mmask = rm < M
+    owner_rows = tl.cdiv(M, ROUTER_TP_SIZE)
+    owner_start = ROUTER_TP_RANK * owner_rows
+    if ROUTER_TP_SIZE == 1:
+        pid_n = pid // num_m
+        pid_m = pid % num_m
+        rm = pid_m * BM + tl.arange(0, BM)
+        mmask = rm < M
+        num_tiles = tl.num_programs(0)
+    else:
+        owner_m = tl.cdiv(owner_rows, BM)
+        router_tiles = R_TILES * owner_m
+        if pid < router_tiles:
+            pid_n = pid // owner_m
+            pid_m = pid % owner_m
+            rm = owner_start + pid_m * BM + tl.arange(0, BM)
+            mmask = (rm < M) & (rm < owner_start + owner_rows)
+        else:
+            shared_pid = pid - router_tiles
+            pid_n = R_TILES + shared_pid // num_m
+            pid_m = shared_pid % num_m
+            rm = pid_m * BM + tl.arange(0, BM)
+            mmask = rm < M
+        # The shared epilogue indexes the original, full-row split-K layout.
+        pid = pid_n * num_m + pid_m
+        num_tiles = num_m * (R_TILES + tl.cdiv(I, BN))
     k_per = K // SPLIT_K
     rk = pid_k * k_per + tl.arange(0, BK)
     tile = tl.arange(0, BM)[:, None] * BN + tl.arange(0, BN)[None, :]
-    num_tiles = tl.num_programs(0)
     base = partials_ptr + (pid_k * num_tiles + pid) * 2 * BM * BN
     if pid_n < R_TILES:
         rn = pid_n * BN + tl.arange(0, BN)
@@ -73,8 +94,12 @@ def _router_shared_int8_kernel(
             for s in tl.static_range(SPLIT_K):
                 bits = tl.load(partials_ptr + (s * num_tiles + pid) * 2 * BM * BN + tile)
                 total += bits.to(tl.float32, bitcast=True)
-            tl.store(logits_ptr + rm[:, None] * NR + rn[None, :], total,
-                     mask=mmask[:, None] & (rn[None, :] < NR))
+            local_row = rm - owner_start
+            if ROUTER_TP_SIZE > 1:
+                # Match the zeros from padding before the former rank slice.
+                total = tl.where(mmask[:, None], total, 0.)
+            tl.store(logits_ptr + local_row[:, None] * NR + rn[None, :], total,
+                     mask=(local_row < owner_rows)[:, None] & (rn[None, :] < NR))
             tl.atomic_xchg(counters_ptr + pid, 0, sem="relaxed", scope="gpu")
     else:
         rn = (pid_n - R_TILES) * BN + tl.arange(0, BN)
@@ -309,27 +334,31 @@ def _router_shared_int8_quant(
     x: torch.Tensor, w_router: torch.Tensor, w_gate_up: torch.Tensor,
     weight_scale: torch.Tensor, partials: torch.Tensor, counters: torch.Tensor,
     limit: float, xq: torch.Tensor | None = None, xs: torch.Tensor | None = None,
+    router_tp_size: int = 1, router_tp_rank: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     from lightop.quant import per_token_quant_int8
 
     m, k = x.shape
     nr = w_router.shape[1]
     width = w_gate_up.shape[0] // 2
-    logits = x.new_empty((m, nr), dtype=torch.float32)
+    if not 0 <= router_tp_rank < router_tp_size:
+        raise ValueError("invalid router TP rank or size")
+    owner_rows = triton.cdiv(m, router_tp_size)
+    logits = x.new_empty((owner_rows, nr), dtype=torch.float32)
     if m == 0:
         q = x.new_empty((m, width), dtype=torch.int8)
         scale = x.new_empty((m, 1), dtype=torch.float32)
         return logits, q, scale
     if xq is None:
         xq, xs = per_token_quant_int8(x)
-    tiles = triton.cdiv(m, _BM) * (triton.cdiv(nr, _BN) + triton.cdiv(width, _BN))
-    # The original GEMM tiles/layout are unchanged. Its shared epilogue is
-    # replaced by the same full-row LightOp operation used after hipBLASLt.
+    tiles = (triton.cdiv(owner_rows, _BM) * triton.cdiv(nr, _BN)
+             + triton.cdiv(m, _BM) * triton.cdiv(width, _BN))
     _router_shared_int8_kernel[(tiles, _SPLIT_K)](
         x, xq, xs, w_router, w_gate_up, weight_scale,
         logits, x, partials, counters, m, k, x.stride(0), w_router.stride(0),
         NR=nr, I=width, LIMIT=limit, BM=_BM, BN=_BN, BK=_BK, SPLIT_K=_SPLIT_K,
-        DEFER_SHARED=True, num_warps=_WARPS, num_stages=_STAGES,
+        DEFER_SHARED=True, ROUTER_TP_SIZE=router_tp_size, ROUTER_TP_RANK=router_tp_rank,
+        num_warps=_WARPS, num_stages=_STAGES,
     )
     q, scale = torch.ops.vllm.step5_shared_int8_epilogue(
         partials, xs, weight_scale, nr, limit,
@@ -339,9 +368,11 @@ def _router_shared_int8_quant(
 
 def _router_shared_int8_quant_fake(
     x, w_router, w_gate_up, weight_scale, partials, counters, limit, xq=None, xs=None,
+    router_tp_size=1, router_tp_rank=0,
 ):
+    owner_rows = (x.shape[0] + router_tp_size - 1) // router_tp_size
     return (
-        x.new_empty((x.shape[0], w_router.shape[1]), dtype=torch.float32),
+        x.new_empty((owner_rows, w_router.shape[1]), dtype=torch.float32),
         x.new_empty((x.shape[0], w_gate_up.shape[0] // 2), dtype=torch.int8),
         x.new_empty((x.shape[0], 1), dtype=torch.float32),
     )
@@ -359,6 +390,7 @@ def router_shared_swiglustep_int8(
     workspace: tuple[torch.Tensor, torch.Tensor] | None = None,
     x_and_scale_quanted: tuple[torch.Tensor, torch.Tensor] | None = None,
     quantized_output: bool = False,
+    router_tp_size: int = 1, router_tp_rank: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor | tuple[torch.Tensor, torch.Tensor]]:
     """Return FP32 router logits and shared activation from checkpoint INT8 weights.
 
@@ -396,11 +428,14 @@ def router_shared_swiglustep_int8(
         or partials.numel() < _SPLIT_K * tiles * 2 * _BM * _BN
     ):
         raise ValueError("invalid private router/shared INT8 workspace")
+    if not quantized_output and (router_tp_size, router_tp_rank) != (1, 0):
+        raise ValueError("sharded router logits require the quantized shared epilogue")
     if quantized_output:
         if I not in (384, 1536):
             raise ValueError("shared INT8 epilogue requires a TP4 or TP1 shard")
         logits, q, scale = torch.ops.vllm.step5_router_shared_int8_quant(
             x, w_router, w_gate_up, weight_scale, partials, counters, float(limit), xq, xs,
+            router_tp_size, router_tp_rank,
         )
         return logits, (q, scale)
     return torch.ops.vllm.step5_router_shared_int8(
