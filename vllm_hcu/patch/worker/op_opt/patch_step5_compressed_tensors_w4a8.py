@@ -138,6 +138,83 @@ def _step5_method_class():
             )
 
         _boltops = False
+        _deepgemm_experts = None
+
+        def _uses_deepgemm(self) -> bool:
+            return getattr(self.moe, "moe_backend", "auto") == "deep_gemm"
+
+        def _process_deepgemm_weights(self, layer):
+            # naive / all-gather dispatch hands the experts gathered tokens;
+            # DeepEP high-throughput only moves tokens and gets its own
+            # modular kernel (built below, after the weights are packed).
+            parallel = getattr(self.moe, "moe_parallel_config", None)
+            if getattr(parallel, "all2all_backend", None) not in (
+                None,
+                "naive",
+                "allgather_reducescatter",
+                "deepep_high_throughput",
+            ):
+                raise ValueError(
+                    "Step5 W4A8 --moe-backend deep_gemm supports naive, "
+                    "allgather_reducescatter or deepep_high_throughput "
+                    "dispatch only"
+                )
+            if self._deepgemm_experts is not None:
+                return
+            from vllm_hcu.model_executor.layers.quantization.step5_w4a8_deepgemm import (
+                Step5W4A8DeepGemmExperts,
+            )
+
+            self._supports_int8_allgatherv_input = False
+            self.moe_quant_config = self.get_fused_moe_quant_config(layer)
+            experts = Step5W4A8DeepGemmExperts(self.moe, self.moe_quant_config)
+            # Repacks layer.w13/w2_weight in place; HIPC may pad the gate/up
+            # scale, so rebuild the config from the registered Parameters.
+            experts.process_weights_after_loading(layer)
+            self.moe_quant_config = self.get_fused_moe_quant_config(layer)
+            self._deepgemm_experts = experts
+            if self._uses_deepep_ht():
+                from vllm_hcu.model_executor.layers.quantization.step5_w4a8_deepgemm import (
+                    make_step5_marlin_ht_kernel,
+                )
+
+                routing_tables = getattr(layer, "_expert_routing_tables", None)
+                self.moe_kernel = make_step5_marlin_ht_kernel(
+                    experts,
+                    self.moe_quant_config,
+                    self.moe,
+                    routing_tables() if callable(routing_tables) else None,
+                )
+                fused_experts = getattr(self.moe_kernel, "fused_experts", None)
+                getattr(fused_experts, "experts", fused_experts).process_weights_after_loading(
+                    layer
+                )
+            logger.info_once(
+                "Step5 CT W4A8: packed INT4 experts on lightop Marlin "
+                "W4A8 grouped GEMM"
+            )
+
+        def _build_deepep_ht_kernel(self, layer):
+            from vllm_hcu.model_executor.layers.fused_moe.experts.step5_aiter_w4a8_moe import (
+                make_step5_aiter_w4a8_ht_kernel,
+            )
+
+            if self.moe_quant_config is None:
+                self.moe_quant_config = self.get_fused_moe_quant_config(layer)
+            routing_tables = getattr(layer, "_expert_routing_tables", None)
+            self.moe_kernel = make_step5_aiter_w4a8_ht_kernel(
+                self,
+                self.moe_quant_config,
+                self.moe,
+                routing_tables() if callable(routing_tables) else None,
+            )
+            fused_experts = getattr(self.moe_kernel, "fused_experts", None)
+            experts = getattr(fused_experts, "experts", fused_experts)
+            experts.process_weights_after_loading(layer)
+
+        def _uses_deepep_ht(self) -> bool:
+            parallel = getattr(self.moe, "moe_parallel_config", None)
+            return getattr(parallel, "all2all_backend", None) == "deepep_high_throughput"
 
         def _uses_boltops(self) -> bool:
             """Packed INT4 W4A8 through BoltOps instead of the AITER MOE_C GEMMs.
@@ -148,9 +225,6 @@ def _step5_method_class():
             calls it).
             """
 
-            uses_deepep_ht = getattr(self, "_uses_deepep_ht", None)
-            if callable(uses_deepep_ht) and uses_deepep_ht():
-                return False
             choice = os.environ.get("VLLM_HCU_STEP5_W4A8_BACKEND", "auto").strip().lower()
             if choice == "aiter":
                 return False
@@ -178,10 +252,22 @@ def _step5_method_class():
             )
 
         def process_weights_after_loading(self, layer):
-            if self._uses_boltops():
+            activation = getattr(self.moe.activation, "value", self.moe.activation)
+            if activation == "swiglustep" and getattr(layer, "swiglu_limit", None) is None:
+                layer.swiglu_limit = 7.0
+            if self._uses_deepgemm():
+                self._process_deepgemm_weights(layer)
+            elif self._uses_boltops():
                 self._process_boltops_weights(layer)
+                if self._uses_deepep_ht() and self.moe_kernel is None:
+                    # DeepEP moves tokens; its experts class then calls BoltOps.
+                    self._build_deepep_ht_kernel(layer)
             else:
                 super().process_weights_after_loading(layer)
+                if self._uses_deepep_ht() and self.moe_kernel is None:
+                    # DeepEP moves tokens, so INT8 all-gather input does not apply.
+                    self._supports_int8_allgatherv_input = False
+                    self._build_deepep_ht_kernel(layer)
             for name in (
                 "w13_weight_packed",
                 "w2_weight_packed",
@@ -203,7 +289,7 @@ def _step5_method_class():
             output_dtype=None,
             **kwargs,
         ):
-            if self._boltops:
+            if self._boltops and self.moe_kernel is None:
                 if i_q is not None:
                     raise RuntimeError(
                         "Step5 W4A8 BoltOps does not consume INT8 AllGatherv input"
@@ -217,17 +303,56 @@ def _step5_method_class():
                 return apply_step5_boltops_w4a8_moe(
                     self, layer, x, topk_weights, topk_ids
                 )
-            return super().apply(
+            experts = self._deepgemm_experts
+            if experts is None or self.moe_kernel is not None:
+                return super().apply(
+                    layer,
+                    x,
+                    topk_weights,
+                    topk_ids,
+                    shared_experts,
+                    shared_experts_input,
+                    i_q=i_q,
+                    i_s=i_s,
+                    output_dtype=output_dtype,
+                    **kwargs,
+                )
+            if i_q is not None:
+                raise RuntimeError(
+                    "Step5 W4A8 DeepGEMM does not consume INT8 AllGatherv input"
+                )
+            # Shared experts and DP/TP reductions remain owned by MoERunner.
+            del shared_experts, shared_experts_input
+            if getattr(layer, "apply_router_weight_on_input", False):
+                raise ValueError("Step5 W4A8 DeepGEMM requires output-side routing")
+            if x.ndim != 2 or topk_ids.ndim != 2 or topk_weights.shape != topk_ids.shape:
+                raise ValueError("Step5 W4A8 DeepGEMM requires rank-2 x and top-k")
+            if topk_ids.shape[0] != x.shape[0]:
+                raise ValueError("Step5 W4A8 DeepGEMM token/top-k count mismatch")
+            if x.shape[0] == 0:
+                return torch.empty_like(x)
+            from vllm_hcu.model_executor.layers.fused_moe.aiter_moe_dispatch import (
+                resolve_aiter_expert_maps,
+            )
+            from vllm_hcu.model_executor.layers.quantization.step5_w4a8_deepgemm import (
+                apply_step5_deepgemm,
+            )
+
+            global_num_experts = getattr(
+                layer, "global_num_experts", getattr(self.moe, "num_experts", -1)
+            )
+            expert_map, _ = resolve_aiter_expert_maps(
+                getattr(layer, "expert_map", getattr(layer, "_expert_map", None)),
+                global_num_experts,
+            )
+            return apply_step5_deepgemm(
+                experts,
                 layer,
                 x,
                 topk_weights,
                 topk_ids,
-                shared_experts,
-                shared_experts_input,
-                i_q=i_q,
-                i_s=i_s,
-                output_dtype=output_dtype,
-                **kwargs,
+                expert_map,
+                global_num_experts,
             )
 
     return Step5CompressedTensorsW4A8Method
@@ -304,6 +429,27 @@ def apply_to_module(module: ModuleType) -> bool:
     @functools.wraps(original)
     def hcu_get_moe_method(quant_config, layer, layer_name):
         if _is_step5_channel_w4a8(quant_config, layer, layer_name):
+            parallel = getattr(layer.moe_config, "moe_parallel_config", None)
+            backend = getattr(parallel, "all2all_backend", None)
+            moe_backend = getattr(layer.moe_config, "moe_backend", "auto")
+            if backend == "deepep_high_throughput":
+                if moe_backend not in ("auto", "deep_gemm"):
+                    raise ValueError(
+                        "Step5 DeepEP HT requires --moe-backend auto or deep_gemm"
+                    )
+                method_cls = _step5_method_class()
+                return method_cls(quant_config, layer.moe_config)
+            if backend == "deepep_low_latency":
+                # The core_fix selector owns the Step5 packed INT4 LL kernel,
+                # but in worker processes it can be applied after this wrapper.
+                from vllm_hcu.model_executor.layers.quantization.ct_w4a8_step5 import (
+                    Step5CompressedW4A8MoEMethod,
+                )
+
+                return Step5CompressedW4A8MoEMethod(quant_config, layer.moe_config)
+            if moe_backend == "deep_gemm":
+                method_cls = _step5_method_class()
+                return method_cls(quant_config, layer.moe_config)
             from vllm_hcu.model_executor.layers.quantization.ct_w4a8_step5_native_policy import (
                 native_enabled,
             )
@@ -329,12 +475,6 @@ def apply_to_module(module: ModuleType) -> bool:
                 )
 
                 return Step5CompressedW4A8MoEMethod(quant_config, layer.moe_config)
-            parallel = getattr(layer.moe_config, "moe_parallel_config", None)
-            if getattr(parallel, "all2all_backend", None) == "deepep_low_latency":
-                # The core_fix selector owns the Step5 packed INT4 LL kernel.
-                # The legacy BoltOps path leaves moe_kernel unset and sends
-                # MoERunner through unsupported dispatch_router_logits.
-                return original(quant_config, layer, layer_name)
             method_cls = _step5_method_class()
             return method_cls(quant_config, layer.moe_config)
         return original(quant_config, layer, layer_name)

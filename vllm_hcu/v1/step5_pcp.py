@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import os
+import sys
 from typing import Any
 
 
@@ -96,6 +97,9 @@ def get_step5_pcp_metadata(
     return context
 
 
+_PCPDBG_COUNT = 0
+
+
 def gather_global_tokens(tensor: Any, context: Step5PCPMetadata) -> Any:
     """Gather equal-width local rows and restore the original request order.
 
@@ -121,6 +125,32 @@ def gather_global_tokens(tensor: Any, context: Step5PCPMetadata) -> Any:
     if int(gathered.shape[0]) != width * int(context.group.world_size):
         raise RuntimeError("Step5 PCP gather returned an invalid token width")
     indices = context.global_restore_indices
+    global _PCPDBG_COUNT
+    if (os.environ.get("VLLM_STEP5_PCP_DEBUG")
+            and context.global_num_tokens == 43
+            and _PCPDBG_COUNT < 8):
+        _PCPDBG_COUNT += 1
+        try:
+            rows = gathered.reshape(int(gathered.shape[0]), -1)
+            occ = (rows != 0).any(dim=1).to(torch.uint8).cpu().tolist()
+            print(
+                "PCPDBG local=%d padded=%d global=%d world=%d in=%s out=%s "
+                "idx=%s occ=%s"
+                % (
+                    context.local_num_tokens,
+                    context.local_padded_tokens,
+                    context.global_num_tokens,
+                    int(context.group.world_size),
+                    tuple(tensor.shape),
+                    tuple(gathered.shape),
+                    [int(x) for x in indices[:16].cpu().tolist()],
+                    "".join(str(x) for x in occ),
+                ),
+                flush=True,
+                file=sys.stderr,
+            )
+        except Exception as exc:
+            print("PCPDBG_ERR %r" % (exc,), flush=True, file=sys.stderr)
     if indices.dtype != torch.int64:
         raise TypeError("Step5 PCP restore indices must use int64")
     if context.global_num_tokens == 0:

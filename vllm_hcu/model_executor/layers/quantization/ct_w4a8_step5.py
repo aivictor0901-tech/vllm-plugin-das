@@ -78,15 +78,24 @@ class Step5CompressedW4A8MoEMethod(FusedMoEMethodBase):
             raise ValueError("Step5 packed INT4 does not support expert biases")
         parallel = getattr(moe, "moe_parallel_config", None)
         from .ct_w4a8_step5_native_policy import native_enabled, validate_parallel
-        self._use_native_w4a8 = native_enabled()
-        if self._use_native_w4a8:
-            validate_parallel(parallel, activation, getattr(moe, "moe_backend", "auto"),
-                              getattr(moe, "has_bias", False))
+        backend = getattr(parallel, "all2all_backend", None)
+        moe_backend = getattr(moe, "moe_backend", "auto")
+        if backend == "deepep_high_throughput":
+            raise ValueError(
+                "Step5 CT W4A8 does not support DeepEP HT yet; "
+                "use deepep_low_latency or allgather_reducescatter"
+            )
         self._use_deepep = (
-            getattr(parallel, "all2all_backend", None) == "deepep_low_latency"
-            and getattr(moe, "moe_backend", "auto") in ("auto", "triton", "deep_gemm")
+            backend == "deepep_low_latency"
+            and moe_backend in ("auto", "triton", "deep_gemm")
         )
-        self._use_deepgemm = self._use_deepep and getattr(moe, "moe_backend", "auto") == "deep_gemm"
+        # DeepEP LL owns the expert compute when selected.  Keep the native
+        # W4A8 policy (which is AgRs-only) from rejecting or shadowing it.
+        self._use_native_w4a8 = native_enabled() and not self._use_deepep
+        if self._use_native_w4a8:
+            validate_parallel(parallel, activation, moe_backend,
+                              getattr(moe, "has_bias", False))
+        self._use_deepgemm = self._use_deepep and moe_backend == "deep_gemm"
         if self._use_deepep:
             if not getattr(parallel, "use_deepep_ll_kernels", False):
                 raise ValueError("DeepEP LL is not active in the resolved MoE parallel config")

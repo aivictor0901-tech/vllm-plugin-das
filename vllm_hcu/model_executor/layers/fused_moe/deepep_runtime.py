@@ -201,6 +201,13 @@ def _require_slimquant_w4a8_hipc_runtime() -> None:
         )
 
 
+def is_step5_ht_w4a8(moe_config: object) -> bool:
+    """Whether this MoE layer is Step5 on the DeepEP HT + W4A8 route."""
+    from vllm_hcu.runtime_compat.step5 import is_step5_owner
+
+    return is_step5_owner(moe_config)
+
+
 def slimquant_w4a8_uses_deepep_auto(moe_config: object) -> bool:
     """Validate and classify the SlimQuant W4A8 MoE execution route.
 
@@ -224,6 +231,16 @@ def slimquant_w4a8_uses_deepep_auto(moe_config: object) -> bool:
         None,
     )
     is_dp_ep = dp_size > 1 and use_ep
+
+    if all2all_backend == "deepep_high_throughput" and is_step5_ht_w4a8(moe_config):
+        # Step5 pairs DeepEP HT dispatch with its own Marlin/AITER W4A8
+        # experts, not the generic HIPC deepep_auto route.
+        if not (use_ep and current_platform.is_rocm()):
+            raise ValueError(
+                "Step5 SlimQuant W4A8 deepep_high_throughput requires "
+                "expert parallelism on the HCU ROCm runtime"
+            )
+        return False
 
     fixed_deepep_backends = {
         "deepep_high_throughput",
@@ -314,13 +331,17 @@ def _slimquant_w4a8_deepep_architectures(moe_config: object) -> tuple:
 
 
 def _require_slimquant_w4a8_silu_hcu_runtime(
-    moe_config: object, route: str
+    moe_config: object, route: str, *, allow_swiglustep: bool = False
 ) -> None:
     activation = getattr(moe_config, "activation", None)
     activation_name = getattr(activation, "value", activation)
-    if activation_name != "silu":
+    allowed = {"silu"}
+    if allow_swiglustep:
+        allowed.add("swiglustep")
+    if activation_name not in allowed:
+        expected = "SiLU or SwiGLUStep" if allow_swiglustep else "SiLU"
         raise ValueError(
-            f"SlimQuant W4A8 {route} supports only SiLU activation; "
+            f"SlimQuant W4A8 {route} supports only {expected} activation; "
             f"got {activation_name!r}"
         )
     if not current_platform.is_rocm():
@@ -334,6 +355,8 @@ _FIXED_DEEPEP_W4A8_ARCHITECTURES = frozenset(
     {
         "Qwen4ExpForCausalLM",
         "Qwen4ExpForConditionalGeneration",
+        "Step5ForCausalLM",
+        "Step5ForConditionalGeneration",
     }
 )
 
@@ -358,15 +381,18 @@ def slimquant_w4a8_fixed_deepep_use_low_latency(
     architectures = _slimquant_w4a8_deepep_architectures(moe_config)
     if _FIXED_DEEPEP_W4A8_ARCHITECTURES.isdisjoint(architectures):
         return None
+    is_step5 = any(str(arch).startswith("Step5") for arch in architectures)
 
     route = f"fixed {all2all_backend}"
+    dp_size = getattr(parallel_config, "dp_size", 1)
+    pcp_size = getattr(parallel_config, "pcp_size", 1)
     if not (
-        getattr(parallel_config, "dp_size", 1) > 1
-        and getattr(parallel_config, "use_ep", False)
+        getattr(parallel_config, "use_ep", False)
+        and (dp_size > 1 or (is_step5 and pcp_size > 1))
     ):
         raise ValueError(
-            f"SlimQuant W4A8 {route} requires dp_size > 1 with expert "
-            "parallelism enabled"
+            f"SlimQuant W4A8 {route} requires expert parallelism with "
+            "dp_size > 1 (or Step5 pcp_size > 1)"
         )
     if getattr(parallel_config, "use_deepep_auto_kernels", False) is True:
         raise ValueError(
@@ -381,7 +407,9 @@ def slimquant_w4a8_fixed_deepep_use_low_latency(
             f"SlimQuant W4A8 {route} requires moe_backend='auto' or "
             f"'deep_gemm', got {moe_backend!r}"
         )
-    _require_slimquant_w4a8_silu_hcu_runtime(moe_config, route)
+    _require_slimquant_w4a8_silu_hcu_runtime(
+        moe_config, route, allow_swiglustep=is_step5
+    )
     return all2all_backend == "deepep_low_latency"
 
 

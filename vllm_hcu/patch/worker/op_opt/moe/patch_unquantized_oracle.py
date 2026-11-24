@@ -166,7 +166,7 @@ def apply_to_module(module: ModuleType) -> bool:
             # unquantized (e.g. Step5 bf16 layers with SWIGLUSTEP).  When the
             # requested AITER backend cannot serve such a layer, use Triton
             # for it instead of failing the whole model.
-            if getattr(moe_config, "moe_backend", "auto") != "aiter":
+            if getattr(moe_config, "moe_backend", "auto") not in ("aiter", "deep_gemm"):
                 raise
             batched = moe_config.moe_parallel_config.use_batched_activation_format
             backend = hcu_enum.BATCHED_TRITON if batched else hcu_enum.TRITON

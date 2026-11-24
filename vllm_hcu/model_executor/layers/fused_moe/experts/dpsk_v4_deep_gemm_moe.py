@@ -360,10 +360,10 @@ class DeepEPDeepGemmContiguousExperts(TritonExperts):
         apply_router_weight_on_input: bool,
     ):
         del apply_router_weight_on_input
-        if activation != MoEActivation.SILU:
+        if activation not in (MoEActivation.SILU, MoEActivation.SWIGLUSTEP):
             raise NotImplementedError(
-                "DeepEP DeepGEMM HT path currently mirrors SGLang's silu-only "
-                f"implementation, got {activation.value}."
+                "DeepEP DeepGEMM HT path supports SiLU and SwiGLUStep; "
+                f"got {activation.value}."
             )
         if a1q_scale is None:
             raise RuntimeError("DeepEP DeepGEMM HT requires per-token activation scales")
@@ -1148,6 +1148,10 @@ class DeepEPAutoDeepGemmExperts(mk.FusedMoEExpertsModular):
 
 class DeepEPAutoW4A8Experts(DeepEPAutoDeepGemmExperts):
     """Own one in-place W4A8 HIPC layout for strict ``deepep_auto``."""
+
+    @staticmethod
+    def _supports_activation(activation: MoEActivation) -> bool:
+        return activation in (MoEActivation.SILU, MoEActivation.SWIGLUSTEP)
 
     _LAYOUT_MARKER = "_slimquant_w4a8_deepep_auto_layout"
     _PACKED_W13 = "_slimquant_w4a8_deepep_auto_packed_w13"

@@ -43,8 +43,13 @@ def validate_step5_pcp_config(config: object) -> None:
         raise ValueError("Step5 PCP supports TP1/PCP2,4,8/PP1,2/DP1/DCP1; got " + str(topology))
     if not parallel.enable_expert_parallel:
         raise ValueError("Step5 PCP requires expert parallelism over its PCP group")
-    if parallel.all2all_backend != "allgather_reducescatter":
-        raise ValueError("Step5 PCP currently requires allgather_reducescatter")
+    if parallel.all2all_backend not in (
+        "allgather_reducescatter",
+        "deepep_high_throughput",
+    ):
+        raise ValueError(
+            "Step5 PCP requires allgather_reducescatter or deepep_high_throughput"
+        )
     if getattr(parallel, "enable_eplb", False):
         raise ValueError("Step5 PCP does not yet support EPLB")
     if not getattr(model, "enforce_eager", False):
@@ -56,8 +61,25 @@ def validate_step5_pcp_config(config: object) -> None:
         raise ValueError("Step5 PCP requires --language-model-only")
     if getattr(config, "lora_config", None) is not None:
         raise ValueError("Step5 PCP does not support LoRA")
-    if getattr(config, "kv_transfer_config", None) is not None:
-        raise ValueError("Step5 PCP currently supports integrated IFB only; legacy PD is unchanged")
+    kv_transfer = getattr(config, "kv_transfer_config", None)
+    if kv_transfer is not None:
+        # Plain PCP replicates the full KV cache inside the PCP group (see the
+        # module docstring: only target prefill queries are partitioned, all
+        # ranks end up holding the gathered global cache), so the Step5 P/D
+        # handoff works unchanged for the producer side: PCP rank 0 owns the
+        # sequence tail and sends the complete cache. Anything other than the
+        # registered Mooncake step5_pd producer remains unvalidated with PCP.
+        extra = getattr(kv_transfer, "kv_connector_extra_config", None) or {}
+        if not (
+            getattr(kv_transfer, "kv_connector", None) == "MooncakeConnector"
+            and bool(extra.get("step5_pd"))
+            and getattr(kv_transfer, "kv_role", None) == "kv_producer"
+        ):
+            raise ValueError(
+                "Step5 PCP currently supports integrated IFB only; legacy PD is unchanged "
+                "(the only allowed P/D combination is MooncakeConnector with "
+                "kv_connector_extra_config.step5_pd=true and kv_role=kv_producer)"
+            )
     cache = config.cache_config
     if getattr(cache, "enable_prefix_caching", False):
         raise ValueError("Step5 PCP prefix-cache ownership is not validated")

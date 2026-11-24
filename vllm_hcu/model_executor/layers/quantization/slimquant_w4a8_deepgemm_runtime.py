@@ -207,7 +207,7 @@ class DeepEPDeepGemmW4A8ContiguousExperts(TritonExperts):
 
     @staticmethod
     def _supports_activation(activation: MoEActivation) -> bool:
-        return activation == MoEActivation.SILU
+        return activation in (MoEActivation.SILU, MoEActivation.SWIGLUSTEP)
 
     def __init__(
         self,

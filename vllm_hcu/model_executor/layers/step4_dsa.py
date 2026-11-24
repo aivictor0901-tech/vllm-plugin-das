@@ -2063,6 +2063,27 @@ class Step4DSAImpl(AttentionImpl[Step4DSAMetadata]):
             cache_key = gather_global_tokens(cache_key, pcp)
             cache_value = gather_global_tokens(cache_value, pcp)
             cache_slots = global_cache_slot_mapping(pcp)
+        global _DSAPCPDBG_COUNT
+        if (os.environ.get("VLLM_STEP5_PCP_DEBUG")
+                and num_tokens == 6
+                and _DSAPCPDBG_COUNT < 8):
+            _DSAPCPDBG_COUNT += 1
+            import sys as _sys
+
+            print(
+                "DSAPCPDBG layer=%s tokens=%d pcp=%s key=%s nzrows=%d "
+                "slots=%s valid=%d head=%s"
+                % (
+                    layer.layer_name, num_tokens, pcp is not None,
+                    tuple(cache_key.shape),
+                    int((cache_key.reshape(int(cache_key.shape[0]), -1) != 0)
+                        .any(dim=1).sum()),
+                    tuple(cache_slots.shape),
+                    int((cache_slots >= 0).sum()),
+                    [int(x) for x in cache_slots[:8].tolist()],
+                ),
+                flush=True, file=_sys.stderr,
+            )
         k_flat, v_flat = self._write_kv(
             kv_cache,
             cache_key,
@@ -2071,6 +2092,7 @@ class Step4DSAImpl(AttentionImpl[Step4DSAMetadata]):
             k_scale,
             v_scale,
         )
+        _maybe_dump_post_write_kv(kv_cache, layer.layer_name)
 
         plan = getattr(layer, "step4_sparse_plan", None)
         if plan is None:
@@ -2418,6 +2440,188 @@ def build_plan(
 
     return plan
 
+
+_DSAPCPDBG_COUNT = 0
+
+
+def _kv_sample(kv_cache, blk, off):
+    """Bytes of the first 16 elements of K and V at (block, token) for one head."""
+    import torch
+
+    if kv_cache.ndim == 5:
+        kk = kv_cache[0][blk, off].flatten()[:16]
+        vv = kv_cache[1][blk, off].flatten()[:16]
+    else:
+        content = int(kv_cache.shape[3])
+        dim = content // 2
+        kk = kv_cache[blk, :, off, :dim].flatten()[:16]
+        vv = kv_cache[blk, :, off, dim:].flatten()[:16]
+    kk = kk.contiguous().view(torch.uint8)
+    vv = vv.contiguous().view(torch.uint8)
+    return (
+        [int(b) for b in kk.cpu().tolist()],
+        [int(b) for b in vv.cpu().tolist()],
+    )
+
+
+_POST_WRITE_STASH: dict = {}
+
+
+def _maybe_dump_post_write_kv(kv_cache, layer_name) -> None:
+    """Sample the request's KV rows after the attention layer wrote them.
+
+    The indexer runs before the attention op writes this step's KV, so a
+    sample taken there reads the previous tenant of the block.  This second
+    record is written from inside the attention impl, right after _write_kv,
+    and only for the layer whose indexer produced the last dump record.
+    """
+    import json
+    import os
+    import time
+
+    path = os.environ.get("VLLM_STEP4_DSA_DUMP_STATE")
+    if not path or not _POST_WRITE_STASH:
+        return
+    if torch.cuda.is_current_stream_capturing():
+        return
+    if _POST_WRITE_STASH.get("layer_name") != layer_name:
+        return
+    stash = dict(_POST_WRITE_STASH)
+    _POST_WRITE_STASH.clear()
+    record = {
+        "t": round(time.time(), 3),
+        "pid": os.getpid(),
+        "host": os.uname().nodename,
+        "phase": "post_write",
+        "plan_t": stash.get("plan_t"),
+        "seq_lens": stash.get("seq_lens"),
+        "slots": stash.get("slots"),
+        "kv_base": (int(kv_cache.data_ptr()) if kv_cache is not None else 0),
+        "kv_regions": [],
+    }
+    try:
+        slots = stash.get("slots") or []
+        rpp = stash.get("rpp") or 1
+        region = stash.get("region") or 1
+        sampled = []
+        if slots and kv_cache is not None and kv_cache.numel() > 0:
+            for slot in slots[:6]:
+                blk = slot // rpp
+                off = (slot % rpp) * region
+                k_bytes, v_bytes = _kv_sample(kv_cache, blk, off)
+                sampled.append({"slot": slot, "block": blk, "off": off,
+                                "k": k_bytes, "v": v_bytes})
+        record["kv_regions"] = sampled
+    except Exception as exc:
+        record["kv_error"] = repr(exc)
+    try:
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record) + chr(10))
+    except Exception:
+        pass
+
+
+def _maybe_dump_state(indexer, md, sched, summary_md, positions=None) -> None:
+    """Debug-only dump of DSA state for short prefill/replay steps.
+
+    Enabled by VLLM_STEP4_DSA_DUMP_STATE=<path>.  Writes one JSON line per
+    step from the first DSA layer on the rank: the per-request plan,
+    summary values for the first score slots, the pending head/tail rows,
+    and the first bytes of the layer's KV page.  Used to compare P's
+    prefill with D's direct prefill and with D's PD replay.
+    """
+    import json
+    import os
+    import time
+
+    path = os.environ.get("VLLM_STEP4_DSA_DUMP_STATE")
+    if not path:
+        return
+    if torch.cuda.is_current_stream_capturing():
+        return
+    state = indexer.state
+    if indexer.slot != state.first_slot:
+        return
+    if md.num_prefills <= 0 or md.num_prefills > 4:
+        return
+    seq_lens = getattr(summary_md, "seq_lens_cpu", None)
+    try:
+        record = {
+            "t": round(time.time(), 3),
+            "pid": os.getpid(),
+            "host": os.uname().nodename,
+            "num_prefills": int(md.num_prefills),
+            "num_actual_tokens": int(md.num_actual_tokens),
+            "seq_lens": [int(x) for x in (seq_lens.tolist()[:8] if seq_lens is not None else [])],
+            "positions": ([int(x) for x in positions[:64].detach().cpu().tolist()]
+                          if positions is not None else None),
+            "slot_mapping": ([int(x) for x in md.slot_mapping[:64].detach().cpu().tolist()]
+                             if getattr(md, "slot_mapping", None) is not None else None),
+            "plans": [],
+        }
+        if record["seq_lens"] and max(record["seq_lens"]) > 128:
+            return
+        flat = None
+        if state.summary is not None:
+            flat = state.summary[indexer.slot].reshape(-1, state.geometry.proxy_dim)
+        for p in sched.requests[:8]:
+            plan = {
+                "row": int(p.row), "past": int(p.past), "qlen": int(p.qlen),
+                "head": int(p.head), "tail": int(p.tail),
+                "nscore": int(p.nscore), "pin": int(p.pending_row_in),
+                "pout": int(p.pending_row_out),
+                "keep": [[int(a), int(b)] for a, b in p.keep_rows],
+            }
+            if p.score_slots is not None and flat is not None:
+                slots = [int(s) for s in p.score_slots[:6].tolist()]
+                plan["score_slots"] = slots
+                plan["summaries"] = [
+                    [float(x) for x in flat[s, :8].float().tolist()] for s in slots
+                ]
+            if p.pending_row_in >= 0 and state.pending_key is not None and p.head > 0:
+                n = min(8, int(p.head))
+                plan["pin_vals"] = [
+                    float(x) for x in
+                    state.pending_key[indexer.slot, p.pending_row_in, :n, :4].float().flatten().tolist()
+                ]
+            if p.pending_row_out >= 0 and state.pending_key is not None:
+                n = min(8, int(p.tail)) or 1
+                plan["pout_vals"] = [
+                    float(x) for x in
+                    state.pending_key[indexer.slot, p.pending_row_out, :n, :4].float().flatten().tolist()
+                ]
+            record["plans"].append(plan)
+        try:
+            kv = indexer.owner.attn.kv_cache
+            rpp = state.regions_per_page
+            region = state.geometry.region_size
+            sampled = []
+            first = record["plans"][0] if record["plans"] else None
+            if (first is not None and first.get("score_slots")
+                    and kv is not None and kv.numel() > 0):
+                for slot in first["score_slots"][:6]:
+                    blk = slot // rpp
+                    off = (slot % rpp) * region
+                    k_bytes, v_bytes = _kv_sample(kv, blk, off)
+                    sampled.append({"slot": slot, "block": blk, "off": off,
+                                    "k": k_bytes, "v": v_bytes})
+            record["kv_regions"] = sampled
+        except Exception as exc:
+            record["kv_error"] = repr(exc)
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record) + chr(10))
+        _POST_WRITE_STASH.clear()
+        _POST_WRITE_STASH.update({
+            "layer_name": indexer.layer_name,
+            "slots": (record["plans"][0].get("score_slots") or [])
+                     if record["plans"] else [],
+            "rpp": int(state.regions_per_page),
+            "region": int(state.geometry.region_size),
+            "seq_lens": record["seq_lens"],
+            "plan_t": record["t"],
+        })
+    except Exception:
+        pass
 
 def _maybe_dump_prefill_plan(packed, counts, q_positions) -> None:
     """Save one real prefill region plan when VLLM_STEP4_DUMP_PLAN names a path.
@@ -3949,7 +4153,15 @@ class Step4DSAState:
             return
         # With speculative decoding a closed region may be reopened by a
         # rollback on the next step, so its row is only demoted, not freed.
-        drop = self.pending.retire if self.spec_query_len > 1 else self.pending.release
+        # The Step5 P/D producer needs the same one-step retention even
+        # without speculation: pd_keep_prefill_tail keeps the final region's
+        # rows for step5_pd.capture(), which reads them on the next engine
+        # step, after this teardown has run.
+        keep_alive = (
+            self.spec_query_len > 1
+            or getattr(self, "pd_keep_prefill_tail", False)
+        )
+        drop = self.pending.retire if keep_alive else self.pending.release
         for slot in self._schedule.completed_slots:
             drop(slot)
         self._schedule.completed_slots.clear()
@@ -4277,6 +4489,7 @@ class Step4Indexer:
             index_k = gather_global_tokens(index_k, pcp)
             index_z = gather_global_tokens(index_z, pcp)
         self._update_summaries(sched, index_k, index_z)
+        _maybe_dump_state(self, md, sched, summary_md, positions)
         chunk_prefill = PREFILL_PLAN_CHUNK > 0 and md.num_prefills > 0 and not (
             DENSE_EQUIV or score_sched.spec
         )
