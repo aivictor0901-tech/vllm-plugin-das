@@ -15,6 +15,7 @@ still performs its required input quantization and INT8 GEMM.
 from __future__ import annotations
 
 import math
+import os
 
 import torch
 from triton.language.extra import libdevice
@@ -27,6 +28,21 @@ from .router_gemm import RSG_MAX_M
 RSG_INT8_MAX_M = RSG_MAX_M
 # Tuned for the Step5 TP4 decode shard K=4096, router N=352, shared I=384.
 _BM, _BN, _BK, _SPLIT_K, _WARPS, _STAGES = 32, 64, 128, 4, 4, 2
+
+
+def _shared_block_m(rows: int, width: int, router_tp_size: int = 1) -> int:
+    """Opt-in candidate for full shared weights on small token-owner batches.
+
+    Keep I384 on BM32: its native LightOp scratch consumer has a fixed layout.
+    This runs inside the real-shape runtime ops, not only at Dynamo warmup.
+    """
+    if (os.getenv("HCU_STEP5_REPLICATED_SHARED_RS_AG", "0") == "1"
+            and os.getenv("HCU_STEP5_SHARED_SMALL_M_BM16", "0") == "1"
+            and width == 1536 and router_tp_size == 1 and 0 < rows <= 16):
+        from vllm_hcu.model_executor.layers.fused_moe.step5_replicated_shared import owner_execution_active
+        if owner_execution_active():
+            return 16
+    return _BM
 
 
 @triton.jit
@@ -201,13 +217,14 @@ def _router_shared_int8(
         return logits, act
     if xq is None:
         xq, xs = per_token_quant_int8(x)
-    tiles = triton.cdiv(M, _BM) * (triton.cdiv(NR, _BN) + triton.cdiv(I, _BN))
+    bm = _shared_block_m(M, I)
+    tiles = triton.cdiv(M, bm) * (triton.cdiv(NR, _BN) + triton.cdiv(I, _BN))
     _router_shared_int8_kernel[(tiles, _SPLIT_K)](
         x, xq, xs, w_router, w_gate_up, weight_scale,
         logits, act, partials, counters, M, K, x.stride(0), w_router.stride(0),
         NR=NR, I=I, LIMIT=limit,
-        BM=_BM, BN=_BN, BK=_BK, SPLIT_K=_SPLIT_K,
-        num_warps=_WARPS, num_stages=_STAGES,
+        BM=bm, BN=_BN, BK=_BK, SPLIT_K=_SPLIT_K,
+        num_warps=2 if bm == 16 else _WARPS, num_stages=_STAGES,
     )
     return logits, act
 
@@ -242,8 +259,8 @@ def _shared_int8_wide_epilogue_kernel(
     col = tl.arange(0, B)
     mask = col < I
     if FROM_PARTIALS:
-        num_m: tl.constexpr = tl.cdiv(M, BM)
-        tiles: tl.constexpr = num_m * (tl.cdiv(NR, BN) + tl.cdiv(I, BN))
+        num_m: tl.constexpr = (M + BM - 1) // BM
+        tiles: tl.constexpr = num_m * ((NR + BN - 1) // BN + (I + BN - 1) // BN)
         pid = (tl.cdiv(NR, BN) + col // BN) * num_m + row // BM
         offset = pid * 2 * BM * BN + (row % BM) * BN + col % BN
         gate_sum = tl.full((B,), 0, tl.int32)
@@ -285,8 +302,11 @@ def _shared_int8_shape(input, xscale, wscale):
 def _shared_int8_epilogue(
     input: torch.Tensor, xscale: torch.Tensor | None = None,
     wscale: torch.Tensor | None = None, router_columns: int = 352, limit: float = 7.0,
+    block_m: int = 32,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     rows, width = _shared_int8_shape(input, xscale, wscale)
+    if block_m not in (16, 32) or (width == 384 and block_m != 32):
+        raise ValueError("shared epilogue requires BM32 for I384 or BM16/BM32 for I1536")
     if width == 384:
         # Keep the validated TP4 native operation and its launch unchanged.
         from lightop.moe import shared_gateup_int8_epilogue
@@ -294,9 +314,9 @@ def _shared_int8_epilogue(
     if not input.is_contiguous():
         raise ValueError("shared epilogue requires contiguous input")
     if input.dtype == torch.int32:
-        tiles = triton.cdiv(rows, _BM) * (triton.cdiv(router_columns, _BN)
+        tiles = triton.cdiv(rows, block_m) * (triton.cdiv(router_columns, _BN)
                                         + triton.cdiv(width, _BN))
-        if (input.numel() < _SPLIT_K * tiles * 2 * _BM * _BN
+        if (input.numel() < _SPLIT_K * tiles * 2 * block_m * _BN
                 or xscale.shape != (rows, 1) or wscale.numel() != 2 * width
                 or xscale.dtype != torch.float32 or wscale.dtype != torch.float32
                 or not xscale.is_contiguous() or not wscale.is_contiguous()
@@ -310,14 +330,16 @@ def _shared_int8_epilogue(
         _shared_int8_wide_epilogue_kernel[(rows,)](
             input, xscale, wscale, q, scale, M=rows, I=width,
             NR=router_columns, LIMIT=limit, FROM_PARTIALS=input.dtype == torch.int32,
-            B=triton.next_power_of_2(width), BM=_BM, BN=_BN, SPLIT_K=_SPLIT_K,
+            B=triton.next_power_of_2(width), BM=block_m, BN=_BN, SPLIT_K=_SPLIT_K,
             num_warps=4, num_stages=1,
         )
     return q, scale
 
 
-def _shared_int8_epilogue_fake(input, xscale=None, wscale=None, router_columns=352, limit=7.0):
+def _shared_int8_epilogue_fake(input, xscale=None, wscale=None, router_columns=352, limit=7.0, block_m=32):
     rows, width = _shared_int8_shape(input, xscale, wscale)
+    if block_m not in (16, 32) or (width == 384 and block_m != 32):
+        raise ValueError("shared epilogue requires BM32 for I384 or BM16/BM32 for I1536")
     return (
         input.new_empty((rows, width), dtype=torch.int8),
         input.new_empty((rows, 1), dtype=torch.float32),
@@ -351,17 +373,18 @@ def _router_shared_int8_quant(
         return logits, q, scale
     if xq is None:
         xq, xs = per_token_quant_int8(x)
-    tiles = (triton.cdiv(owner_rows, _BM) * triton.cdiv(nr, _BN)
-             + triton.cdiv(m, _BM) * triton.cdiv(width, _BN))
+    bm = _shared_block_m(m, width, router_tp_size)
+    tiles = (triton.cdiv(owner_rows, bm) * triton.cdiv(nr, _BN)
+             + triton.cdiv(m, bm) * triton.cdiv(width, _BN))
     _router_shared_int8_kernel[(tiles, _SPLIT_K)](
         x, xq, xs, w_router, w_gate_up, weight_scale,
         logits, x, partials, counters, m, k, x.stride(0), w_router.stride(0),
-        NR=nr, I=width, LIMIT=limit, BM=_BM, BN=_BN, BK=_BK, SPLIT_K=_SPLIT_K,
+        NR=nr, I=width, LIMIT=limit, BM=bm, BN=_BN, BK=_BK, SPLIT_K=_SPLIT_K,
         DEFER_SHARED=True, ROUTER_TP_SIZE=router_tp_size, ROUTER_TP_RANK=router_tp_rank,
-        num_warps=_WARPS, num_stages=_STAGES,
+        num_warps=2 if bm == 16 else _WARPS, num_stages=_STAGES,
     )
     q, scale = torch.ops.vllm.step5_shared_int8_epilogue(
-        partials, xs, weight_scale, nr, limit,
+        partials, xs, weight_scale, nr, limit, bm,
     )
     return logits, q, scale
 
@@ -419,13 +442,14 @@ def router_shared_swiglustep_int8(
             raise RuntimeError("prepare a private router/shared INT8 workspace before capture")
         workspace = make_router_shared_int8_workspace(x.device, NR, I)
     partials, counters = workspace
-    tiles = triton.cdiv(x.shape[0], _BM) * (triton.cdiv(NR, _BN) + triton.cdiv(I, _BN))
+    bm = _shared_block_m(x.shape[0], I, router_tp_size)
+    tiles = triton.cdiv(x.shape[0], bm) * (triton.cdiv(NR, _BN) + triton.cdiv(I, _BN))
     if (
         partials.dtype != torch.int32 or counters.dtype != torch.int32
         or partials.device != x.device or counters.device != x.device
         or not partials.is_contiguous() or not counters.is_contiguous()
         or counters.numel() < tiles
-        or partials.numel() < _SPLIT_K * tiles * 2 * _BM * _BN
+        or partials.numel() < _SPLIT_K * tiles * 2 * bm * _BN
     ):
         raise ValueError("invalid private router/shared INT8 workspace")
     if not quantized_output and (router_tp_size, router_tp_rank) != (1, 0):

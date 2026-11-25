@@ -117,7 +117,9 @@ def install_counter_reset(buffer):
     from vllm.config import get_current_vllm_config
     from .step5_ll_topology import uses_step5_ll_fused_restore
     cfg = get_current_vllm_config()
-    if not uses_step5_ll_fused_restore(cfg):
+    from .step5_replicated_shared import uses_replicated_shared_ll_restore
+    if not (uses_step5_ll_fused_restore(cfg)
+            or uses_replicated_shared_ll_restore(cfg)):
         raise ValueError("Fused LL counters require fixed LL TP4/DP2, TP4/DP4 or "
                          "TP1/DP16, PP1, EP, FP32 residuals, DBO/SP off")
     if hasattr(buffer, "_hcu_step5_counter_state"):

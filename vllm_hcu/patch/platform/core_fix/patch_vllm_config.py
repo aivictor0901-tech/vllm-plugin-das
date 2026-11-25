@@ -15,6 +15,7 @@ from vllm_hcu.deepseek_v4_runtime import (
     is_deepseek_v4, is_dspark_enabled, model_architectures,
 )
 from vllm_hcu.patch.config import HcuFeatureConfig, get_hcu_config, set_hcu_config
+from vllm_hcu.runtime_compat.step5 import is_step5_config
 
 from ._common import PatchCompatibilityError, apply_once, load_exact_module
 from .patch_compilation_config import bind_hcu_config
@@ -840,6 +841,46 @@ def _request_cudagraph_buckets_enabled() -> bool:
     )
 
 
+def _extend_step5_default_cudagraph_sizes(
+    vllm_config: object,
+    *,
+    compile_sizes_template: list[int | str] | None,
+) -> None:
+    """Keep Step5 decode sizes 52/60 alongside the automatic graph buckets."""
+    from vllm_hcu.platforms import envs as hcu_envs
+
+    if not hcu_envs.VLLM_HCU_USE_CUSTOM_OPS or not is_step5_config(vllm_config):
+        return
+    compilation_config = getattr(vllm_config, "compilation_config", None)
+    current_sizes = getattr(compilation_config, "cudagraph_capture_sizes", None)
+    max_size = getattr(compilation_config, "max_cudagraph_capture_size", None)
+    if not current_sizes or not isinstance(max_size, int) or max_size < 1:
+        return
+
+    scheduler_config = getattr(vllm_config, "scheduler_config", None)
+    max_tokens = getattr(scheduler_config, "max_num_batched_tokens", max_size)
+    limit = min(max_size, max_tokens)
+    parallel_config = getattr(vllm_config, "parallel_config", None)
+    tp_size = getattr(parallel_config, "tensor_parallel_size", 1)
+    pass_config = getattr(compilation_config, "pass_config", None)
+    use_sp = bool(getattr(pass_config, "enable_sp", False)) or get_hcu_config(
+        vllm_config
+    ).enable_custom_sp
+    alignment = tp_size if use_sp and tp_size > 1 else 1
+    extra_sizes = [
+        size for size in (52, 60) if size <= limit and size % alignment == 0
+    ]
+    sizes = sorted(set(current_sizes).union(extra_sizes))
+    if sizes == current_sizes:
+        return
+
+    compilation_config.cudagraph_capture_sizes = sizes
+    # Upstream may have expanded the symbolic compile-size sentinel already.
+    # Recompute it from its original template; explicit compile sizes stay fixed.
+    compilation_config.compile_sizes = compile_sizes_template
+    compilation_config.post_init_cudagraph_sizes()
+
+
 def _replace_with_request_cudagraph_buckets(
     vllm_config: object,
     *,
@@ -1033,9 +1074,14 @@ def apply_to_module(module: ModuleType) -> bool:
         )
 
         result = set_cudagraph_sizes(self)
-        if explicit_sizes or not _request_cudagraph_buckets_enabled():
+        if explicit_sizes:
             return result
-        _replace_with_request_cudagraph_buckets(
+        if _request_cudagraph_buckets_enabled():
+            _replace_with_request_cudagraph_buckets(
+                self,
+                compile_sizes_template=compile_sizes_template,
+            )
+        _extend_step5_default_cudagraph_sizes(
             self,
             compile_sizes_template=compile_sizes_template,
         )
