@@ -2038,6 +2038,47 @@ class Step4DSAImpl(AttentionImpl[Step4DSAMetadata]):
         output_scale: torch.Tensor | None = None,
         output_block_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        return self._forward_impl(
+            layer, query, key, value, kv_cache, attn_metadata, output,
+            output_scale, output_block_scale,
+        )
+
+    def forward_gate_quant_no_copy(
+        self, layer, query, key, value, kv_cache, attn_metadata, gate, xq, xs,
+    ) -> None:
+        from vllm_hcu.models.step5_dsa_gate_quant import write_quantized_rows
+
+        valid = attn_metadata.num_actual_tokens
+        if not 0 <= valid <= query.shape[0]:
+            raise ValueError("invalid DSA actual-token count")
+        pure_flash_decode = (
+            attn_metadata.num_prefills == 0
+            and valid == attn_metadata.num_decode_tokens
+            and "decode" in FLASH_ATTN_DSA_STAGES
+        )
+        if pure_flash_decode:
+            def consume(out_d):
+                write_quantized_rows(out_d, gate, xq, xs, valid)
+
+            self._forward_impl(
+                layer, query, key, value, kv_cache, attn_metadata, None,
+                decode_consumer=consume,
+            )
+        else:
+            # Prefill/mixed batches and alternative backends retain the original
+            # output-buffer contract. Do not silently change their algorithms.
+            output = torch.empty(query.shape, device=query.device, dtype=query.dtype)
+            self.forward(layer, query, key, value, kv_cache, attn_metadata, output)
+            write_quantized_rows(output, gate, xq, xs, valid)
+        # Graph-padding rows must not expose allocator contents to o_proj.
+        if valid < xq.shape[0]:
+            xq[valid:].zero_()
+            xs[valid:].fill_(1.0)
+
+    def _forward_impl(
+        self, layer, query, key, value, kv_cache, attn_metadata, output,
+        output_scale=None, output_block_scale=None, *, decode_consumer=None,
+    ):
         if output_scale is not None or output_block_scale is not None:
             raise NotImplementedError(
                 "Step-4 DSA does not support fused output quantization"
@@ -2163,7 +2204,10 @@ class Step4DSAImpl(AttentionImpl[Step4DSAMetadata]):
                 if splits > 1:
                     out_d, lse_d = merge_split_states(out_d, lse_d)
             del lse_d
-            output[:ndt] = out_d
+            if decode_consumer is None:
+                output[:ndt] = out_d
+            else:
+                decode_consumer(out_d)
 
         if attn_metadata.num_prefills > 0:
             packed, counts, logical_ids, request_indices = plan.prefill
