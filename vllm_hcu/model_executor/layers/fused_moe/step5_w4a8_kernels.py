@@ -27,14 +27,14 @@ def activation_masked(x, q, scale, counts, CAP: tl.constexpr, I: tl.constexpr,
 
 
 @triton.jit
-def _row_value(ptr, row, col, mask, I: tl.constexpr):
+def _row_value(ptr, row, col, mask, I: tl.constexpr, LIMIT: tl.constexpr):
     offset = row[:, None].to(tl.int64) * (2 * I) + col[None, :]
     gate = tl.load(ptr + offset, mask=mask, other=0).to(tl.float32)
     up = tl.load(ptr + offset + I, mask=mask, other=0).to(tl.float32)
     return (
         (
-            tl.minimum(gate * tl.sigmoid(gate), 7.0)
-            * tl.minimum(tl.maximum(up, -7.0), 7.0)
+            tl.minimum(gate * tl.sigmoid(gate), LIMIT)
+            * tl.minimum(tl.maximum(up, -LIMIT), LIMIT)
         )
         .to(tl.bfloat16)
         .to(tl.float32)
@@ -51,6 +51,8 @@ def activation_persistent(
     I: tl.constexpr,
     BM: tl.constexpr,
     CH: tl.constexpr,
+    DENSE: tl.constexpr = False,
+    LIMIT: tl.constexpr = 7.0,
 ):
     tl.static_assert(I == 3 * CH)
     col = tl.arange(0, CH)
@@ -58,27 +60,39 @@ def activation_persistent(
     for start in range(tl.program_id(0) * BM, ROWS, step):
         row = start + tl.arange(0, BM)
         inside = row < ROWS
-        valid = inside & (tl.load(experts + row, mask=inside, other=-1) >= 0)
+        if DENSE:
+            valid = inside
+        else:
+            valid = inside & (tl.load(experts + row, mask=inside, other=-1) >= 0)
         if tl.sum(valid.to(tl.int32), 0) > 0:
             mask = valid[:, None]
-            y0 = _row_value(gateup, row, col, mask, I)
-            y1 = _row_value(gateup, row, col + CH, mask, I)
-            y2 = _row_value(gateup, row, col + 2 * CH, mask, I)
+            y0 = _row_value(gateup, row, col, mask, I, LIMIT)
+            y1 = _row_value(gateup, row, col + CH, mask, I, LIMIT)
+            y2 = _row_value(gateup, row, col + 2 * CH, mask, I, LIMIT)
             maximum = tl.maximum(
                 tl.maximum(tl.max(tl.abs(y0), 1), tl.max(tl.abs(y1), 1)),
                 tl.max(tl.abs(y2), 1),
             )
-            scale = tl.where(maximum > 0, maximum / 127.0, 1.0)
             offset = row[:, None].to(tl.int64) * I + col[None, :]
-            q0 = tl.minimum(
-                tl.maximum(libdevice.nearbyint(y0 / scale[:, None]), -127.0), 127.0
-            ).to(tl.int8)
-            q1 = tl.minimum(
-                tl.maximum(libdevice.nearbyint(y1 / scale[:, None]), -127.0), 127.0
-            ).to(tl.int8)
-            q2 = tl.minimum(
-                tl.maximum(libdevice.nearbyint(y2 / scale[:, None]), -127.0), 127.0
-            ).to(tl.int8)
+            if DENSE:
+                # Dense LightOp uses a nonzero floor and reciprocal multiply.
+                maximum = tl.maximum(maximum, 1e-10)
+                scale = maximum / 127.0
+                inv = (127.0 / maximum)[:, None]
+                q0 = libdevice.nearbyint(y0 * inv).to(tl.int8)
+                q1 = libdevice.nearbyint(y1 * inv).to(tl.int8)
+                q2 = libdevice.nearbyint(y2 * inv).to(tl.int8)
+            else:
+                scale = tl.where(maximum > 0, maximum / 127.0, 1.0)
+                q0 = tl.minimum(
+                    tl.maximum(libdevice.nearbyint(y0 / scale[:, None]), -127.0), 127.0
+                ).to(tl.int8)
+                q1 = tl.minimum(
+                    tl.maximum(libdevice.nearbyint(y1 / scale[:, None]), -127.0), 127.0
+                ).to(tl.int8)
+                q2 = tl.minimum(
+                    tl.maximum(libdevice.nearbyint(y2 / scale[:, None]), -127.0), 127.0
+                ).to(tl.int8)
             tl.store(quant + offset, q0, mask=mask)
             tl.store(quant + offset + CH, q1, mask=mask)
             tl.store(quant + offset + 2 * CH, q2, mask=mask)

@@ -208,6 +208,25 @@ def _shared_int8_epilogue(
     input: torch.Tensor, xscale: torch.Tensor | None = None,
     wscale: torch.Tensor | None = None, router_columns: int = 352, limit: float = 7.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    if (
+        input.dtype == torch.bfloat16 and input.ndim == 2
+        and input.shape[1] == 3072 and xscale is None and wscale is None
+    ):
+        if not input.is_cuda or not input.is_contiguous():
+            raise ValueError("Step5 dense shared INT8 epilogue requires contiguous GPU input")
+        from vllm_hcu.model_executor.layers.fused_moe.step5_w4a8_kernels import (
+            activation_persistent,
+        )
+
+        q, scale = _shared_int8_epilogue_fake(input, limit=limit)
+        rows, width = q.shape
+        if rows:
+            activation_persistent[(min(triton.cdiv(rows, 4), 1024),)](
+                input, q, scale, None, ROWS=rows, I=width, BM=4, CH=width // 3,
+                DENSE=True, LIMIT=limit, num_warps=4, num_stages=1,
+            )
+        return q, scale
+
     from lightop.moe import shared_gateup_int8_epilogue
 
     return shared_gateup_int8_epilogue(
@@ -217,8 +236,9 @@ def _shared_int8_epilogue(
 
 def _shared_int8_epilogue_fake(input, xscale=None, wscale=None, router_columns=352, limit=7.0):
     rows = xscale.shape[0] if input.dtype == torch.int32 else input.shape[0]
+    width = 1536 if input.dtype == torch.bfloat16 and input.shape[-1] == 3072 else 384
     return (
-        input.new_empty((rows, 384), dtype=torch.int8),
+        input.new_empty((rows, width), dtype=torch.int8),
         input.new_empty((rows, 1), dtype=torch.float32),
     )
 

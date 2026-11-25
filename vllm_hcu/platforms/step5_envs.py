@@ -38,6 +38,12 @@ def warn_ignored_step5_envs() -> None:
 
 
 ENVIRONMENT_VARIABLES = {
+    "VLLM_HCU_STEP5_PREFILL_GATE_INT8": lambda: (
+        os.getenv("VLLM_HCU_STEP5_PREFILL_GATE_INT8", "0") == "1"
+    ),
+    "VLLM_HCU_STEP5_PREFILL_SHARED_INT8": lambda: (
+        os.getenv("VLLM_HCU_STEP5_PREFILL_SHARED_INT8", "0") == "1"
+    ),
     "VLLM_STEP5_LIGHTOP_SPEC_INDEXER": lambda: (
         os.getenv("VLLM_STEP5_LIGHTOP_SPEC_INDEXER", "0") == "1"
     ),
