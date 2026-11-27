@@ -23,7 +23,7 @@ from vllm.v1.worker.gpu.model_runner import (
     torch,
 )
 
-from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp
+from vllm_hcu.v1.step5_context_graphs import dispatch_step5_cg_and_sync_dp
 from vllm_hcu.v1.hcu_dbo import dbo_batch_scope
 from vllm_hcu.v1.step5_hot_context import needs_context_eager, record_context_graph_mode
 
@@ -82,13 +82,16 @@ def execute_model(
         skip_compiled = True
 
     with dbo_batch_scope(self, batch_req_state):
-        batch_desc, dp_sync = dispatch_cg_and_sync_dp(
+        batch_desc, dp_sync = dispatch_step5_cg_and_sync_dp(
             self.cudagraph_manager,
             num_reqs,
             num_toks,
             uniform_tok_count,
             self.dp_size,
             self.dp_rank,
+            runner=self,
+            batch_state=batch_req_state,
+            dummy_run=dummy_run,
             max_query_len=max_query_len,
             need_eager=is_profile or skip_compiled or needs_context_eager(self, batch_req_state, dummy_run),
             num_active_loras=num_active_loras,

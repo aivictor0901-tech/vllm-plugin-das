@@ -265,8 +265,14 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
 
     def capture_model(self, profile_only: bool = False):
         from vllm_hcu.v1.step5_boundary import ENABLED, EARLY_SUFFIX, retain_graphs
+        from vllm_hcu.v1.step5_context_graphs import configure_context_graphs
 
-        if profile_only or not ENABLED or not is_step5_config(self.vllm_config):
+        if not is_step5_config(self.vllm_config):
+            return super().capture_model(profile_only=profile_only)
+        # Profiling must see the expanded descriptor count as well, so vLLM
+        # reserves graph memory for all widths before allocating the real KV.
+        configure_context_graphs(self, profile_only=profile_only)
+        if profile_only or not ENABLED:
             return super().capture_model(profile_only=profile_only)
         parallel = self.parallel_config
         if (parallel.pipeline_parallel_size != 1
@@ -465,7 +471,11 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
                 self._hsl_resolve()
                 self._hsl_attach(input_batch)
                 from vllm_hcu.v1.step5_hot_context import check_hot_graph_context
-                check_hot_graph_context(input_batch, args[0] if args else None, getattr(self, "_step5_hot_context_real_batch", False))
+                check_hot_graph_context(
+                    input_batch, args[0] if args else None,
+                    getattr(self, "_step5_hot_context_real_batch", False),
+                    limit_regions=getattr(self, "_step5_context_regions", None),
+                )
             return original_prepare_attn(input_batch, *args, **kwargs)
 
         model_state.prepare_attn = prepare_attn

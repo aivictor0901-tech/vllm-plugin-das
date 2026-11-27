@@ -2852,6 +2852,9 @@ class Step4DSAState:
         self._stage = 0
         self._stage_ev: list[torch.cuda.Event] = []
         self._decode_logits: torch.Tensor | None = None
+        self._context_score_storage = None
+        self._context_score_views = {}
+        self._context_warmed_widths = set()
         # Persistent verify-step schedule (_spec_decode_schedule): one int64
         # device vector holding every field at a fixed offset, refilled by one
         # H2D copy per step from a pinned ring like the decode path's.
@@ -2915,6 +2918,9 @@ class Step4DSAState:
         self._stage = 0
         self._stage_ev = []
         self._decode_logits = None
+        self._context_score_storage = None
+        self._context_score_views = {}
+        self._context_warmed_widths = set()
         self._spec_layout = {}
         self._spec_raw = None
         self._spec_i32 = {}
@@ -3023,6 +3029,20 @@ class Step4DSAState:
         # nor more than the summary pool holds.
         need = -(-self.max_model_len // region)
         self.graph_regions = min(GRAPH_REGIONS_OVERRIDE or need, need, pool_rows)
+        context_buckets = ()
+        if henvs.custom_ops_enabled():
+            from vllm_hcu.v1.step5_context_graphs import parse_context_buckets
+
+            context_buckets = parse_context_buckets(
+                os.environ.get("HCU_STEP5_CONTEXT_GRAPH_BUCKETS", ""),
+                self.max_model_len,
+            )
+        if context_buckets:
+            if context_buckets[-1] > min(GRAPH_REGIONS_OVERRIDE or need, need):
+                raise ValueError("Step5 context buckets exceed the configured DSA graph width")
+            # Even the minimal profiling KV pool must allocate the real score
+            # width. Zero-length dummy rows never access its missing KV pages.
+            self.graph_regions = context_buckets[-1]
 
         nr = self.max_num_reqs
         i64 = dict(dtype=torch.int64, device=device)
@@ -3071,6 +3091,9 @@ class Step4DSAState:
             dtype=torch.float32,
             device=device,
         )
+        if context_buckets:
+            self._context_score_storage = self._decode_logits
+            self._context_score_views = {self.graph_regions: self._decode_logits}
         mib = self._decode_logits.numel() * 4 / 2**20
         logger.info(
             "step4 DSA: decode graph width %d regions (max_model_len %d, "
@@ -3086,6 +3109,29 @@ class Step4DSAState:
             mib,
         )
         self._warm_graph_kernels(device)
+        if context_buckets:
+            self._context_warmed_widths.add(self.graph_regions)
+
+    def select_context_graph_width(self, regions: int, *, warmup=False) -> None:
+        """Use a contiguous view of one largest-width score allocation.
+
+        Widths execute serially on the normal model stream. Views share storage,
+        but each captured graph keeps its own fixed row stride and launch grid.
+        KV, summaries, pending rows and the live metadata buffers are unchanged.
+        """
+        storage = self._context_score_storage
+        if storage is None or not 0 < regions <= storage.shape[1]:
+            raise RuntimeError(f"Unallocated Step5 context score width {regions}")
+        if regions not in self._context_score_views:
+            rows = storage.shape[0]
+            self._context_score_views[regions] = storage.view(-1)[:rows * regions].view(rows, regions)
+        self.graph_regions = regions
+        self._decode_logits = self._context_score_views[regions]
+        if warmup and regions not in self._context_warmed_widths:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError("Step5 context kernels must warm up before graph capture")
+            self._warm_graph_kernels(storage.device)
+            self._context_warmed_widths.add(regions)
 
     def _warm_graph_kernels(self, device: torch.device) -> None:
         """Compile the width-dependent decode kernels before capture can reach them.
