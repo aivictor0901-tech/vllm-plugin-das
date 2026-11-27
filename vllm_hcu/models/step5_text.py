@@ -2293,7 +2293,12 @@ class Step5Model(nn.Module):
                 # max_num_seqs would do; the slack absorbs rows left behind by
                 # requests that finished mid-region, which are only reclaimed
                 # least-recently-touched.
-                max_pending=2 * vllm_config.scheduler_config.max_num_seqs + 16,
+                # Step5 P/D retains the final region of every finished
+                # prefill until the connector's capture() runs on a later
+                # engine step. At bs32 the old 2x+16 sizing (80 rows) filled
+                # exactly and capture recycled the row it still needed; 4x+32
+                # leaves room.
+                max_pending=4 * vllm_config.scheduler_config.max_num_seqs + 32,
                 dtype=self.compute_dtype,
                 # Capture bounds: the decode schedule lives in [max_num_reqs]
                 # buffers at a score width covering max_model_len, so that both
