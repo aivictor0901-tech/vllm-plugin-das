@@ -5,6 +5,9 @@ import importlib
 import os
 
 import torch
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
 
 
 def gemm_backend():
@@ -32,6 +35,18 @@ def _require_deepgemm_kernel():
     return kernel
 
 
+@lru_cache(maxsize=1)
+def prefill_wasp_kernel():
+    module_name = "deepgemm.step5_prefill_wasp"
+    try:
+        module = importlib.import_module(module_name)
+    except ModuleNotFoundError as error:
+        if error.name == module_name:
+            return None
+        raise
+    return module.m_grouped_marlin_w4a8_gemm_nt_contiguous_hipc
+
+
 def _deepgemm_gemm(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -40,9 +55,17 @@ def _deepgemm_gemm(
     weight_scale: torch.Tensor,
     expert_ids: torch.Tensor,
     mode: int = 1002,
+    prefill_wasp: bool = False,
 ) -> None:
     # Weights already have their single-owner HIPC layout. Scales have already
     # been converted by the checkpoint loader; never repack or rescale here.
+    if prefill_wasp:
+        kernel = prefill_wasp_kernel()
+        if mode != 1006 or kernel is None:
+            raise RuntimeError("Step5 Prefill WASP requires MODE1006 and the WASP DeepGEMM wheel")
+        logger.info_once("Step5 Prefill MODE1006 executing optimized WASP from the DeepGEMM wheel")
+        kernel(input, weight, output, input_scale, weight_scale, expert_ids, mode)
+        return
     _require_deepgemm_kernel()(
         (input, input_scale), (weight, weight_scale), output, expert_ids,
         config={"MODE": mode},
@@ -57,6 +80,7 @@ def _deepgemm_gemm_fake(
     weight_scale: torch.Tensor,
     expert_ids: torch.Tensor,
     mode: int = 1002,
+    prefill_wasp: bool = False,
 ) -> None:
     # The output is caller-owned. Keep this free of data-dependent shape guards
     # so FakeTensor and unbacked symbolic batch sizes can trace the operation.

@@ -221,10 +221,10 @@ def padded_route_rows(tokens, topk, experts, alignment=64):
     )
 
 
-def w4a8_execution_plan(tokens, phase, *, generic_decode=False):
+def w4a8_execution_plan(tokens, phase, *, generic_decode=False, prefill_wasp=False):
     """Select the mode and its routing alignment as one inseparable plan.
 
-    Default plans preserve the existing small-Decode and Prefill behavior.
+    Packaged WASP uses 128-row expert blocks for supported Prefill dispatch.
     generic_decode enables validated large Decode MODE1006 while retaining
     the generic producer's existing 256-row expert layout.
     No device routing counts are copied to the host for this decision.
@@ -232,6 +232,8 @@ def w4a8_execution_plan(tokens, phase, *, generic_decode=False):
     mode = int(os.environ.get("HCU_STEP5_W4A8_MODE", "1002"))
     if mode not in (1002, 1006):
         raise ValueError("HCU_STEP5_W4A8_MODE must be 1002 or 1006")
+    if prefill_wasp and phase == "prefill":
+        return 1006, 128
     if mode == 1006 and phase == "decode" and generic_decode and tokens in (
         272, 288, 320, 352, 384, 416, 448, 480, 512,
     ):

@@ -1,4 +1,4 @@
-"""Private64-row W4 permutation: block histograms, stable offsets, token gather."""
+"""Grouped W4 permutation: block histograms, stable offsets, token gather."""
 
 import torch
 import triton
@@ -20,6 +20,7 @@ def _histogram(
     NB: tl.constexpr,
     B: tl.constexpr,
     H: tl.constexpr,
+    INIT_BLOCKS: tl.constexpr,
 ):
     group = tl.program_id(0)
     r = group * B + tl.arange(0, B)
@@ -30,9 +31,9 @@ def _histogram(
     e = tl.arange(0, H)
     tl.store(partial + group * E + e, counts, mask=e < E)
     tl.store(inverse + r, -1, mask=r < R)
-    tl.store(indices + r, -1, mask=r < BOUND)
-    tail = r + NB * B
-    tl.store(indices + tail, -1, mask=tail < BOUND)
+    for block in tl.static_range(INIT_BLOCKS):
+        pos = r + block * NB * B
+        tl.store(indices + pos, -1, mask=pos < BOUND)
 
 
 @triton.jit
@@ -43,6 +44,7 @@ def _block_prefixes(
     NB: tl.constexpr,
     RB: tl.constexpr,
     EH: tl.constexpr,
+    ALIGNMENT: tl.constexpr,
 ):
     r = tl.arange(0, RB)
     e = tl.arange(0, EH)
@@ -52,7 +54,7 @@ def _block_prefixes(
         other=0,
     )
     counts = tl.sum(values, axis=0)
-    padded = tl.cdiv(counts, 64) * 64
+    padded = tl.cdiv(counts, ALIGNMENT) * ALIGNMENT
     starts = tl.cumsum(padded, axis=0) - padded
     block_starts = starts[None, :] + tl.cumsum(values, axis=0) - values
     tl.store(
@@ -113,12 +115,12 @@ def _gather_tokens(
                 tl.store(out_scale + pos, s)
 
 
-def permute64(a, scale, ids, mapping, experts, out):
+def permute64(a, scale, ids, mapping, experts, out, alignment=64):
     assert a.is_contiguous() and ids.is_contiguous() and mapping.is_contiguous()
     assert scale.is_contiguous() and scale.shape[1] == 1 and a.dtype == torch.int8
     routes = ids.numel()
     groups = triton.cdiv(routes, 1024)
-    bound = padded_route_rows(ids.shape[0], ids.shape[1], experts)
+    bound = padded_route_rows(ids.shape[0], ids.shape[1], experts, alignment)
     assert out.shape == (bound, a.shape[1])
     partial = torch.empty((groups, experts), device=a.device, dtype=torch.int32)
     prefix = torch.empty_like(partial)
@@ -138,6 +140,7 @@ def permute64(a, scale, ids, mapping, experts, out):
         groups,
         1024,
         triton.next_power_of_2(experts + 1),
+        triton.cdiv(bound, groups * 1024),
         num_warps=4,
     )
     _block_prefixes[(1,)](
@@ -147,6 +150,7 @@ def permute64(a, scale, ids, mapping, experts, out):
         groups,
         triton.next_power_of_2(groups),
         triton.next_power_of_2(experts),
+        alignment,
         num_warps=4,
     )
     _assign_positions[(groups, experts)](

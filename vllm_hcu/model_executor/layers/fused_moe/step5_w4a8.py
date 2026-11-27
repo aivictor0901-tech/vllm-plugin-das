@@ -53,11 +53,13 @@ def _make_experts_class(phase, backend="deepgemm"):
     )
     from vllm.model_executor.layers.fused_moe.utils import _resize_cache
     from vllm.model_executor.layers.fused_moe.activation import MoEActivation
-    from vllm_hcu.ops.step5.w4a8 import require_gemm_op
+    from vllm_hcu.ops.step5.w4a8 import prefill_wasp_kernel, require_gemm_op
 
     op = require_gemm_op(backend)
+    prefill_wasp = is_prefill and prefill_wasp_kernel() is not None
 
     def expert_gemm(a, b, output, indices, config):
+        mode = config["MODE"]
         op(
             a[0],
             b[0],
@@ -65,7 +67,8 @@ def _make_experts_class(phase, backend="deepgemm"):
             a[1].contiguous(),
             b[1].contiguous(),
             indices.contiguous(),
-            config["MODE"],
+            mode,
+            prefill_wasp and mode == 1006,
         )
         return output
 
@@ -73,6 +76,7 @@ def _make_experts_class(phase, backend="deepgemm"):
         _hcu_step5_owner = True
         _hcu_step5_w4a8 = True
         _hcu_step5_w4a8_gemm_backend = backend
+        _hcu_step5_prefill_wasp = prefill_wasp
 
         @staticmethod
         def _supports_activation(activation):
@@ -150,7 +154,7 @@ def _make_experts_class(phase, backend="deepgemm"):
                 expert_tokens_meta,
                 activation,
             )
-            _, alignment = w4a8_execution_plan(M, phase)
+            _, alignment = w4a8_execution_plan(M, phase, prefill_wasp=prefill_wasp)
             if (not is_prefill and alignment == 64) or (N, K) != (3072, 4096):
                 return base
             if expert_tokens_meta is None:
@@ -213,7 +217,7 @@ def _make_experts_class(phase, backend="deepgemm"):
                 and a1q_scale.is_contiguous()
                 and expert_tokens_meta is None
             )
-            use_large64 = (
+            use_large = (
                 is_prefill
                 and not use_small
                 and expert_tokens_meta is None
@@ -228,8 +232,9 @@ def _make_experts_class(phase, backend="deepgemm"):
             )
             mode, alignment = w4a8_execution_plan(
                 hidden_states.shape[0], phase, generic_decode=generic_decode,
+                prefill_wasp=prefill_wasp and (use_small or use_large),
             )
-            if not use_small and not generic_decode:
+            if not (use_small or use_large or generic_decode):
                 # Other dispatchers and metadata retain their existing ABI.
                 mode, alignment = 1002, 64
             aligned = dg.compute_aligned_M(
@@ -239,10 +244,8 @@ def _make_experts_class(phase, backend="deepgemm"):
                 alignment=self.ALIGNMENT,
                 expert_tokens_meta=expert_tokens_meta,
             )
-            if use_small:
+            if use_small or use_large:
                 aligned = padded_route_rows(hidden_states.shape[0], topk, E, alignment)
-            elif use_large64:
-                aligned = padded_route_rows(hidden_states.shape[0], topk, E)
             gathered = _resize_cache(workspace13.view(dtype=torch.int8), (aligned, K))
             fused_scatter = getattr(expert_tokens_meta, "_hcu_step5_fused_scatter", None)
             if fused_scatter is not None:
@@ -269,7 +272,7 @@ def _make_experts_class(phase, backend="deepgemm"):
                         global_num_experts,
                         alignment,
                     )
-            elif use_large64:
+            elif use_large:
                 aq, scales, indices, inverse, _ = permute64(
                     hidden_states,
                     self._ensure_2d_scale(a1q_scale),
@@ -277,6 +280,7 @@ def _make_experts_class(phase, backend="deepgemm"):
                     expert_map,
                     E,
                     gathered,
+                    alignment,
                 )
             else:
                 aq, scales, indices, inverse, _ = dg.deepgemm_moe_permute(
@@ -439,10 +443,12 @@ def prepare_step5_w4a8(method, layer, phase):
     experts.process_weights_after_loading(layer)
     method.moe_quant_config = quant
     method.moe_kernel = mk.FusedMoEKernel(prepare, experts)
-    decode_mode, decode_alignment = w4a8_execution_plan(128, phase)
+    gemm_mode, route_alignment = w4a8_execution_plan(
+        128, phase, prefill_wasp=Experts._hcu_step5_prefill_wasp,
+    )
     logger.info_once(
-        "[step5-w4a8] gemm_backend=%s, decode MODE=%d/pad%d, profile=%s, static EP%d",
-        backend, decode_mode, decode_alignment, phase, parallel.ep_size,
+        "[step5-w4a8] gemm_backend=%s, MODE=%d/pad%d, profile=%s, static EP%d",
+        backend, gemm_mode, route_alignment, phase, parallel.ep_size,
     )
     # The modular prepare owns quantize/dispatch and the modular kernel
     # owns pipe/DBO/combine. Outer naive dispatch must therefore be off.
@@ -455,9 +461,9 @@ def prepare_step5_w4a8(method, layer, phase):
         "weight_bits": 4,
         "gemm_backend": backend,
         "gemm_op": str(require_gemm_op(backend)),
-        "gemm_mode": decode_mode,
+        "gemm_mode": gemm_mode,
         "reduction_block": 2048,
-        "small_route_alignment": decode_alignment,
+        "small_route_alignment": route_alignment,
         "prefill_activation": "persistent8x512",
         "profile": phase,
         "shared_add_protocol": "EP_COMBINE provider/finalize",
