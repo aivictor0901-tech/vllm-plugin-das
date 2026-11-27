@@ -125,6 +125,14 @@ from vllm.model_executor.models.utils import (
 
 logger = init_logger("vllm.step5.step5_text")
 
+FUSED_ATTN_QK_NORM_ROPE = henvs.optional_custom_op_enabled(
+    os.getenv("VLLM_HCU_STEP5_FUSED_ATTN_QK_NORM_ROPE", "0") == "1"
+)
+if FUSED_ATTN_QK_NORM_ROPE:
+    from vllm_hcu.model_executor.layers.step5_attention_qk_norm_rope import (
+        can_use as can_fuse_attention_qk_norm_rope,
+    )
+
 # Checkpoint tensors that belong to the DSA indexer. Only consulted when DSA is
 # switched off: the dense-equivalent path does not allocate them, and they are
 # counted at load time so a skip stays distinguishable from a successful load.
@@ -1279,6 +1287,15 @@ class Step5Attention(nn.Module):
             self.int8_gate_quant and self.swa_fused_qk
             and _get_step5_swa_fused().INT8_EPILOGUE
         )
+        self.dsa_gate_quant_no_copy = False
+        if henvs.optional_custom_op_enabled(
+            os.getenv("VLLM_HCU_STEP5_DSA_GATE_QUANT_NO_COPY", "0") == "1"
+        ):
+            from vllm_hcu.models import step5_dsa_gate_quant
+
+            self.dsa_gate_quant_no_copy = step5_dsa_gate_quant.configured_for(self)
+            if self.dsa_gate_quant_no_copy:
+                step5_dsa_gate_quant.require_graph_boundary()
 
         # Step-5 uses 1/3 on full-attention layers, so take the rotary width from
         # get_rope (int(head_size * factor)) instead of assuming 1 or 1/2.
@@ -1513,15 +1530,26 @@ class Step5Attention(nn.Module):
                 int8_output=int8_epilogue,
             )
             return self._gate_o_proj(attn_output, extra_dims, hidden_states)
-        q_by_head = q.view(*q.shape[:-1], q.shape[-1] // self.head_dim, self.head_dim)
-        q_by_head = self.q_norm(q_by_head.contiguous())
-        q = q_by_head.view(q.shape)
+        if FUSED_ATTN_QK_NORM_ROPE and can_fuse_attention_qk_norm_rope(
+            self, q, k, positions
+        ):
+            q, k = torch.ops.vllm.step5_attention_qk_norm_rope(
+                q, k, self.q_norm.weight, self.k_norm.weight,
+                self.rotary_emb.cos_sin_cache, positions,
+                self.head_dim, self.rotary_emb.rotary_dim,
+                self.q_norm.variance_epsilon, self.k_norm.variance_epsilon,
+                self.rotary_emb.is_neox_style, False,
+            )
+        else:
+            q_by_head = q.view(*q.shape[:-1], q.shape[-1] // self.head_dim, self.head_dim)
+            q_by_head = self.q_norm(q_by_head.contiguous())
+            q = q_by_head.view(q.shape)
 
-        k_by_head = k.view(*k.shape[:-1], k.shape[-1] // self.head_dim, self.head_dim)
-        k_by_head = self.k_norm(k_by_head.contiguous())
-        k = k_by_head.view(k.shape)
-        if self.use_rope:
-            q, k = self.rotary_emb(positions, q, k)
+            k_by_head = k.view(*k.shape[:-1], k.shape[-1] // self.head_dim, self.head_dim)
+            k_by_head = self.k_norm(k_by_head.contiguous())
+            k = k_by_head.view(k.shape)
+            if self.use_rope:
+                q, k = self.rotary_emb(positions, q, k)
         if self.indexer is not None:
             # Publishes layer.attn.step4_sparse_plan, which the DSA backend
             # reads. It needs hidden_states, which Attention.forward never sees
@@ -1531,6 +1559,12 @@ class Step5Attention(nn.Module):
                 self.indexer.forward(idx, positions)
             else:
                 self.indexer.forward(hidden_states, positions)
+        if self.dsa_gate_quant_no_copy:
+            from vllm_hcu.models import step5_dsa_gate_quant
+
+            if step5_dsa_gate_quant.can_use(self, q, extra_dims):
+                quantized = step5_dsa_gate_quant.forward(self, q, k, v, extra_dims)
+                return self._gate_o_proj(quantized, extra_dims, hidden_states)
         attn_output = self.attn(q, k, v)
         return self._gate_o_proj(attn_output, extra_dims, hidden_states)
 

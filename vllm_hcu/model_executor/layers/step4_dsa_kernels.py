@@ -52,6 +52,10 @@ from vllm_hcu.platforms import envs as henvs
 
 # Step-4 compresses every 8 consecutive tokens into one summary vector. The CuTe kernels
 # hard-specialize on this; we keep it a parameter but never exercise anything else.
+_FUSED_INDEXER_QK_NORM_ROPE = henvs.optional_custom_op_enabled(
+    os.getenv("VLLM_HCU_STEP5_FUSED_INDEXER_QK_NORM_ROPE", "0") == "1"
+)
+
 REGION_BLOCK_SIZE = 8
 PROXY_DIM = 256
 
@@ -152,7 +156,9 @@ def _store_value(value, dtype: tl.constexpr, ROUND_E4M3: tl.constexpr):
 
 
 @triton.jit
-def _indexer_norm_rope_kernel(
+def _indexer_norm_rope_body(
+    token,
+    head,
     x_ptr,
     out_ptr,
     weight_ptr,
@@ -189,8 +195,6 @@ def _indexer_norm_rope_kernel(
     tensor -- and overlapping stores from one program would depend on store ordering the
     compiler does not promise.
     """
-    token = tl.program_id(0)
-    head = tl.program_id(1)
     base = token * stride_x_token + head * head_dim
     out_base = token * stride_out_token + head * head_dim
 
@@ -287,6 +291,59 @@ def _indexer_norm_rope_kernel(
         ),
         mask=half_ok,
     )
+
+
+@triton.jit
+def _indexer_norm_rope_kernel(
+    x_ptr, out_ptr, weight_ptr, bias_ptr, cos_ptr, sin_ptr, positions_ptr,
+    stride_x_token, stride_out_token, stride_cos, eps, weight_bias,
+    head_dim: tl.constexpr, rotary_dim: tl.constexpr,
+    SUBTRACT_MEAN: tl.constexpr, HAS_BIAS: tl.constexpr,
+    ROUND_E4M3: tl.constexpr, BLOCK_D: tl.constexpr, BLOCK_R: tl.constexpr,
+):
+    _indexer_norm_rope_body(
+        tl.program_id(0), tl.program_id(1),
+        x_ptr, out_ptr, weight_ptr, bias_ptr, cos_ptr, sin_ptr, positions_ptr,
+        stride_x_token, stride_out_token, stride_cos, eps, weight_bias,
+        head_dim, rotary_dim, SUBTRACT_MEAN, HAS_BIAS, ROUND_E4M3, BLOCK_D, BLOCK_R,
+    )
+
+
+@triton.jit
+def _indexer_qk_norm_rope_kernel(
+    Q, K, QO, KO, QW, KW, KB, C, S, P,
+    sq, sk, soq, sok, sc, eps, q_weight_bias,
+    NQ: tl.constexpr, D: tl.constexpr, R: tl.constexpr,
+    ROUND_Q: tl.constexpr, BD: tl.constexpr, BR: tl.constexpr,
+):
+    token, head = tl.program_id(0), tl.program_id(1)
+    if head < NQ:
+        _indexer_norm_rope_body(
+            token, head, Q, QO, QW, QW, C, S, P, sq, soq, sc,
+            eps, q_weight_bias, D, R, False, False, ROUND_Q, BD, BR,
+        )
+    else:
+        _indexer_norm_rope_body(
+            token, head - NQ, K, KO, KW, KB, C, S, P, sk, sok, sc,
+            eps, 0.0, D, R, True, True, False, BD, BR,
+        )
+
+
+def _paired_indexer_norm_rope(
+    q, k, qw, kw, kb, cos, sin, positions, *, num_q_heads, num_k_heads,
+    head_dim, rotary_dim, eps, q_norm_weight_bias, round_q,
+):
+    qo = torch.empty(q.shape, dtype=q.dtype, device=q.device)
+    ko = torch.empty(k.shape, dtype=k.dtype, device=k.device)
+    if q.shape[0] > 0:
+        _indexer_qk_norm_rope_kernel[(q.shape[0], num_q_heads + num_k_heads)](
+            q, k, qo, ko, qw, kw, kb, cos, sin, positions,
+            q.stride(0), k.stride(0), qo.stride(0), ko.stride(0), cos.stride(0),
+            eps, q_norm_weight_bias, NQ=num_q_heads, D=head_dim, R=rotary_dim,
+            ROUND_Q=round_q, BD=triton.next_power_of_2(head_dim),
+            BR=triton.next_power_of_2(rotary_dim),
+        )
+    return qo, ko
 
 
 def _norm_rope(
@@ -410,6 +467,14 @@ def indexer_norm_rope(
         or positions.dtype not in (torch.int32, torch.int64)
     ):
         raise ValueError("positions must be one contiguous integer per token")
+    if _FUSED_INDEXER_QK_NORM_ROPE:
+        q_out, k_out = _paired_indexer_norm_rope(
+            index_q, index_k, q_norm_weight, k_norm_weight, k_norm_bias,
+            cos, sin, positions, num_q_heads=num_q_heads,
+            num_k_heads=num_k_heads, head_dim=head_dim, rotary_dim=rotary_dim,
+            eps=eps, q_norm_weight_bias=q_norm_weight_bias, round_q=round_q,
+        )
+        return q_out, k_out, index_z.contiguous() if contiguous_z else index_z
     return (
         _norm_rope(
             index_q,
