@@ -38,6 +38,12 @@ def warn_ignored_step5_envs() -> None:
 
 
 ENVIRONMENT_VARIABLES = {
+    "VLLM_HCU_STEP5_PREFILL_GATE_INT8": lambda: (
+        os.getenv("VLLM_HCU_STEP5_PREFILL_GATE_INT8", "0") == "1"
+    ),
+    "VLLM_HCU_STEP5_PREFILL_SHARED_INT8": lambda: (
+        os.getenv("VLLM_HCU_STEP5_PREFILL_SHARED_INT8", "0") == "1"
+    ),
     # Include the opt-in in vLLM's environment/cache factors.
     "VLLM_HCU_STEP5_FUSED_ATTN_QK_NORM_ROPE": lambda: (
         os.getenv("VLLM_HCU_STEP5_FUSED_ATTN_QK_NORM_ROPE", "0") == "1"

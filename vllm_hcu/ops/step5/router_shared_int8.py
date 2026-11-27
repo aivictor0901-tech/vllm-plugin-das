@@ -302,9 +302,14 @@ def _shared_int8_shape(input, xscale, wscale):
 def _shared_int8_epilogue(
     input: torch.Tensor, xscale: torch.Tensor | None = None,
     wscale: torch.Tensor | None = None, router_columns: int = 352, limit: float = 7.0,
-    block_m: int = 32,
+    block_m: int = 32, prefill_dense: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     rows, width = _shared_int8_shape(input, xscale, wscale)
+    if prefill_dense and (
+        width != 1536 or input.dtype != torch.bfloat16 or not input.is_cuda
+        or xscale is not None or wscale is not None
+    ):
+        raise ValueError("Step5 dense Prefill epilogue requires BF16 GPU gate/up")
     if block_m not in (16, 32) or (width == 384 and block_m != 32):
         raise ValueError("shared epilogue requires BM32 for I384 or BM16/BM32 for I1536")
     if width == 384:
@@ -326,7 +331,16 @@ def _shared_int8_epilogue(
         raise ValueError("invalid shared gate/up width")
     q = input.new_empty((rows, width), dtype=torch.int8)
     scale = input.new_empty((rows, 1), dtype=torch.float32)
-    if rows:
+    if rows and prefill_dense:
+        from vllm_hcu.model_executor.layers.fused_moe.step5_w4a8_kernels import (
+            activation_persistent,
+        )
+
+        activation_persistent[(min(triton.cdiv(rows, 4), 1024),)](
+            input, q, scale, None, ROWS=rows, I=width, BM=4, CH=width // 3,
+            DENSE=True, LIMIT=limit, num_warps=4, num_stages=1,
+        )
+    elif rows:
         _shared_int8_wide_epilogue_kernel[(rows,)](
             input, xscale, wscale, q, scale, M=rows, I=width,
             NR=router_columns, LIMIT=limit, FROM_PARTIALS=input.dtype == torch.int32,
@@ -336,7 +350,10 @@ def _shared_int8_epilogue(
     return q, scale
 
 
-def _shared_int8_epilogue_fake(input, xscale=None, wscale=None, router_columns=352, limit=7.0, block_m=32):
+def _shared_int8_epilogue_fake(
+    input, xscale=None, wscale=None, router_columns=352, limit=7.0,
+    block_m=32, prefill_dense=False,
+):
     rows, width = _shared_int8_shape(input, xscale, wscale)
     if block_m not in (16, 32) or (width == 384 and block_m != 32):
         raise ValueError("shared epilogue requires BM32 for I384 or BM16/BM32 for I1536")

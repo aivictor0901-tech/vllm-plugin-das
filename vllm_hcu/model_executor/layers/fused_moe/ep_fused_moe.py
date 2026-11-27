@@ -96,6 +96,7 @@ def _ep_swiglustep_quant_deepgemm_kernel(
     D: tl.constexpr, LIMIT: tl.constexpr, DTYPE_MAX: tl.constexpr,
     BLOCK_M: tl.constexpr, CH: tl.constexpr,
 ):
+    # Retained as a numerical/benchmark reference; production uses LightOp.
     # DeepGEMM marks padding in a per-row array, including holes between
     # experts. Reuse native Step5's post-SiLU clamp and BF16 rounding before
     # calculating amax; LightOp's fused activation clamps before SiLU.
@@ -268,7 +269,7 @@ def ep_swiglustep_quant(cache1, sorted_weights, nvalid, rows, limit=7.0, q=None)
 
 
 def ep_swiglustep_quant_deepgemm(cache1, expert_ids, q, limit=7.0):
-    """Native Step5 activation/quantization for DeepGEMM's padded row layout.
+    """LightOp Step5 activation/quantization for DeepGEMM's padded row layout.
 
     ``q`` is caller-owned scratch; only per-row scales are allocated here.
     Input and output must be disjoint contiguous buffers. Negative expert ids
@@ -292,16 +293,10 @@ def ep_swiglustep_quant_deepgemm(cache1, expert_ids, q, limit=7.0):
         if (start < other + q.numel() * q.element_size()
                 and other < start + cache1.numel() * cache1.element_size()):
             raise ValueError("Step5 DeepGEMM activation input and output must not overlap")
-    scale = torch.empty((rows, 1), dtype=torch.float32, device=cache1.device)
-    if rows:
-        bm = ACT_CFG["BLOCK_M"]
-        grid = (max(1, min(triton.cdiv(rows, bm),
-                           _num_cus(cache1.device.index) * ACT_CFG["CTAS_PER_CU"])),)
-        _ep_swiglustep_quant_deepgemm_kernel[grid](
-            q, scale, cache1, expert_ids, rows,
-            D=d, LIMIT=float(limit), DTYPE_MAX=torch.finfo(FP8).max,
-            BLOCK_M=bm, CH=d // 3, num_warps=ACT_CFG["num_warps"], num_stages=1)
-    return q, scale
+    from lightop.activation import step5_swiglustep_fp8_quant
+
+    return step5_swiglustep_fp8_quant(
+        cache1, expert_ids, output=q, limit=limit)
 
 
 def ep_masked_moe_sum(cache3, out, topk_ids, expert_map, scale=1.0, add=None, add_start=0):

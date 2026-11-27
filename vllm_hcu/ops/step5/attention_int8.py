@@ -12,6 +12,8 @@ Their owners retain the native hipBLASLt projections and TP reduction.
 """
 from __future__ import annotations
 
+import os
+
 import torch
 from triton.language.extra import libdevice
 
@@ -20,6 +22,8 @@ from vllm.utils.torch_utils import direct_register_custom_op
 
 
 ATTN_INT8_MAX_M = 1024
+_PREFILL_GATE_INT8_MAX_M = 32768
+_PREFILL_GATE_INT8 = os.environ.get("VLLM_HCU_STEP5_PREFILL_GATE_INT8", "0") == "1"
 
 
 @triton.jit
@@ -31,7 +35,7 @@ def _gate_quant_int8_kernel(
     row = tl.program_id(0)
     col = tl.arange(0, B)
     width: tl.constexpr = NH * D
-    # The measured 3072/1536 widths have three power-of-two segments. Match
+    # The 1536, 3072 and 12288 widths have three power-of-two segments. Match
     # LightOp's reduction and division order, including the 1e-10 amax floor.
     x0 = tl.load(x_ptr + row * width + col).to(tl.float32)
     x1 = tl.load(x_ptr + row * width + B + col).to(tl.float32)
@@ -52,15 +56,22 @@ def _gate_quant_int8_kernel(
 
 
 def usable_gate_quant_int8(x: torch.Tensor, gate: torch.Tensor) -> bool:
-    """Static metadata guard for TP1/TP4/TP8 BF16 attention shards."""
-    return (
+    """Select the supported BF16 attention shards and token counts."""
+    if not (
         x.is_cuda and x.ndim == 2 and x.dtype == torch.bfloat16
-        and x.is_contiguous() and 0 <= x.shape[0] <= ATTN_INT8_MAX_M
+        and x.is_contiguous()
         and gate.ndim == 2 and gate.dtype == torch.bfloat16
         and gate.shape[0] == x.shape[0] and gate.shape[1] in (8, 16, 64)
         and x.shape[1] == gate.shape[1] * 192
         and gate.stride(1) == 1 and gate.stride(0) >= gate.shape[1]
         and gate.device == x.device
+    ):
+        return False
+    if 0 <= x.shape[0] <= ATTN_INT8_MAX_M:
+        return True
+    return (
+        _PREFILL_GATE_INT8 and gate.shape[1] == 64
+        and ATTN_INT8_MAX_M < x.shape[0] <= _PREFILL_GATE_INT8_MAX_M
     )
 
 
@@ -71,7 +82,7 @@ def _gate_quant_int8(x: torch.Tensor, gate: torch.Tensor) -> tuple[torch.Tensor,
         _gate_quant_int8_kernel[(x.shape[0],)](
             x, gate, xq, xs, gate.stride(0),
             NH=gate.shape[1], D=192, B=x.shape[1] // 3,
-            num_warps=2, num_stages=1,
+            num_warps=4 if x.shape[0] > ATTN_INT8_MAX_M else 2, num_stages=1,
         )
     return xq, xs
 

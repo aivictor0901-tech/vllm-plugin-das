@@ -646,11 +646,10 @@ def _can_fuse_int8_shared_expert(mlp: "Step5MLP") -> bool:
     )
 
 
-def _can_fuse_int8_attention_gate(layer: RowParallelLinear) -> bool:
+def _can_consume_dynamic_int8(layer: RowParallelLinear) -> bool:
     """Reuse only the native symmetric dynamic channel-INT8 input contract."""
     if not (
-        INT8_ATTN_GATE_QUANT
-        and MIXED_DENSE_INT8
+        MIXED_DENSE_INT8
         and not MIXED_DENSE_DEQUANT
         and henvs.custom_quantization_gemm_enabled()
     ):
@@ -678,6 +677,10 @@ def _can_fuse_int8_attention_gate(layer: RowParallelLinear) -> bool:
         and callable(supports)
         and supports()
     )
+
+
+def _can_fuse_int8_attention_gate(layer: RowParallelLinear) -> bool:
+    return INT8_ATTN_GATE_QUANT and _can_consume_dynamic_int8(layer)
 
 
 class BF16FP32RouterLinear(ReplicatedLinear):
@@ -997,6 +1000,14 @@ class Step5MLP(nn.Module):
             and getattr(self.down_proj, "input_is_parallel", False)
             and callable(supports) and supports()
         )
+        self._shared_prefill_output_int8 = (
+            os.getenv("VLLM_HCU_STEP5_PREFILL_SHARED_INT8", "0") == "1"
+            and henvs.custom_ops_enabled()
+            and ".share_expert" in prefix and self.limit is not None
+            and self.gate_up_proj.output_size_per_partition == 3072
+            and self.act_fn.enabled()
+            and _can_consume_dynamic_int8(self.down_proj)
+        )
 
     def enable_fused_router_shared(self, max_m: int) -> None:
         """Keep short fused-router batches on the stream that made the act."""
@@ -1063,11 +1074,18 @@ class Step5MLP(nn.Module):
                 gate_up, _ = self.gate_up_proj._forward_with_hcu_quanted(
                     hidden_states, x_and_scale_quanted,
                 )
-            if getattr(self, "_shared_output_int8", False):
+            prefill_epilogue = (
+                getattr(self, "_shared_prefill_output_int8", False)
+                and gate_up.is_cuda and gate_up.dtype == torch.bfloat16
+                and gate_up.ndim == 2 and gate_up.is_contiguous()
+                and 1024 < gate_up.shape[0] <= 32768
+            )
+            if getattr(self, "_shared_output_int8", False) or prefill_epilogue:
                 from vllm_hcu.ops.step5 import router_shared_int8  # registers the custom op
 
                 intermediate_act = torch.ops.vllm.step5_shared_int8_epilogue(
                     gate_up, None, None, 352, float(self.limit),
+                    prefill_dense=prefill_epilogue,
                 )
             else:
                 intermediate_act = self.act_fn(gate_up)
