@@ -2470,6 +2470,163 @@ class MooncakeConnectorWorker:
     # sequential writes over disjoint ranges.
     _MAX_SEND_DESCS = 8192
 
+    def _send_blocks_vector_gather(
+        self,
+        remote_session: str,
+        src_ptrs: list[int],
+        dst_ptrs: list[int],
+        lengths: list[int],
+        gather_jobs: list,
+        slot_index: int,
+    ) -> tuple[int, float, float, float, int, int]:
+        """NHD gather with one advanced-indexing gather per (tensor, head)."""
+        scratch = getattr(self, "_nhd_scratch", None)
+        if scratch is None:
+            return -1, 0.0, 0.0, 0.0, 0, 0
+        slot_count = 4
+        slot_bytes = int(scratch.numel()) // slot_count
+        slot_base = (slot_index % slot_count) * slot_bytes
+        scratch_ptr = int(scratch.data_ptr()) + slot_base
+        capacity = slot_bytes
+        limit = self._MAX_SEND_DESCS
+
+        gather_s = 0.0
+        sync_s = 0.0
+        transfer_s = 0.0
+        gather_count = 0
+        batch_count = 0
+
+        # Group gather descriptors by (tensor, head, payload length).  The
+        # descriptor order is irrelevant to the remote write: only each
+        # (destination address, length) pair matters.
+        group_map: dict[tuple, dict] = {}
+        group_order: list[tuple] = []
+        raw_items: list[int] = []
+        for idx, job in enumerate(gather_jobs):
+            if job is None:
+                raw_items.append(idx)
+                continue
+            tensor, block_id, head_index = job
+            key = (id(tensor), int(head_index), int(lengths[idx]))
+            group = group_map.get(key)
+            if group is None:
+                group = {
+                    "tensor": tensor,
+                    "head": int(head_index),
+                    "per": int(lengths[idx]),
+                    "indices": [],
+                }
+                group_map[key] = group
+                group_order.append(key)
+            group["indices"].append(idx)
+        group_order.sort(key=lambda key: group_map[key]["indices"][0])
+
+        # Pre-chunk each gather group so one group never exceeds the scratch
+        # slot or the per-call descriptor limit.
+        items: list[tuple] = []
+        for key in group_order:
+            group = group_map[key]
+            per = group["per"]
+            if per <= 0:
+                return -1, 0.0, 0.0, 0.0, 0, 0
+            max_per = min(capacity // per, limit)
+            if max_per <= 0:
+                return -1, 0.0, 0.0, 0.0, 0, 0
+            indices = group["indices"]
+            for offset in range(0, len(indices), max_per):
+                items.append(("gather", key, indices[offset : offset + max_per]))
+        for idx in raw_items:
+            items.append(("raw", idx, None))
+
+        index = 0
+        ret_value = 0
+        while index < len(items) and ret_value == 0:
+            batch_items: list[tuple] = []
+            batch_desc_count = 0
+            offset = 0
+            while index < len(items):
+                kind, key_or_idx, chunk = items[index]
+                if kind == "gather":
+                    n = len(chunk)
+                    item_bytes = n * group_map[key_or_idx]["per"]
+                else:
+                    n = 1
+                    item_bytes = lengths[key_or_idx]
+                if batch_items and (
+                    offset + item_bytes > capacity
+                    or batch_desc_count + n > limit
+                ):
+                    break
+                if item_bytes > capacity or n > limit:
+                    return -1, 0.0, 0.0, 0.0, 0, 0
+                batch_items.append(items[index])
+                offset += item_bytes
+                batch_desc_count += n
+                index += 1
+            if not batch_items:
+                break
+
+            batch_count += 1
+            batch_src: list[int] = []
+            batch_dst: list[int] = []
+            batch_len: list[int] = []
+            cur = 0
+            gathered = False
+            gather_t0 = time.perf_counter()
+            for kind, key_or_idx, chunk in batch_items:
+                if kind == "gather":
+                    group = group_map[key_or_idx]
+                    tensor = group["tensor"]
+                    head = group["head"]
+                    per = group["per"]
+                    n = len(chunk)
+                    block_ids = [int(gather_jobs[idx][1]) for idx in chunk]
+                    block_index = torch.tensor(
+                        block_ids, dtype=torch.long, device=tensor.device
+                    )
+                    gathered_tensor = tensor[block_index, head]
+                    flat = gathered_tensor.contiguous().reshape(-1)
+                    if flat.dtype != torch.uint8:
+                        flat = flat.view(torch.uint8)
+                    item_bytes = n * per
+                    if flat.numel() != item_bytes:
+                        logger.error(
+                            "VECTOR_GATHER size mismatch: tensor=%s head=%d "
+                            "blocks=%d per=%d got=%d expected=%d",
+                            getattr(tensor, "shape", None),
+                            head,
+                            n,
+                            per,
+                            flat.numel(),
+                            item_bytes,
+                        )
+                        return -1, 0.0, 0.0, 0.0, 0, 0
+                    scratch.narrow(0, slot_base + cur, item_bytes).copy_(flat)
+                    for j, idx in enumerate(chunk):
+                        batch_src.append(scratch_ptr + cur + j * per)
+                        batch_dst.append(dst_ptrs[idx])
+                        batch_len.append(per)
+                    cur += item_bytes
+                    gather_count += n
+                    gathered = True
+                else:
+                    idx = key_or_idx
+                    batch_src.append(src_ptrs[idx])
+                    batch_dst.append(dst_ptrs[idx])
+                    batch_len.append(lengths[idx])
+                    cur += lengths[idx]
+            gather_s += time.perf_counter() - gather_t0
+            if gathered:
+                t0 = time.perf_counter()
+                torch.cuda.synchronize(scratch.device)
+                sync_s += time.perf_counter() - t0
+            t0 = time.perf_counter()
+            ret_value = self.engine.batch_transfer_sync_write(
+                remote_session, batch_src, batch_dst, batch_len
+            )
+            transfer_s += time.perf_counter() - t0
+        return ret_value, gather_s, sync_s, transfer_s, gather_count, batch_count
+
     def _send_blocks(
         self,
         remote_session: str,
@@ -2481,18 +2638,44 @@ class MooncakeConnectorWorker:
     ) -> int:
         start_time = time.perf_counter()
         total_descs = len(src_ptrs)
+        total_bytes = sum(lengths)
+        timing_enabled = bool(os.environ.get("VLLM_STEP5_XFER_TIMING"))
+        gather_s = 0.0
+        sync_s = 0.0
+        transfer_s = 0.0
+        gather_count = 0
+        batch_count = 0
         limit = self._MAX_SEND_DESCS
         ret_value = 0
         if gather_jobs is None:
             for offset in range(0, total_descs, limit):
+                batch_count += 1
+                t0 = time.perf_counter()
                 ret_value = self.engine.batch_transfer_sync_write(
                     remote_session,
                     src_ptrs[offset : offset + limit],
                     dst_ptrs[offset : offset + limit],
                     lengths[offset : offset + limit],
                 )
+                transfer_s += time.perf_counter() - t0
                 if ret_value != 0:
                     break
+        elif os.environ.get("VLLM_STEP5_VECTOR_GATHER"):
+            (
+                ret_value,
+                gather_s,
+                sync_s,
+                transfer_s,
+                gather_count,
+                batch_count,
+            ) = self._send_blocks_vector_gather(
+                remote_session,
+                src_ptrs,
+                dst_ptrs,
+                lengths,
+                gather_jobs,
+                slot_index,
+            )
         else:
             # NHD pages keep a single head's rows strided, so each gathered
             # descriptor is copied into a registered scratch buffer first. The
@@ -2507,11 +2690,13 @@ class MooncakeConnectorWorker:
             capacity = slot_bytes
             index = 0
             while index < total_descs and ret_value == 0:
+                batch_count += 1
                 batch_src: list[int] = []
                 batch_dst: list[int] = []
                 batch_len: list[int] = []
                 gathered = False
                 offset = 0
+                gather_t0 = time.perf_counter()
                 while (
                     index < total_descs
                     and len(batch_src) < limit
@@ -2527,24 +2712,44 @@ class MooncakeConnectorWorker:
                         ).copy_(piece)
                         batch_src.append(scratch_ptr + offset)
                         gathered = True
+                        gather_count += 1
                     else:
                         batch_src.append(src_ptrs[index])
                     batch_dst.append(dst_ptrs[index])
                     batch_len.append(lengths[index])
                     offset += lengths[index]
                     index += 1
+                gather_s += time.perf_counter() - gather_t0
                 if not batch_src:
                     return -1
                 if gathered:
+                    t0 = time.perf_counter()
                     torch.cuda.synchronize(scratch.device)
+                    sync_s += time.perf_counter() - t0
+                t0 = time.perf_counter()
                 ret_value = self.engine.batch_transfer_sync_write(
                     remote_session, batch_src, batch_dst, batch_len
                 )
+                transfer_s += time.perf_counter() - t0
         duration = time.perf_counter() - start_time
+        if timing_enabled:
+            logger.warning(
+                "XFER_TIMING descs=%d gather_descs=%d batches=%d bytes=%d "
+                "gather_s=%.3f sync_s=%.3f transfer_s=%.3f total_s=%.3f ret=%d",
+                total_descs,
+                gather_count,
+                batch_count,
+                total_bytes,
+                gather_s,
+                sync_s,
+                transfer_s,
+                duration,
+                ret_value,
+            )
         if ret_value == 0:
             self.xfer_stats.record_transfer(
                 duration_s=duration,
-                total_bytes=sum(lengths),
+                total_bytes=total_bytes,
                 num_descs=total_descs,
             )
             logger.debug("Sending to %s done, took %s", remote_session, duration)
@@ -2556,7 +2761,7 @@ class MooncakeConnectorWorker:
                 ret_value,
                 duration,
                 total_descs,
-                sum(lengths),
+                total_bytes,
             )
         return ret_value
 

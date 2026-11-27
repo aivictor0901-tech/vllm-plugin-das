@@ -11,6 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import os
 import sys
+import time
 from typing import Any
 
 
@@ -100,6 +101,59 @@ def get_step5_pcp_metadata(
 _PCPDBG_COUNT = 0
 
 
+_PCP_GATHER_TIMING = {
+    "calls": 0,
+    "pad_s": 0.0,
+    "gather_s": 0.0,
+    "idx_s": 0.0,
+    "total_s": 0.0,
+    "by_sig": {},
+}
+
+
+def _record_pcp_gather_timing(tensor, context, width, pad_s, gather_s, idx_s, total_s):
+    state = _PCP_GATHER_TIMING
+    state["calls"] += 1
+    state["pad_s"] += pad_s
+    state["gather_s"] += gather_s
+    state["idx_s"] += idx_s
+    state["total_s"] += total_s
+    sig = (tuple(int(x) for x in tensor.shape[1:]), int(width),
+           int(context.group.world_size))
+    entry = state["by_sig"].setdefault(
+        sig, {"calls": 0, "pad": 0.0, "gather": 0.0, "idx": 0.0, "total": 0.0}
+    )
+    entry["calls"] += 1
+    entry["pad"] += pad_s
+    entry["gather"] += gather_s
+    entry["idx"] += idx_s
+    entry["total"] += total_s
+    if state["calls"] % 128 != 0:
+        return
+    top = sorted(state["by_sig"].items(), key=lambda kv: -kv[1]["total"])[:3]
+    top_str = "; ".join(
+        "%s:n=%d,tot=%.3f,g=%.3f,i=%.3f,p=%.3f"
+        % (key, val["calls"], val["total"], val["gather"], val["idx"], val["pad"])
+        for key, val in top
+    )
+    print(
+        "PCP_GATHER_TIMING pid=%d rank=%d calls=%d pad_s=%.3f gather_s=%.3f "
+        "idx_s=%.3f total_s=%.3f top=[%s]"
+        % (
+            os.getpid(),
+            int(context.group.rank_in_group),
+            state["calls"],
+            state["pad_s"],
+            state["gather_s"],
+            state["idx_s"],
+            state["total_s"],
+            top_str,
+        ),
+        flush=True,
+        file=sys.stderr,
+    )
+
+
 def gather_global_tokens(tensor: Any, context: Step5PCPMetadata) -> Any:
     """Gather equal-width local rows and restore the original request order.
 
@@ -115,13 +169,26 @@ def gather_global_tokens(tensor: Any, context: Step5PCPMetadata) -> Any:
         return tensor[:context.global_num_tokens]
     import torch
 
+    timing = bool(os.environ.get("VLLM_STEP5_PCP_GATHER_TIMING"))
+    total_t0 = time.perf_counter() if timing else 0.0
+    pad_s = 0.0
+    gather_s = 0.0
+    idx_s = 0.0
+
     width = context.local_padded_tokens
+    pad_t0 = time.perf_counter() if timing else 0.0
     if int(tensor.shape[0]) < width:
         padded = tensor.new_zeros((width, *tensor.shape[1:]))
         padded[:context.local_num_tokens].copy_(tensor[:context.local_num_tokens])
     else:
         padded = tensor[:width].contiguous()
+    if timing:
+        pad_s = time.perf_counter() - pad_t0
+
+    gather_t0 = time.perf_counter() if timing else 0.0
     gathered = context.group.all_gather(padded, dim=0)
+    if timing:
+        gather_s = time.perf_counter() - gather_t0
     if int(gathered.shape[0]) != width * int(context.group.world_size):
         raise RuntimeError("Step5 PCP gather returned an invalid token width")
     indices = context.global_restore_indices
@@ -155,7 +222,20 @@ def gather_global_tokens(tensor: Any, context: Step5PCPMetadata) -> Any:
         raise TypeError("Step5 PCP restore indices must use int64")
     if context.global_num_tokens == 0:
         return gathered[:0]
-    return torch.index_select(gathered, 0, indices)
+    idx_t0 = time.perf_counter() if timing else 0.0
+    result = torch.index_select(gathered, 0, indices)
+    if timing:
+        idx_s = time.perf_counter() - idx_t0
+        _record_pcp_gather_timing(
+            tensor,
+            context,
+            width,
+            pad_s,
+            gather_s,
+            idx_s,
+            time.perf_counter() - total_t0,
+        )
+    return result
 
 
 def global_cache_slot_mapping(context: Step5PCPMetadata) -> Any:
