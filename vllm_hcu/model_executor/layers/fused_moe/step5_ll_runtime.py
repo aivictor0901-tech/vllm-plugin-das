@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Opaque shape dispatch and serial Step5 LL counter lifetime.
 
-The counter path is opt-in, fixed LL, TP4/DP4 and DBO-off only. Both native
+The counter path is opt-in, fixed LL and DBO-off on supported topologies. Both native
 counters are reset by the existing shared/routed restore kernel after receive
 completion, including on empty ranks. No native synchronization is removed.
 """
@@ -115,12 +115,13 @@ def install_counter_reset(buffer):
     if os.getenv("HCU_STEP5_LL_FUSED_COUNTER_RESET", "0") != "1":
         return
     from vllm.config import get_current_vllm_config
+    from .step5_ll_topology import uses_step5_ll_fused_restore
     cfg = get_current_vllm_config()
-    p = cfg.parallel_config
-    if (p.all2all_backend != "deepep_low_latency" or p.tensor_parallel_size != 4
-            or p.data_parallel_size != 4 or p.pipeline_parallel_size != 1
-            or p.enable_dbo or cfg.compilation_config.pass_config.enable_sp):
-        raise ValueError("Fused LL counters require fixed LL TP4/DP4/PP1, DBO/SP off")
+    from .step5_replicated_shared import uses_replicated_shared_ll_restore
+    if not (uses_step5_ll_fused_restore(cfg)
+            or uses_replicated_shared_ll_restore(cfg)):
+        raise ValueError("Fused LL counters require fixed LL TP4/DP2, TP4/DP4 or "
+                         "TP1/DP16, PP1, EP, FP32 residuals, DBO/SP off")
     if hasattr(buffer, "_hcu_step5_counter_state"):
         return
     state = CounterState(torch.device("cuda", torch.cuda.current_device()))

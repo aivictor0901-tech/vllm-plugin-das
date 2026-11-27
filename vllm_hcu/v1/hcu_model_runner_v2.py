@@ -213,6 +213,12 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
         self._hsl_enabled = False
         self._hsl_pending = None
         self._hsl_batch = None
+        self._step5_decode_inputs = None
+        if (os.getenv("HCU_STEP5_CACHE_DECODE_METADATA") == "1"
+                and henvs.custom_ops_enabled() and is_step5_config(vllm_config)):
+            from vllm_hcu.v1.step5_decode_inputs import Step5DecodeInputs
+
+            self._step5_decode_inputs = Step5DecodeInputs()
 
     def _init_kv_zero_meta(self) -> None:
         """Build one upstream zeroer per cache group for mixed KV caches."""
@@ -256,6 +262,42 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
             return super().update_requests(scheduler_output)
         finally:
             zeroer.owners = None
+
+    def capture_model(self, profile_only: bool = False):
+        from vllm_hcu.v1.step5_boundary import ENABLED, EARLY_SUFFIX, retain_graphs
+        from vllm_hcu.v1.step5_context_graphs import configure_context_graphs
+
+        if not is_step5_config(self.vllm_config):
+            return super().capture_model(profile_only=profile_only)
+        # Profiling must see the expanded descriptor count as well, so vLLM
+        # reserves graph memory for all widths before allocating the real KV.
+        configure_context_graphs(self, profile_only=profile_only)
+        if profile_only or not ENABLED:
+            return super().capture_model(profile_only=profile_only)
+        parallel = self.parallel_config
+        if (parallel.pipeline_parallel_size != 1
+                or parallel.prefill_context_parallel_size != 1
+                or self.lora_config is not None):
+            raise ValueError("Step5 metadata overlap requires PP1/PCP1 without LoRA")
+        for groups in self.attn_groups:
+            for group in groups:
+                if getattr(group.get_metadata_builder(0), "aot_schedule", False):
+                    raise ValueError("Step5 early graph work requires metadata-free SWA scheduling")
+        if EARLY_SUFFIX:
+            from vllm_hcu.model_executor.layers.step4_dsa import Step4DSAMetadataBuilder
+
+            builders = [group.get_metadata_builder(0)
+                        for groups in self.attn_groups for group in groups]
+            dsa_builders = [builder for builder in builders
+                            if isinstance(builder, Step4DSAMetadataBuilder)]
+            if len(dsa_builders) != 1 or builders[-1] is not dsa_builders[0]:
+                raise ValueError("Early Step5 suffix requires one final DSA metadata producer")
+        with retain_graphs(self.cudagraph_manager):
+            result = super().capture_model(profile_only=profile_only)
+        pairs = self.cudagraph_manager._step5_boundary_pairs
+        logger.info("[step5-boundary] retained %d target graphs; first partition: %s",
+                    len(pairs), next(iter(pairs.values())).stats)
+        return result
 
     def load_model(self, load_dummy_weights: bool = False) -> None:
         """Load and materialize derived weights in the worker weights pool."""
@@ -429,7 +471,11 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
                 self._hsl_resolve()
                 self._hsl_attach(input_batch)
                 from vllm_hcu.v1.step5_hot_context import check_hot_graph_context
-                check_hot_graph_context(input_batch, args[0] if args else None, getattr(self, "_step5_hot_context_real_batch", False))
+                check_hot_graph_context(
+                    input_batch, args[0] if args else None,
+                    getattr(self, "_step5_hot_context_real_batch", False),
+                    limit_regions=getattr(self, "_step5_context_regions", None),
+                )
             return original_prepare_attn(input_batch, *args, **kwargs)
 
         model_state.prepare_attn = prepare_attn
@@ -512,11 +558,14 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
         return out
 
     def prepare_inputs(self, scheduler_output, batch_req_state, batch_desc):
-        input_batch = super().prepare_inputs(
-            scheduler_output,
-            batch_req_state,
-            batch_desc,
-        )
+        cache = self._step5_decode_inputs
+        if (cache is not None and scheduler_output.scheduled_spec_decode_tokens
+                and not batch_req_state.has_prefill and self.adaptive_verification is None
+                and self.pcp_manager is None and batch_desc.num_ubatches == 1
+                and batch_req_state.idx_mapping_np.dtype == np.int64):
+            input_batch = cache.prepare_inputs(self, scheduler_output, batch_req_state, batch_desc)
+        else:
+            input_batch = super().prepare_inputs(scheduler_output, batch_req_state, batch_desc)
         if self._hsl_enabled:
             # The mirror is resolved lazily in model_state.prepare_attn (see
             # _hsl_wrap_model_state), so all host work before the metadata

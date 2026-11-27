@@ -5,6 +5,7 @@
 import asyncio
 import logging
 import os
+import queue
 import re
 import threading
 import time
@@ -486,6 +487,10 @@ def _expand_transfer_regions(
     return regions
 
 
+_XFERDBG_COUNT = 0
+_XFERDBG_WANT = ("layers.3.self_attn.attn", "step5_summary_v1")
+
+
 def _compute_sender_transfer_plan(
     transfer_topo: TransferTopology,
     remote_tp_rank: int,
@@ -493,8 +498,14 @@ def _compute_sender_transfer_plan(
     local_kv_block_len: int,
     remote_kv_block_len: int,
     producer_cache_replicated: bool,
+    is_replicated_region: bool = False,
 ) -> tuple[bool, int, int, int]:
     """Plan one producer-rank to one consumer-rank copy for heterogeneous TP."""
+    if is_replicated_region:
+        # Identical payload on every producer TP rank: every consumer rank
+        # takes the whole region, exactly like a replicated producer cache.
+        return True, 0, 0, local_kv_block_len
+
     tp_ratio = transfer_topo.tp_ratio(remote_tp_size)
 
     if tp_ratio == 1:
@@ -544,12 +555,17 @@ def _validate_asymmetric_region_lengths(
     transfer_topo: TransferTopology,
     remote_tp_size: int,
     producer_cache_replicated: bool,
+    replicated_regions: frozenset[str] | set[str] = frozenset(),
 ) -> str | None:
     """Validate transfer-region metadata for a fixed producer/consumer pair.
 
     This checks registered KV regions, not per-request block counts. A region
     corresponds to one registered KV tensor, or one K/V half after expansion
     for layouts that store K and V together.
+
+    ``replicated_regions`` names regions whose payload is identical on every
+    producer TP rank (Step5 DSA summaries). They are copied whole rather than
+    sliced by tp_ratio, so their lengths must simply be equal.
     """
     if len(local_regions) != len(remote_regions):
         return (
@@ -573,6 +589,15 @@ def _validate_asymmetric_region_lengths(
     for idx, (local_region, remote_region) in enumerate(
         zip(local_regions, remote_regions)
     ):
+        if local_region.layer_name in replicated_regions:
+            if local_region.kv_block_len != remote_region.kv_block_len:
+                return (
+                    "Step5 replicated KV region length mismatch at region "
+                    f"{idx} ({local_region.layer_name}): "
+                    f"local={local_region.kv_block_len}, "
+                    f"remote={remote_region.kv_block_len}."
+                )
+            continue
         if tp_ratio == 1:
             if local_region.kv_block_len != remote_region.kv_block_len:
                 return (
@@ -803,6 +828,54 @@ def _get_tensor_dense_flag(tensor: torch.Tensor) -> bool | None:
     return None
 
 
+def _hcu_flash_registration_views(
+    layer_name: str,
+    cache: torch.Tensor,
+    spec: KVCacheSpec,
+    physical_blocks_per_logical_block: int,
+    layout: str | None = None,
+) -> list[tuple[str, torch.Tensor]]:
+    """Expose HCU [B, 2, N, H, C] pages as separate zero-copy K/V regions.
+
+    The attention tensor stays unchanged. LBHNC gives each K/V plane
+    contiguous [H, N, C] contents, preserving head-wise TP transfer offsets.
+    Explicit component names prevent matching these planes with fused v0.28
+    [B, H, N, 2*C] pages on an incompatible peer.
+    """
+    if not isinstance(cache, torch.Tensor) or cache.ndim != 5:
+        return [(layer_name, cache)]
+    ratio = physical_blocks_per_logical_block
+    if (
+        not isinstance(spec, (FullAttentionSpec, SlidingWindowSpec))
+        or isinstance(spec, (MLAAttentionSpec, SlidingWindowMLASpec))
+        or ratio <= 0
+        or spec.block_size % ratio
+    ):
+        raise ValueError(f"Unsupported HCU Flash KV page spec for {layer_name}.")
+    expected = (2, spec.block_size // ratio, spec.num_kv_heads, spec.head_size)
+    if tuple(cache.shape[1:]) != expected or cache.shape[0] <= 0:
+        raise ValueError(
+            f"HCU Flash KV page tensor for {layer_name} must have shape "
+            f"[B, {expected}], got {tuple(cache.shape)}."
+        )
+    plane_elements = expected[1] * expected[2] * expected[3]
+    if cache.stride(1) != plane_elements or cache.stride(0) < 2 * plane_elements:
+        raise ValueError(f"Overlapping or scattered HCU Flash KV planes: {layer_name}.")
+    views = [
+        (f"{layer_name}.hcu_flash_{component}", cache[:, index].permute(0, 2, 1, 3))
+        for index, component in enumerate(("k", "v"))
+    ]
+    if layout != "NHD" and any(not view[0].is_contiguous() for _, view in views):
+        # Under NHD the plane keeps token-major strides; the sender gathers a
+        # single head into a dense buffer before the RDMA write, so the strided
+        # [H, N, C] view is a valid registration.
+        raise ValueError(
+            f"HCU Flash KV transfer requires contiguous [H, N, C] planes "
+            f"(LBHNC layout): {layer_name}."
+        )
+    return views
+
+
 class MooncakeXferMetadata(
     msgspec.Struct,
     omit_defaults=True,  # type: ignore[call-arg]
@@ -819,6 +892,9 @@ class MooncakeXferMetadata(
     registered_layer_indices: list[int] = msgspec.field(default_factory=list)
     registered_group_indices: list[int] = msgspec.field(default_factory=list)
     num_blocks_per_layer: list[int] = msgspec.field(default_factory=list)
+    step5_pd_version: int = 0
+    step5_mtp_tokens: int = 0
+    step5_prompt_tokens: dict[str, int] = msgspec.field(default_factory=dict)
 
 
 class MooncakeXferResponseStatus(IntEnum):
@@ -838,6 +914,7 @@ class MooncakeXferResponse(
     ok_reqs: list[ReqId] | None = None
     err_reqs: list[ReqId] | None = None
     err_msg: str | None = None
+    step5_tails: dict[str, dict[str, bytes]] = msgspec.field(default_factory=dict)
 
 
 @dataclass
@@ -851,6 +928,7 @@ class PullReqMeta:
     expire_time: float = float("inf")
     # Designed for one D pairing to multiple P
     pull_tasks_count: int = 0
+    step5_prompt_tokens: int = 0
 
 
 @dataclass
@@ -864,6 +942,8 @@ class SendBlockMeta:
     sent: int = 0
     sending: int = 0
     ttft_send_start_logged: bool = False
+    step5_tails: dict[str, bytes] | None = None
+    step5_prompt_tokens: int = 0
 
 
 class MooncakeConnectorMetadata(KVConnectorMetadata):
@@ -873,6 +953,8 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
         self.reqs_to_recv: dict[EngineId, dict[ReqId, PullReqMeta]] = defaultdict(dict)
         self.reqs_to_send: dict[ReqId, tuple[TransferId, list[list[int]]]] = {}
         self.reqs_not_processed: set[TransferId] = set()
+        self.step5_prompt_tokens: dict[str, int] = {}
+        self.step5_tails: dict[str, dict[str, bytes]] = {}
 
     def add_new_req(
         self,
@@ -880,8 +962,10 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
         local_block_ids: list[list[int]],
         kv_transfer_params: dict[str, Any],
         load_remote_cache: bool = True,
+        prompt_tokens: int = 0,
     ):
         transfer_id = kv_transfer_params["transfer_id"]
+        self.step5_prompt_tokens[request_id] = prompt_tokens
         if load_remote_cache:
             remote_engine_id = kv_transfer_params["remote_engine_id"]
             self.reqs_to_recv[remote_engine_id][request_id] = PullReqMeta(
@@ -890,6 +974,7 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
                 remote_engine_id=remote_engine_id,
                 remote_bootstrap_addr=kv_transfer_params["remote_bootstrap_addr"],
                 transfer_id=transfer_id,
+                step5_prompt_tokens=prompt_tokens,
             )
         else:
             self.reqs_to_send[request_id] = (transfer_id, local_block_ids)
@@ -1058,6 +1143,11 @@ class MooncakeConnectorScheduler:
         self.vllm_config = vllm_config
         self.block_size = vllm_config.cache_config.block_size
 
+        from . import step5_pd
+        self.step5_pd_enabled = step5_pd.enabled(vllm_config)
+        if self.step5_pd_enabled:
+            step5_pd.validate_config(vllm_config)
+
         assert vllm_config.kv_transfer_config
         self.is_kv_producer: bool = (
             vllm_config.kv_transfer_config.kv_role == "kv_producer"
@@ -1066,6 +1156,7 @@ class MooncakeConnectorScheduler:
             vllm_config.kv_transfer_config.kv_role == "kv_consumer"
         )
         logger.info("Initializing Mooncake Transfer Engine Scheduler %s", engine_id)
+        self.engine_id: EngineId = engine_id
 
         self._is_hma_required = (
             not vllm_config.scheduler_config.disable_hybrid_kv_cache_manager
@@ -1114,8 +1205,26 @@ class MooncakeConnectorScheduler:
         ]
 
     def _get_remote_prefill_token_count(self, num_prompt_tokens: int) -> int:
-        """D-side only. Returns N-1 for Mamba models since the decoder
-        always recomputes the last token and must start from h(N-1)."""
+        """D-side only. Returns the prefix of prompt tokens to load from the
+        producer; the remainder is recomputed locally.
+
+        Mamba decoders always recompute the last prompt token (its logits are
+        needed for sampling and are not transferred), so they load N-1.
+
+        step5_pd replays the whole final DSA *region* instead of a single
+        token.  When only token N-1 is replayed, its attention over the rest
+        of the current (partial) region depends on the producer-side pending
+        tail; that handoff is fragile, and losing it hides the region's
+        content from the model.  Recomputing up to ``region_size`` tokens
+        locally starts the replay exactly on a region boundary
+        (``past % region_size == 0``), so the DSA schedule buffers the region
+        itself and the transferred KV + complete-region summaries are the
+        only cross-instance state it needs.
+        """
+        if getattr(self, "step5_pd_enabled", False) and num_prompt_tokens > 1:
+            region = 8  # Step-4 DSA REGION_BLOCK_SIZE
+            past = num_prompt_tokens - 1
+            return max(past - (past % region), 1)
         if self._has_mamba and num_prompt_tokens > 1:
             return num_prompt_tokens - 1
         return num_prompt_tokens
@@ -1179,6 +1288,13 @@ class MooncakeConnectorScheduler:
             params,
         )
 
+        if (getattr(self, "step5_pd_enabled", False) and self.is_kv_producer
+                and params and params.get("do_remote_decode")
+                and request.max_tokens != 1):
+            # Only a handoff request needs this restriction: the exported
+            # DSA tail must describe the prompt, not later generated tokens.
+            raise ValueError("Step5 P must generate exactly one token before handoff.")
+
         if not params:
             return 0, False
 
@@ -1241,6 +1357,16 @@ class MooncakeConnectorScheduler:
             if not params.get("transfer_id"):
                 logger.warning("Missing transfer_id in kv_transfer_params from router!")
             else:
+                # With a data-parallel producer the router cannot choose the
+                # producer engine by rank: vLLM's DP coordinator decides per
+                # request. Return the actual engine id so the router can use
+                # it instead of guessing a DP rank.
+                params.setdefault("remote_engine_id", self.engine_id)
+                if "remote_bootstrap_addr" not in params:
+                    host, port = get_mooncake_bootstrap_addr(self.vllm_config)
+                    if host in ("0.0.0.0", "127.0.0.1", "localhost"):
+                        host = get_ip()
+                    params["remote_bootstrap_addr"] = f"http://{host}:{port}"
                 # Add an empty list to worker to create event.
                 self._reqs_need_send[request.request_id] = (request, [])
 
@@ -1258,6 +1384,7 @@ class MooncakeConnectorScheduler:
                     request_id=req_id,
                     local_block_ids=block_ids,
                     kv_transfer_params=req.kv_transfer_params,
+                    prompt_tokens=req.num_prompt_tokens if self.step5_pd_enabled else 0,
                 )
             self._reqs_need_recv.clear()
 
@@ -1269,6 +1396,7 @@ class MooncakeConnectorScheduler:
                     local_block_ids=block_ids,
                     kv_transfer_params=req.kv_transfer_params,
                     load_remote_cache=False,
+                    prompt_tokens=req.num_prompt_tokens if self.step5_pd_enabled else 0,
                 )
             self._reqs_need_send.clear()
             meta.reqs_not_processed = self._reqs_not_processed
@@ -1324,13 +1452,27 @@ class MooncakeConnectorScheduler:
         # remove the conditional below
         delay_free_blocks = any(len(group) > 0 for group in block_ids)
 
-        if delay_free_blocks:
-            self._reqs_need_send[request.request_id] = (
-                request,
-                self.get_sw_clipped_blocks(block_ids),
-            )
+        if not delay_free_blocks:
+            return False, None
 
-        return delay_free_blocks, None
+        self._reqs_need_send[request.request_id] = (
+            request,
+            self.get_sw_clipped_blocks(block_ids),
+        )
+
+        # A data-parallel producer has one API server and several engines, so
+        # the router cannot infer which engine served this request from the
+        # request it sent. Return the producer identity with the final output.
+        # Do not echo do_remote_decode: that flag belongs only to the P-side
+        # request, and leaking it would make the D handler assert.
+        producer = {
+            "transfer_id": params["transfer_id"],
+            "remote_engine_id": self.engine_id,
+        }
+        bootstrap_addr = params.get("remote_bootstrap_addr")
+        if bootstrap_addr:
+            producer["remote_bootstrap_addr"] = bootstrap_addr
+        return True, producer
 
 
 class MooncakeConnectorWorker:
@@ -1730,6 +1872,23 @@ class MooncakeConnectorWorker:
             await sock.send_multipart((identity, self._encoder.encode(response)))
 
         pending_reqs: dict[ReqId, SendBlockMeta] = {}
+        completed_reqs: dict[ReqId, dict] = {}
+        sent_tails = getattr(self, "_sent_transfer_tails", None)
+        if sent_tails is None:
+            sent_tails = self._sent_transfer_tails = {}
+        step5_state = getattr(self, "_step5_state", None)
+        # Heterogeneous TP (e.g. P=TP1 -> D=TP4) is handled by
+        # handshake_target_ranks() and the transfer-plan tp_ratio math, so the
+        # protocol version and MTP depth are the only fields that must agree.
+        # MTP is optional on both sides (0 = disabled); only when both sides
+        # speculate must the depths match.
+        local_mtp_tokens = getattr(self.vllm_config.speculative_config,
+                                   "num_speculative_tokens", 0) or 0
+        if (meta.step5_pd_version != (1 if step5_state else 0)
+                or (step5_state and meta.step5_mtp_tokens and local_mtp_tokens
+                    and meta.step5_mtp_tokens != local_mtp_tokens)):
+            await reject_metadata("Step5 P/D requires matching protocol versions and MTP steps.")
+            return
         if meta.remote_tp_size <= 0 or not 0 <= meta.remote_tp_rank < meta.remote_tp_size:
             await reject_metadata(
                 "Mooncake remote TP size/rank is invalid: "
@@ -1806,12 +1965,20 @@ class MooncakeConnectorWorker:
             transfer_topo=self.transfer_topo,
             remote_tp_size=meta.remote_tp_size,
             producer_cache_replicated=self._producer_cache_is_replicated(),
+            replicated_regions=self._step5_replicated_regions(),
         )
         if validation_err is not None:
             await reject_metadata(validation_err)
             return
         for d_req_id, (transfer_id, _) in meta.req_blocks.items():
             if transfer_id not in self.reqs_need_send:
+                stored = sent_tails.get(transfer_id)
+                if stored is not None:
+                    # A repeated pull for an already-sent transfer: the KV is
+                    # in place, so answer success with the same tails instead
+                    # of waiting for a producer request that already finished.
+                    completed_reqs[d_req_id] = stored.get(d_req_id, {})
+                    continue
                 # This req is not enqueued in P side yet, create it here.
                 self.reqs_need_send[transfer_id] = SendBlockMeta(
                     p_req_id="",
@@ -1827,6 +1994,15 @@ class MooncakeConnectorWorker:
         ) -> tuple[ReqId, SendBlockMeta]:
             await send_meta.ready.wait()
             return d_req_id, send_meta
+
+        if not pending_reqs:
+            response = MooncakeXferResponse(
+                status=MooncakeXferResponseStatus.FINISH,
+                ok_reqs=list(completed_reqs) or None,
+                step5_tails=dict(completed_reqs) if step5_state else {},
+            )
+            await sock.send_multipart((identity, self._encoder.encode(response)))
+            return
 
         wait_tasks = [
             asyncio.create_task(wait_and_ret(d_req_id, send_meta))
@@ -1849,8 +2025,10 @@ class MooncakeConnectorWorker:
                 )
                 response = MooncakeXferResponse(
                     status=MooncakeXferResponseStatus.FINISH,
+                    ok_reqs=list(completed_reqs) or None,
                     err_reqs=list(pending_reqs),
                     err_msg="Timeout waiting for P side ready.",
+                    step5_tails=dict(completed_reqs) if step5_state else {},
                 )
                 await sock.send_multipart((identity, self._encoder.encode(response)))
                 break
@@ -1884,6 +2062,7 @@ class MooncakeConnectorWorker:
                 lengths,
                 err_reqs,
                 err_msg,
+                gather_jobs,
             ) = await self._build_transfer_params(
                 ready_reqs,
                 meta,
@@ -1891,6 +2070,16 @@ class MooncakeConnectorWorker:
                 remote_regions,
             )
             err_req_set = set(err_reqs)
+            if step5_state:
+                mismatched = [req_id for req_id, item in ready_reqs
+                              if meta.step5_prompt_tokens.get(req_id) != item.step5_prompt_tokens]
+                if mismatched:
+                    # The descriptor arrays include every ready request; do
+                    # not execute any writes if one request contract is wrong.
+                    err_reqs = [req_id for req_id, _ in ready_reqs]
+                    err_req_set = set(err_reqs)
+                    err_msg = "Step5 P/D prompt token count mismatch."
+                    src_ptrs, dst_ptrs, lengths = [], [], []
             ok_ready_reqs = [
                 (d_req_id, send_meta)
                 for d_req_id, send_meta in ready_reqs
@@ -1914,6 +2103,10 @@ class MooncakeConnectorWorker:
                     src_ptrs,
                     dst_ptrs,
                     lengths,
+                    gather_jobs
+                    if any(job is not None for job in gather_jobs)
+                    else None,
+                    None,
                 )
 
                 if ret_value != 0:
@@ -1948,11 +2141,19 @@ class MooncakeConnectorWorker:
                 ):
                     self.finished_sending_reqs.add(send_meta.p_req_id)
 
+            tails_out = {req_id: item.step5_tails for req_id, item in ok_ready_reqs}
+            for d_req_id, item in ok_ready_reqs:
+                if step5_state and item.step5_tails:
+                    sent_tails.setdefault(item.transfer_id, {})[d_req_id] = item.step5_tails
+            tails_out.update(completed_reqs)
             response = MooncakeXferResponse(
                 status=response_status,
-                ok_reqs=[d_req_id for d_req_id, _ in ok_ready_reqs] or None,
+                ok_reqs=[d_req_id for d_req_id, _ in ok_ready_reqs]
+                + list(completed_reqs)
+                or None,
                 err_reqs=err_reqs or None,
                 err_msg=err_msg,
+                step5_tails=tails_out if step5_state else {},
             )
             await sock.send_multipart((identity, self._encoder.encode(response)))
 
@@ -2008,6 +2209,16 @@ class MooncakeConnectorWorker:
         lengths = []
         err_reqs: list[ReqId] = []
         err_msg: str | None = None
+        gather_jobs: list = []
+        global _XFERDBG_COUNT
+        xferdbg = (
+            bool(os.environ.get("VLLM_STEP5_TRANSFER_DEBUG"))
+            and _XFERDBG_COUNT < 2
+        )
+        if xferdbg:
+            _XFERDBG_COUNT += 1
+        # Step5 summary regions are TP-invariant copies, not TP-sharded slices.
+        replicated_regions = self._step5_replicated_regions()
         remote_session = f"{agent_meta.remote_hostname}:{agent_meta.remote_port}"
         for d_req_id, send_meta in ready_reqs:
             _, remote_block_ids_per_group = agent_meta.req_blocks[d_req_id]
@@ -2072,8 +2283,17 @@ class MooncakeConnectorWorker:
                     has_block_error = True
                     break
                 elif n_local > n_remote:
-                    # Partial prefix cache hit: just read uncomputed blocks.
-                    local_group = local_group[-n_remote:] if n_remote > 0 else []
+                    if getattr(self, "_step5_state", None) is not None:
+                        # Step5 P/D disables prefix caching, so the surplus
+                        # block is the producer's tail block created by the
+                        # mandatory one-token handoff generation
+                        # (prompt_len % block_size == 0). The consumer only
+                        # asked for the prompt's blocks; drop the trailing
+                        # handoff block, keep the leading n_remote.
+                        local_group = local_group[:n_remote] if n_remote > 0 else []
+                    else:
+                        # Partial prefix cache hit: just read uncomputed blocks.
+                        local_group = local_group[-n_remote:] if n_remote > 0 else []
                 local_block_ids_by_group.append(local_group)
                 remote_block_ids_by_group.append(remote_group)
 
@@ -2161,6 +2381,9 @@ class MooncakeConnectorWorker:
                     remote_kv_block_len=remote_region.kv_block_len,
                     remote_tp_rank=agent_meta.remote_tp_rank,
                     remote_tp_size=agent_meta.remote_tp_size,
+                    is_replicated_region=(
+                        local_region.layer_name in replicated_regions
+                    ),
                 )
                 if not should_transfer:
                     # Replicated KV cache: only one producer rank in the TP group
@@ -2176,6 +2399,21 @@ class MooncakeConnectorWorker:
                 assert dst_region_offset + transfer_len <= remote_region.kv_block_len, (
                     "Destination transfer region exceeds remote KV block size."
                 )
+                if xferdbg and any(
+                    part in local_region.layer_name for part in _XFERDBG_WANT
+                ):
+                    logger.warning(
+                        "XFERDBG req=%s region=%s g=%d lb=%s rb=%s "
+                        "lkbl=%d rkbl=%d lblen=%d rblen=%d lba=%d rba=%d "
+                        "plan=(%s,%d,%d,%d)",
+                        d_req_id, local_region.layer_name, group_index,
+                        local_block_ids[:4], remote_block_ids[:4],
+                        local_region.kv_block_len, remote_region.kv_block_len,
+                        local_region.block_len, remote_region.block_len,
+                        local_region.base_addr, remote_region.base_addr,
+                        should_transfer, src_region_offset,
+                        dst_region_offset, transfer_len,
+                    )
                 # Collapse one contiguous block group into a single larger
                 # transfer descriptor when the per-block copy is identical.
                 can_coalesce = _can_coalesce_block_transfers(
@@ -2185,6 +2423,33 @@ class MooncakeConnectorWorker:
                     dst_region_offset=dst_region_offset,
                     transfer_len=transfer_len,
                 )
+
+                # Under the token-major (NHD) layout a single head's rows are
+                # `H * content` apart, not contiguous, so a tp_ratio slice has
+                # to be gathered into a dense buffer before the RDMA write.
+                gather_head = (
+                    getattr(self, "kv_cache_layout", None) == "NHD"
+                    and local_region.layer_name not in replicated_regions
+                    and transfer_len < local_region.kv_block_len
+                )
+                gather_tensor = None
+                gather_head_index = 0
+                if gather_head:
+                    can_coalesce = False
+                    gather_tensor = getattr(
+                        self, "_cache_tensors_by_region", {}
+                    ).get(local_region.layer_name)
+                    gather_head_index = (
+                        src_region_offset // transfer_len if transfer_len else 0
+                    )
+                    if gather_tensor is None:
+                        err_reqs.append(d_req_id)
+                        if err_msg is None:
+                            err_msg = (
+                                "NHD gather cache tensor missing for "
+                                + local_region.layer_name
+                            )
+                        continue
 
                 for group_local_block_id, group_remote_block_id in zip(
                     group_local_block_ids, group_remote_block_ids
@@ -2201,21 +2466,50 @@ class MooncakeConnectorWorker:
                             + dst_region_offset
                         )
                         lengths.append(transfer_len * len(group_local_block_id))
+                        gather_jobs.append(None)
                     else:
                         for local_block_id, remote_block_id in zip(
                             group_local_block_id, group_remote_block_id
                         ):
-                            src_ptrs.append(
-                                local_region.base_addr
-                                + local_block_id * local_region.block_len
-                                + src_region_offset
-                            )
+                            if gather_head:
+                                gather_jobs.append(
+                                    (
+                                        gather_tensor,
+                                        local_block_id,
+                                        gather_head_index,
+                                    )
+                                )
+                                src_ptrs.append(0)
+                            else:
+                                src_ptrs.append(
+                                    local_region.base_addr
+                                    + local_block_id * local_region.block_len
+                                    + src_region_offset
+                                )
+                                gather_jobs.append(None)
                             dst_ptrs.append(
                                 remote_region.base_addr
                                 + remote_block_id * remote_region.block_len
                                 + dst_region_offset
                             )
                             lengths.append(transfer_len)
+
+                if xferdbg and any(
+                    part in local_region.layer_name for part in _XFERDBG_WANT
+                ):
+                    logger.warning(
+                        "XFERDBG_PTR req=%s region=%s src=%d dst=%d len=%d "
+                        "expected_dst=%d",
+                        d_req_id, local_region.layer_name,
+                        src_ptrs[-1] if src_ptrs else -1,
+                        dst_ptrs[-1] if dst_ptrs else -1,
+                        lengths[-1] if lengths else -1,
+                        remote_region.base_addr
+                        + (group_remote_block_ids[0][0]
+                           if group_remote_block_ids else 0)
+                        * remote_region.block_len
+                        + dst_region_offset,
+                    )
 
             logger.debug(
                 "Sending kv_caches for request %s (%d blocks) to %s",
@@ -2224,7 +2518,7 @@ class MooncakeConnectorWorker:
                 remote_session,
             )
 
-        return src_ptrs, dst_ptrs, lengths, err_reqs, err_msg
+        return src_ptrs, dst_ptrs, lengths, err_reqs, err_msg, gather_jobs
 
     def _dsa_owns_layer(self, layer_index: int) -> bool:
         """Return whether this PCP producer transfers ``layer_index``."""
@@ -2239,23 +2533,327 @@ class MooncakeConnectorWorker:
         without this, NVLink transfers fail for TP ranks > 0."""
         current_platform.set_device(self.device_id)
 
+    # Long-context requests (e.g. 64K prompt tokens) expand to tens of
+    # thousands of scatter/gather descriptors.  The transfer engine rejects a
+    # single call above its internal descriptor limit (observed: ret=-1 for
+    # 24992 descriptors / 362 MB), so split one logical request into several
+    # sequential writes over disjoint ranges.
+    _MAX_SEND_DESCS = 8192
+
+    def _send_blocks_vector_gather(
+        self,
+        remote_session: str,
+        src_ptrs: list[int],
+        dst_ptrs: list[int],
+        lengths: list[int],
+        gather_jobs: list,
+        slot_index: int,
+    ) -> tuple[int, float, float, float, int, int]:
+        """NHD gather with one advanced-indexing gather per (tensor, head)."""
+        scratch = getattr(self, "_nhd_scratch", None)
+        if scratch is None:
+            return -1, 0.0, 0.0, 0.0, 0, 0
+        slot_count = int(getattr(self, "_nhd_slot_count", 4))
+        slot_bytes = int(scratch.numel()) // slot_count
+        slot_base = (slot_index % slot_count) * slot_bytes
+        scratch_ptr = int(scratch.data_ptr()) + slot_base
+        capacity = slot_bytes
+        limit = self._MAX_SEND_DESCS
+
+        gather_s = 0.0
+        sync_s = 0.0
+        transfer_s = 0.0
+        gather_count = 0
+        batch_count = 0
+
+        # Group gather descriptors by (tensor, head, payload length).  The
+        # descriptor order is irrelevant to the remote write: only each
+        # (destination address, length) pair matters.
+        group_map: dict[tuple, dict] = {}
+        group_order: list[tuple] = []
+        raw_items: list[int] = []
+        for idx, job in enumerate(gather_jobs):
+            if job is None:
+                raw_items.append(idx)
+                continue
+            tensor, block_id, head_index = job
+            key = (id(tensor), int(head_index), int(lengths[idx]))
+            group = group_map.get(key)
+            if group is None:
+                group = {
+                    "tensor": tensor,
+                    "head": int(head_index),
+                    "per": int(lengths[idx]),
+                    "indices": [],
+                }
+                group_map[key] = group
+                group_order.append(key)
+            group["indices"].append(idx)
+        group_order.sort(key=lambda key: group_map[key]["indices"][0])
+
+        # Pre-chunk each gather group so one group never exceeds the scratch
+        # slot or the per-call descriptor limit.
+        items: list[tuple] = []
+        for key in group_order:
+            group = group_map[key]
+            per = group["per"]
+            if per <= 0:
+                return -1, 0.0, 0.0, 0.0, 0, 0
+            max_per = min(capacity // per, limit)
+            if max_per <= 0:
+                return -1, 0.0, 0.0, 0.0, 0, 0
+            indices = group["indices"]
+            for offset in range(0, len(indices), max_per):
+                items.append(("gather", key, indices[offset : offset + max_per]))
+        for idx in raw_items:
+            items.append(("raw", idx, None))
+
+        index = 0
+        ret_value = 0
+        while index < len(items) and ret_value == 0:
+            batch_items: list[tuple] = []
+            batch_desc_count = 0
+            offset = 0
+            while index < len(items):
+                kind, key_or_idx, chunk = items[index]
+                if kind == "gather":
+                    n = len(chunk)
+                    item_bytes = n * group_map[key_or_idx]["per"]
+                else:
+                    n = 1
+                    item_bytes = lengths[key_or_idx]
+                if batch_items and (
+                    offset + item_bytes > capacity
+                    or batch_desc_count + n > limit
+                ):
+                    break
+                if item_bytes > capacity or n > limit:
+                    return -1, 0.0, 0.0, 0.0, 0, 0
+                batch_items.append(items[index])
+                offset += item_bytes
+                batch_desc_count += n
+                index += 1
+            if not batch_items:
+                break
+
+            batch_count += 1
+            batch_src: list[int] = []
+            batch_dst: list[int] = []
+            batch_len: list[int] = []
+            cur = 0
+            gathered = False
+            gather_t0 = time.perf_counter()
+            for kind, key_or_idx, chunk in batch_items:
+                if kind == "gather":
+                    group = group_map[key_or_idx]
+                    tensor = group["tensor"]
+                    head = group["head"]
+                    per = group["per"]
+                    n = len(chunk)
+                    block_ids = [int(gather_jobs[idx][1]) for idx in chunk]
+                    block_index = torch.tensor(
+                        block_ids, dtype=torch.long, device=tensor.device
+                    )
+                    gathered_tensor = tensor[block_index, head]
+                    flat = gathered_tensor.contiguous().reshape(-1)
+                    if flat.dtype != torch.uint8:
+                        flat = flat.view(torch.uint8)
+                    item_bytes = n * per
+                    if flat.numel() != item_bytes:
+                        logger.error(
+                            "VECTOR_GATHER size mismatch: tensor=%s head=%d "
+                            "blocks=%d per=%d got=%d expected=%d",
+                            getattr(tensor, "shape", None),
+                            head,
+                            n,
+                            per,
+                            flat.numel(),
+                            item_bytes,
+                        )
+                        return -1, 0.0, 0.0, 0.0, 0, 0
+                    scratch.narrow(0, slot_base + cur, item_bytes).copy_(flat)
+                    for j, idx in enumerate(chunk):
+                        batch_src.append(scratch_ptr + cur + j * per)
+                        batch_dst.append(dst_ptrs[idx])
+                        batch_len.append(per)
+                    cur += item_bytes
+                    gather_count += n
+                    gathered = True
+                else:
+                    idx = key_or_idx
+                    batch_src.append(src_ptrs[idx])
+                    batch_dst.append(dst_ptrs[idx])
+                    batch_len.append(lengths[idx])
+                    cur += lengths[idx]
+            gather_s += time.perf_counter() - gather_t0
+            if gathered:
+                t0 = time.perf_counter()
+                torch.cuda.synchronize(scratch.device)
+                sync_s += time.perf_counter() - t0
+            t0 = time.perf_counter()
+            ret_value = self.engine.batch_transfer_sync_write(
+                remote_session, batch_src, batch_dst, batch_len
+            )
+            transfer_s += time.perf_counter() - t0
+        return ret_value, gather_s, sync_s, transfer_s, gather_count, batch_count
+
     def _send_blocks(
         self,
         remote_session: str,
         src_ptrs: list[int],
         dst_ptrs: list[int],
         lengths: list[int],
+        gather_jobs: list | None = None,
+        slot_index: int | None = None,
+    ) -> int:
+        if gather_jobs is None:
+            return self._send_blocks_impl(
+                remote_session, src_ptrs, dst_ptrs, lengths, gather_jobs, 0
+            )
+        slot_queue = getattr(self, "_nhd_slot_queue", None)
+        if slot_index is not None or slot_queue is None:
+            return self._send_blocks_impl(
+                remote_session,
+                src_ptrs,
+                dst_ptrs,
+                lengths,
+                gather_jobs,
+                int(slot_index or 0),
+            )
+        slot = slot_queue.get()
+        try:
+            return self._send_blocks_impl(
+                remote_session, src_ptrs, dst_ptrs, lengths, gather_jobs, slot
+            )
+        finally:
+            slot_queue.put(slot)
+
+    def _send_blocks_impl(
+        self,
+        remote_session: str,
+        src_ptrs: list[int],
+        dst_ptrs: list[int],
+        lengths: list[int],
+        gather_jobs: list | None,
+        slot_index: int,
     ) -> int:
         start_time = time.perf_counter()
-        ret_value = self.engine.batch_transfer_sync_write(
-            remote_session, src_ptrs, dst_ptrs, lengths
+        total_descs = len(src_ptrs)
+        total_bytes = sum(lengths)
+        timing_enabled = (
+            os.environ.get("VLLM_STEP5_XFER_TIMING") == "1"
         )
+        gather_s = 0.0
+        sync_s = 0.0
+        transfer_s = 0.0
+        gather_count = 0
+        batch_count = 0
+        limit = self._MAX_SEND_DESCS
+        ret_value = 0
+        if gather_jobs is None:
+            for offset in range(0, total_descs, limit):
+                batch_count += 1
+                t0 = time.perf_counter()
+                ret_value = self.engine.batch_transfer_sync_write(
+                    remote_session,
+                    src_ptrs[offset : offset + limit],
+                    dst_ptrs[offset : offset + limit],
+                    lengths[offset : offset + limit],
+                )
+                transfer_s += time.perf_counter() - t0
+                if ret_value != 0:
+                    break
+        elif os.environ.get("VLLM_STEP5_VECTOR_GATHER") == "1":
+            (
+                ret_value,
+                gather_s,
+                sync_s,
+                transfer_s,
+                gather_count,
+                batch_count,
+            ) = self._send_blocks_vector_gather(
+                remote_session,
+                src_ptrs,
+                dst_ptrs,
+                lengths,
+                gather_jobs,
+                slot_index,
+            )
+        else:
+            # NHD pages keep a single head's rows strided, so each gathered
+            # descriptor is copied into a registered scratch buffer first. The
+            # scratch bounds one batch; larger requests take several batches.
+            scratch = getattr(self, "_nhd_scratch", None)
+            if scratch is None:
+                return -1
+            slot_count = int(getattr(self, "_nhd_slot_count", 4))
+            slot_bytes = int(scratch.numel()) // slot_count
+            slot_base = (slot_index % slot_count) * slot_bytes
+            scratch_ptr = int(scratch.data_ptr()) + slot_base
+            capacity = slot_bytes
+            index = 0
+            while index < total_descs and ret_value == 0:
+                batch_count += 1
+                batch_src: list[int] = []
+                batch_dst: list[int] = []
+                batch_len: list[int] = []
+                gathered = False
+                offset = 0
+                gather_t0 = time.perf_counter()
+                while (
+                    index < total_descs
+                    and len(batch_src) < limit
+                    and offset + lengths[index] <= capacity
+                ):
+                    job = gather_jobs[index]
+                    if job is not None:
+                        tensor, block_id, head_index = job
+                        piece = tensor[block_id, head_index].contiguous()
+                        piece = piece.reshape(-1).view(torch.uint8)
+                        scratch.narrow(
+                            0, slot_base + offset, lengths[index]
+                        ).copy_(piece)
+                        batch_src.append(scratch_ptr + offset)
+                        gathered = True
+                        gather_count += 1
+                    else:
+                        batch_src.append(src_ptrs[index])
+                    batch_dst.append(dst_ptrs[index])
+                    batch_len.append(lengths[index])
+                    offset += lengths[index]
+                    index += 1
+                gather_s += time.perf_counter() - gather_t0
+                if not batch_src:
+                    return -1
+                if gathered:
+                    t0 = time.perf_counter()
+                    torch.cuda.synchronize(scratch.device)
+                    sync_s += time.perf_counter() - t0
+                t0 = time.perf_counter()
+                ret_value = self.engine.batch_transfer_sync_write(
+                    remote_session, batch_src, batch_dst, batch_len
+                )
+                transfer_s += time.perf_counter() - t0
         duration = time.perf_counter() - start_time
+        if timing_enabled:
+            logger.warning(
+                "XFER_TIMING descs=%d gather_descs=%d batches=%d bytes=%d "
+                "gather_s=%.3f sync_s=%.3f transfer_s=%.3f total_s=%.3f ret=%d",
+                total_descs,
+                gather_count,
+                batch_count,
+                total_bytes,
+                gather_s,
+                sync_s,
+                transfer_s,
+                duration,
+                ret_value,
+            )
         if ret_value == 0:
             self.xfer_stats.record_transfer(
                 duration_s=duration,
-                total_bytes=sum(lengths),
-                num_descs=len(src_ptrs),
+                total_bytes=total_bytes,
+                num_descs=total_descs,
             )
             logger.debug("Sending to %s done, took %s", remote_session, duration)
         else:
@@ -2265,8 +2863,8 @@ class MooncakeConnectorWorker:
                 remote_session,
                 ret_value,
                 duration,
-                len(src_ptrs),
-                sum(lengths),
+                total_descs,
+                total_bytes,
             )
         return ret_value
 
@@ -2289,9 +2887,25 @@ class MooncakeConnectorWorker:
         self.registered_group_indices = []
         self.num_blocks_per_layer = []
 
-        for layer_name, cache in kv_caches.items():
+        from . import step5_pd
+        if step5_pd.enabled(self.vllm_config):
+            step5_pd.validate_config(self.vllm_config)
+            self._step5_state = step5_pd.Step5StateTransfer(self, kv_caches)
+            kv_caches = {**kv_caches, **self._step5_state.views}
+
+        registration_views = [
+            (source_name, region_name, view)
+            for source_name, cache in kv_caches.items()
+            if source_name in self._layer_specs
+            for region_name, view in _hcu_flash_registration_views(
+                source_name, cache, self._layer_specs[source_name],
+                self._physical_blocks_per_logical_kv_block,
+                layout=getattr(self, "kv_cache_layout", None),
+            )
+        ]
+        for source_name, layer_name, cache in registration_views:
             layer_index = extract_layer_index(layer_name)
-            layer_spec = self._layer_specs.get(layer_name)
+            layer_spec = self._layer_specs.get(source_name)
             if layer_spec is None:
                 logger.debug(
                     "Skipping layer %s because no KV cache spec is present.",
@@ -2331,11 +2945,36 @@ class MooncakeConnectorWorker:
                     f"KV page tensor for {layer_name}."
                 )
             self._log_debug_cache_registration(layer_name, cache)
+            tensor_map = getattr(self, "_cache_tensors_by_region", None)
+            if tensor_map is None:
+                tensor_map = self._cache_tensors_by_region = {}
+            tensor_map[layer_name] = cache
+            sig = (tuple(cache.shape), cache.stride(0), cache[0].is_contiguous())
+            seen = getattr(self, "_regiondbg_seen", None)
+            if seen is None:
+                seen = self._regiondbg_seen = set()
+            if sig not in seen:
+                seen.add(sig)
+                logger.warning(
+                    "REGIONDBG layer=%s shape=%s stride0=%d stride1=%d "
+                    "stride2=%d contig0=%s elem=%d block_stride=%d "
+                    "topo=(blocks_first=%s, virtually_split_kv=%s, "
+                    "split_k_and_v=%s)",
+                    layer_name, sig[0], sig[1], cache.stride(1),
+                    cache.stride(2), sig[2],
+                    cache.element_size(), cache.stride(0) * cache.element_size(),
+                    getattr(self.transfer_topo, "is_kv_layout_blocks_first", None),
+                    getattr(self.transfer_topo, "virtually_split_kv_in_blocks", None),
+                    getattr(self.transfer_topo, "split_k_and_v", None),
+                )
             if cache.shape[0] <= 0:
                 raise ValueError(
                     f"KV cache {layer_name} must contain at least one block."
                 )
-            if not cache[0].is_contiguous():
+            if (
+                getattr(self, "kv_cache_layout", None) != "NHD"
+                and not cache[0].is_contiguous()
+            ):
                 raise ValueError(
                     "HCU Mooncake requires canonical contiguous [H, N, C] "
                     f"page contents; layer={layer_name}. Use KV cache layout "
@@ -2365,6 +3004,12 @@ class MooncakeConnectorWorker:
                             "Mooncake KV content must divide into kernel blocks."
                         )
                     kv_block_len = layer_spec.unpadded_page_size_bytes // ratio
+                    if source_name != layer_name:
+                        # Each HCU region contains only K or V, but its
+                        # block stride still spans the complete padded page.
+                        if kv_block_len % 2:
+                            raise ValueError("HCU Flash KV page payload must be even.")
+                        kv_block_len //= 2
                     if kv_block_len != cache[0].numel() * cache.element_size():
                         raise ValueError(
                             "Mooncake KV page shape does not match its spec."
@@ -2402,7 +3047,7 @@ class MooncakeConnectorWorker:
             self.kv_block_len_per_layer.append(kv_block_len)
             self.registered_layer_names.append(layer_name)
             self.registered_layer_indices.append(layer_index)
-            self.registered_group_indices.append(self._layer_group_indices[layer_name])
+            self.registered_group_indices.append(self._layer_group_indices[source_name])
             self.num_blocks_per_layer.append(cache.shape[0])
             storage = cache.untyped_storage()
             storage_addr = storage.data_ptr()
@@ -2429,6 +3074,39 @@ class MooncakeConnectorWorker:
         ret_value = self.engine.batch_register_memory(kv_data_ptrs, kv_data_lens)
         if ret_value != 0:
             raise RuntimeError("Mooncake batch memory registration failed.")
+
+        if (
+            not self.is_kv_consumer
+            and getattr(self, "kv_cache_layout", None) == "NHD"
+        ):
+            scratch_mb = int(
+                os.environ.get("VLLM_MOONCAKE_NHD_SCRATCH_MB", "16")
+            )
+            slot_bytes = max(scratch_mb, 1) << 20
+            slot_count = 4
+            self._nhd_slot_count = slot_count
+            scratch_bytes = slot_bytes * slot_count
+            first_cache = next(iter(kv_caches.values()))
+            self._nhd_scratch = torch.empty(
+                scratch_bytes,
+                dtype=torch.uint8,
+                device=first_cache.device,
+            )
+            self._nhd_slot_queue = queue.Queue()
+            for slot in range(slot_count):
+                self._nhd_slot_queue.put(slot)
+            ret_value = self.engine.batch_register_memory(
+                [int(self._nhd_scratch.data_ptr())], [scratch_bytes]
+            )
+            if ret_value != 0:
+                raise RuntimeError(
+                    "Mooncake NHD scratch memory registration failed."
+                )
+            logger.warning(
+                "Mooncake NHD gather scratch: %d MiB x4 slots registered on %s",
+                scratch_mb,
+                first_cache.device,
+            )
 
         self.device_kv_caches = kv_caches
         logger.debug(
@@ -2507,6 +3185,16 @@ class MooncakeConnectorWorker:
         finished_recving_reqs = recv_fut.result() if recv_fut else set()
         finished_sending_reqs = send_fut.result() if send_fut else set()
 
+        step5_state = getattr(self, "_step5_state", None)
+        if step5_state:
+            for req_id in finished_recving_reqs:
+                entry = step5_state.received.pop(req_id)
+                groups, tokens, tails = (
+                    entry["groups"], entry["tokens"], entry["tails"],
+                )
+                if any(groups):
+                    step5_state.restore(groups, tokens, tails)
+
         if finished_sending_reqs or finished_recving_reqs:
             logger.debug(
                 "Rank %s, get_finished: %s requests done sending "
@@ -2547,6 +3235,12 @@ class MooncakeConnectorWorker:
             registered_layer_indices=self.registered_layer_indices,
             registered_group_indices=self.registered_group_indices,
             num_blocks_per_layer=self.num_blocks_per_layer,
+            step5_pd_version=1 if getattr(self, "_step5_state", None) else 0,
+            step5_mtp_tokens=(getattr(self.vllm_config.speculative_config,
+                                      "num_speculative_tokens", 0) or 0)
+            if getattr(self, "_step5_state", None) else 0,
+            step5_prompt_tokens={key: value.step5_prompt_tokens for key, value in pull_metas.items()}
+            if getattr(self, "_step5_state", None) else {},
         )
 
         encoded_data = self._encoder.encode(metadata)
@@ -2613,6 +3307,27 @@ class MooncakeConnectorWorker:
 
         for req_id in dict.fromkeys((*ok_reqs, *err_reqs)):
             pull_meta = pull_metas[req_id]
+            step5_state = getattr(self, "_step5_state", None)
+            if step5_state:
+                tails = response.step5_tails.get(req_id)
+                if (tails is None and any(pull_meta.local_block_ids)) or pull_meta.pull_tasks_count < 1:
+                    self._kv_load_error = "Step5 P/D requires every matching TP/PP peer response."
+                    return
+                # A producer with PP>1 answers once per stage, each covering only
+                # its own layers, so the tails are unioned rather than replaced.
+                entry = step5_state.received.get(req_id)
+                if entry is None:
+                    step5_state.received[req_id] = entry = {
+                        "groups": pull_meta.local_block_ids,
+                        "tokens": pull_meta.step5_prompt_tokens,
+                        "tails": {},
+                    }
+                elif entry["tokens"] != pull_meta.step5_prompt_tokens:
+                    self._kv_load_error = (
+                        "Step5 P/D producer stages disagree on the prompt length."
+                    )
+                    return
+                entry["tails"].update(tails or {})
             # No race because we are in async loop.
             pull_meta.pull_tasks_count -= 1
             if pull_meta.pull_tasks_count == 0:
@@ -2670,6 +3385,12 @@ class MooncakeConnectorWorker:
                         remote_pcp_size,
                         remote_layer_split,
                     )
+                    # Plain PCP registers only the real sender (PCP rank 0;
+                    # the other ranks are dummy senders that never register),
+                    # so num_virtual already equals the producer's real TP
+                    # size there. Only DSA cache layer-split registers every
+                    # (tp, pcp) virtual rank, so only that case folds out
+                    # remote_pcp_size.
                     self._tp_size[remote_engine_id] = (
                         num_virtual // remote_pcp_size
                         if remote_layer_split
@@ -2697,6 +3418,23 @@ class MooncakeConnectorWorker:
         remote_pcp_size, remote_layer_split = self._remote_pcp_info.get(
             remote_engine_id, (1, False)
         )
+        # TP may differ from the producer (P=TP1 -> D=TP4); tp_ratio drives the
+        # slice planning. Step5 state (DSA tail) assumes its capture()/
+        # restore() tail-slot math runs against a single owning rank's local
+        # block table; plain PCP is fine because that rank is always PCP
+        # rank 0 (see validate_config() in step5_pd.py), but DSA cache
+        # layer-split's per-layer ownership model hasn't been analyzed
+        # against that math, so only that combination is still rejected here.
+        if (
+            getattr(self, "_step5_state", None)
+            and remote_pcp_size != 1
+            and remote_layer_split
+        ):
+            self._fail_pull_metas(
+                pull_metas,
+                "Step5 P/D does not support PCP with DSA cache layer-split.",
+            )
+            return
         if remote_pcp_size > 1:
             if not remote_layer_split:
                 virtual_ranks = [
@@ -2722,6 +3460,12 @@ class MooncakeConnectorWorker:
             worker_addrs.extend(pp_to_addr[pp_rank] for pp_rank in pp_ranks)
 
         count = len(worker_addrs)
+        # With producer PP>1 each consumer TP rank pulls from one producer stage
+        # per remote PP rank, so several peers are legitimate. Zero is still an
+        # error: the pairing found nothing to ask.
+        if getattr(self, "_step5_state", None) and count < 1:
+            self._fail_pull_metas(pull_metas, "Step5 P/D found no matching producer peer.")
+            return
         logger.debug(
             "Receiving Mooncake KV for engine %s from producer virtual TP "
             "ranks %s (pcp_size=%d, layer_split=%s) and PP ranks %s",
@@ -2786,6 +3530,9 @@ class MooncakeConnectorWorker:
                 send_meta = self.reqs_need_send[transfer_id]
                 send_meta.p_req_id = p_req_id
                 send_meta.local_block_ids = block_ids
+                if getattr(self, "_step5_state", None):
+                    send_meta.step5_tails = metadata.step5_tails[p_req_id]
+                    send_meta.step5_prompt_tokens = metadata.step5_prompt_tokens[p_req_id]
                 send_meta.expire_time = (
                     time.perf_counter() + envs.VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT
                 )
@@ -2813,6 +3560,22 @@ class MooncakeConnectorWorker:
                 assert not send_meta.ready.is_set()
 
     def start_load_kv(self, metadata: MooncakeConnectorMetadata):
+        step5_state = getattr(self, "_step5_state", None)
+        if step5_state and self.is_kv_producer and not self._pcp_dummy_sender:
+            # Snapshot on the model worker thread before new forwards can
+            # recycle the completed prefill's partial-region storage.
+            #
+            # Under plain PCP (self._pcp_dummy_sender is only ever true for
+            # that case), PCP rank 0 always owns the chunk containing the
+            # sequence's final token (pcp_manager.py rank_segments()), so it
+            # is the only rank whose local block table covers the tail
+            # position capture() looks up; the other ranks skip this exactly
+            # like they already skip sending their (here: dummy) KV blocks.
+            for req_id, (_, groups) in metadata.reqs_to_send.items():
+                if groups:
+                    metadata.step5_tails[req_id] = step5_state.capture(
+                        groups, metadata.step5_prompt_tokens[req_id],
+                    )
         if not self.is_kv_producer and metadata.reqs_to_recv:
             asyncio.run_coroutine_threadsafe(
                 self._start_load_kv(metadata.reqs_to_recv), self.receiver_loop
@@ -2855,12 +3618,17 @@ class MooncakeConnectorWorker:
             num_blocks_per_layer=num_blocks_per_layer,
         )
 
+    def _step5_replicated_regions(self) -> set[str]:
+        step5_state = getattr(self, "_step5_state", None)
+        return step5_state.replicated_regions if step5_state else set()
+
     def _get_sender_transfer_plan(
         self,
         local_kv_block_len: int,
         remote_kv_block_len: int,
         remote_tp_rank: int,
         remote_tp_size: int,
+        is_replicated_region: bool = False,
     ) -> tuple[bool, int, int, int]:
         return _compute_sender_transfer_plan(
             transfer_topo=self.transfer_topo,
@@ -2869,6 +3637,7 @@ class MooncakeConnectorWorker:
             local_kv_block_len=local_kv_block_len,
             remote_kv_block_len=remote_kv_block_len,
             producer_cache_replicated=self._producer_cache_is_replicated(),
+            is_replicated_region=is_replicated_region,
         )
 
     def _log_debug_cache_registration(

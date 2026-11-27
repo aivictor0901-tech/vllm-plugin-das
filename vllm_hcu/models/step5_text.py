@@ -125,6 +125,14 @@ from vllm.model_executor.models.utils import (
 
 logger = init_logger("vllm.step5.step5_text")
 
+FUSED_ATTN_QK_NORM_ROPE = henvs.optional_custom_op_enabled(
+    os.getenv("VLLM_HCU_STEP5_FUSED_ATTN_QK_NORM_ROPE", "0") == "1"
+)
+if FUSED_ATTN_QK_NORM_ROPE:
+    from vllm_hcu.model_executor.layers.step5_attention_qk_norm_rope import (
+        can_use as can_fuse_attention_qk_norm_rope,
+    )
+
 # Checkpoint tensors that belong to the DSA indexer. Only consulted when DSA is
 # switched off: the dense-equivalent path does not allocate them, and they are
 # counted at load time so a skip stays distinguishable from a successful load.
@@ -140,6 +148,10 @@ _DSA_INDEXER_SUBSTRINGS = (
 
 # Escape hatch back to the pre-DSA dense path, for A/B against this backend.
 DISABLE_DSA = is_dsa_disabled()
+
+# A full input vocabulary on each TP rank avoids the embedding all-reduce.
+# This changes storage only; the native embedding loader and dtype are kept.
+REPLICATED_EMBEDDING = os.environ.get("HCU_STEP5_REPLICATED_EMBEDDING", "0") == "1"
 
 # Apply placement while checkpoint tensors stream through the plugin loader.
 EXPERT_PLACEMENT = (
@@ -759,6 +771,7 @@ class BF16FP32RouterLinear(ReplicatedLinear):
     def _forward_fused_shared(
         self, x2: torch.Tensor,
         x_and_scale_quanted: tuple[torch.Tensor, torch.Tensor] | None = None,
+        *, router_tp_size: int = 1, router_tp_rank: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor] | None:
         if self._fused_shared_int8:
             from vllm_hcu.ops.step5.router_shared_int8 import usable_router_shared_int8
@@ -782,6 +795,7 @@ class BF16FP32RouterLinear(ReplicatedLinear):
                 mlp.limit,
                 workspace=self._rsg_int8_workspace,
                 x_and_scale_quanted=x_and_scale_quanted,
+                router_tp_size=router_tp_size, router_tp_rank=router_tp_rank,
             )
         from vllm_hcu.ops.step5.router_gemm import RSG_MAX_M
 
@@ -927,6 +941,7 @@ class Step5MLP(nn.Module):
         quant_config: QuantizationConfig | None = None,
         reduce_results: bool = True,
         prefix: str = "",
+        disable_tp: bool = False,
     ) -> None:
         super().__init__()
         self.gate_up_proj = MergedColumnParallelLinear(
@@ -935,6 +950,7 @@ class Step5MLP(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.gate_up_proj",
+            disable_tp=disable_tp,
         )
         self.down_proj = RowParallelLinear(
             intermediate_size,
@@ -943,6 +959,7 @@ class Step5MLP(nn.Module):
             quant_config=quant_config,
             reduce_results=reduce_results,
             prefix=f"{prefix}.down_proj",
+            disable_tp=disable_tp,
         )
 
         if hidden_act != "silu":
@@ -979,7 +996,7 @@ class Step5MLP(nn.Module):
             os.getenv("VLLM_HCU_STEP5_SHARED_INT8_EPILOGUE", "0") == "1"
             and MIXED_DENSE_INT8 and not MIXED_DENSE_DEQUANT
             and ".share_expert" in prefix and self.limit is not None
-            and self.gate_up_proj.output_size_per_partition == 768
+            and self.gate_up_proj.output_size_per_partition in (768, 3072)
             and getattr(self.down_proj, "input_is_parallel", False)
             and callable(supports) and supports()
         )
@@ -1068,6 +1085,7 @@ class Step5MLP(nn.Module):
 
                 intermediate_act = torch.ops.vllm.step5_shared_int8_epilogue(
                     gate_up, None, None, 352, float(self.limit),
+                    prefill_dense=prefill_epilogue,
                 )
             else:
                 intermediate_act = self.act_fn(gate_up)
@@ -1287,6 +1305,15 @@ class Step5Attention(nn.Module):
             self.int8_gate_quant and self.swa_fused_qk
             and _get_step5_swa_fused().INT8_EPILOGUE
         )
+        self.dsa_gate_quant_no_copy = False
+        if henvs.optional_custom_op_enabled(
+            os.getenv("VLLM_HCU_STEP5_DSA_GATE_QUANT_NO_COPY", "0") == "1"
+        ):
+            from vllm_hcu.models import step5_dsa_gate_quant
+
+            self.dsa_gate_quant_no_copy = step5_dsa_gate_quant.configured_for(self)
+            if self.dsa_gate_quant_no_copy:
+                step5_dsa_gate_quant.require_graph_boundary()
 
         # Step-5 uses 1/3 on full-attention layers, so take the rotary width from
         # get_rope (int(head_size * factor)) instead of assuming 1 or 1/2.
@@ -1521,15 +1548,26 @@ class Step5Attention(nn.Module):
                 int8_output=int8_epilogue,
             )
             return self._gate_o_proj(attn_output, extra_dims, hidden_states)
-        q_by_head = q.view(*q.shape[:-1], q.shape[-1] // self.head_dim, self.head_dim)
-        q_by_head = self.q_norm(q_by_head.contiguous())
-        q = q_by_head.view(q.shape)
+        if FUSED_ATTN_QK_NORM_ROPE and can_fuse_attention_qk_norm_rope(
+            self, q, k, positions
+        ):
+            q, k = torch.ops.vllm.step5_attention_qk_norm_rope(
+                q, k, self.q_norm.weight, self.k_norm.weight,
+                self.rotary_emb.cos_sin_cache, positions,
+                self.head_dim, self.rotary_emb.rotary_dim,
+                self.q_norm.variance_epsilon, self.k_norm.variance_epsilon,
+                self.rotary_emb.is_neox_style, False,
+            )
+        else:
+            q_by_head = q.view(*q.shape[:-1], q.shape[-1] // self.head_dim, self.head_dim)
+            q_by_head = self.q_norm(q_by_head.contiguous())
+            q = q_by_head.view(q.shape)
 
-        k_by_head = k.view(*k.shape[:-1], k.shape[-1] // self.head_dim, self.head_dim)
-        k_by_head = self.k_norm(k_by_head.contiguous())
-        k = k_by_head.view(k.shape)
-        if self.use_rope:
-            q, k = self.rotary_emb(positions, q, k)
+            k_by_head = k.view(*k.shape[:-1], k.shape[-1] // self.head_dim, self.head_dim)
+            k_by_head = self.k_norm(k_by_head.contiguous())
+            k = k_by_head.view(k.shape)
+            if self.use_rope:
+                q, k = self.rotary_emb(positions, q, k)
         if self.indexer is not None:
             # Publishes layer.attn.step4_sparse_plan, which the DSA backend
             # reads. It needs hidden_states, which Attention.forward never sees
@@ -1539,6 +1577,12 @@ class Step5Attention(nn.Module):
                 self.indexer.forward(idx, positions)
             else:
                 self.indexer.forward(hidden_states, positions)
+        if self.dsa_gate_quant_no_copy:
+            from vllm_hcu.models import step5_dsa_gate_quant
+
+            if step5_dsa_gate_quant.can_use(self, q, extra_dims):
+                quantized = step5_dsa_gate_quant.forward(self, q, k, v, extra_dims)
+                return self._gate_o_proj(quantized, extra_dims, hidden_states)
         attn_output = self.attn(q, k, v)
         return self._gate_o_proj(attn_output, extra_dims, hidden_states)
 
@@ -1707,14 +1751,25 @@ class FusedMoEBlock(nn.Module):
         # LL routed tokens are uniquely owned across TP. For the ordinary
         # replicated residual path, sum shared TP partials and restore routed
         # owners together in one TP collective instead of ReduceScatter + AG.
+        from vllm_hcu.model_executor.layers.fused_moe.step5_ll_topology import uses_step5_ll_fused_restore
+        from vllm_hcu.model_executor.layers.fused_moe.step5_replicated_shared import uses_replicated_shared_ll_restore
         self._step5_ll_fused_restore = (
             self._step5_deepep
-            and vllm_config.parallel_config.all2all_backend == "deepep_low_latency"
-            and bool(getattr(config, "fp32_residual_connection", False))
-            and not vllm_config.compilation_config.pass_config.enable_sp
-            and self.tp_size == 4
-            and get_ep_group().world_size == 16
+            and (uses_step5_ll_fused_restore(vllm_config)
+                 or uses_replicated_shared_ll_restore(vllm_config))
+            and get_ep_group().world_size == (
+                self.tp_size * vllm_config.parallel_config.data_parallel_size
+            )
         )
+        from vllm_hcu.model_executor.layers.fused_moe.step5_replicated_shared import replicated_shared_enabled
+        self._step5_replicated_shared = replicated_shared_enabled(vllm_config, prefix)
+        if self._step5_replicated_shared and (
+            not self._step5_deepep
+            or get_ep_group().world_size != (
+                self.tp_size * vllm_config.parallel_config.data_parallel_size)
+            or not isinstance(self.gate, BF16FP32RouterLinear)
+        ):
+            raise ValueError("Replicated shared RS/AG requires Step5 LL experts and the BF16/FP32 router")
         self.effective_sequence_parallel = (
             (vllm_config.compilation_config.pass_config.enable_sp or self._step5_deepep)
             and self.tp_size > 1
@@ -1740,11 +1795,16 @@ class FusedMoEBlock(nn.Module):
             # it with no scale. MIXED_DENSE_INT8 opts in explicitly instead.
             quant_config=_dense_quant_config(vllm_config),
             prefix=f"{prefix}.share_expert",
+            disable_tp=self._step5_replicated_shared,
         )
+        if self._step5_replicated_shared:
+            from vllm_hcu.model_executor.layers.fused_moe.step5_replicated_shared import validate_replicated_shared_projection
+            validate_replicated_shared_projection(self.share_expert, config.share_expert_dim)
         if (
             FUSED_ROUTER_SHARED
             and isinstance(self.gate, BF16FP32RouterLinear)
-            and (self.fold_shared_expert or self._step5_ll_fused_restore)
+            and (self.fold_shared_expert or self._step5_ll_fused_restore
+                 or self._step5_replicated_shared)
             and self.share_expert.limit is not None
             and (
                 self.share_expert.gate_up_proj.weight.dtype == torch.bfloat16
@@ -1765,7 +1825,7 @@ class FusedMoEBlock(nn.Module):
         self.experts = FusedMoEFactory(
             # LL owns only a TP token slice; compute fused shared/router on
             # the full shared input outside the routed-only runner.
-            gate=None if self._step5_ll_fused_restore else self.gate,
+            gate=None if (self._step5_ll_fused_restore or self._step5_replicated_shared) else self.gate,
             num_experts=config.moe_num_experts,
             top_k=config.moe_top_k,
             hidden_size=config.hidden_size,
@@ -1789,7 +1849,7 @@ class FusedMoEBlock(nn.Module):
         from vllm_hcu.model_executor.layers.fused_moe.step5_ll_eplb_policy import install_int64_eplb_mapping
         install_int64_eplb_mapping(self.experts.router, vllm_config)
 
-        if self._step5_ll_fused_restore:
+        if self._step5_ll_fused_restore or self._step5_replicated_shared:
             from vllm_hcu.model_executor.layers.fused_moe.step5_ll_runtime import router_shared_op
             router_shared_op()
             self.experts._hcu_step5_ll_router_shared = self._ll_router_shared_eager
@@ -1797,7 +1857,34 @@ class FusedMoEBlock(nn.Module):
     def _ll_router_shared_eager(self, full_input, xq=None, xs=None):
         """Keep shape-dependent dispatch inside the opaque runtime boundary."""
         quanted = None if xq is None else (xq, xs)
+        if getattr(self, "_step5_replicated_shared", False):
+            # full_input is already this rank's owner slice. The replicated
+            # shared weights use all 1536 channels; router rows must NOT be
+            # divided by TP a second time, including after large-shape warmup.
+            from vllm_hcu.model_executor.layers.fused_moe.step5_replicated_shared import owner_execution
+            with owner_execution():
+                if self.share_expert.requires_main_stream_for_fused_activation(full_input):
+                    logits, activation = self.gate(full_input, x_and_scale_quanted=quanted)
+                    shared = (self.share_expert.forward_fused_router_activation(activation)
+                              if activation is not None else self.share_expert(
+                                  full_input, x_and_scale_quanted=quanted))
+                else:
+                    shared = self.share_expert(full_input, x_and_scale_quanted=quanted)
+                    logits = self.gate._gemm(full_input, self.gate.weight)
+                return shared, logits
         if self.share_expert.requires_main_stream_for_fused_activation(full_input):
+            if (self.tp_size == 4 and getattr(self.gate, "_fused_shared_int8", False)
+                    and self.share_expert._shared_output_int8):
+                # All rows need the TP-sharded shared projection. Only the
+                # local rows need router logits before the LL dispatch.
+                self.share_expert.fused_act = None
+                fused = self.gate._forward_fused_shared(
+                    full_input, quanted, router_tp_size=self.tp_size,
+                    router_tp_rank=get_tp_group().rank_in_group,
+                )
+                if fused is not None:
+                    logits, activation = fused
+                    return self.share_expert.forward_fused_router_activation(activation), logits
             logits, activation = self.gate(full_input, x_and_scale_quanted=quanted)
             shared = (self.share_expert.forward_fused_router_activation(activation)
                       if activation is not None else self.share_expert(
@@ -1833,6 +1920,18 @@ class FusedMoEBlock(nn.Module):
         """Return (shared, routed); shared is None when FusedMoE already added it."""
         hidden_dim = hidden_states.shape[-1]
         hidden_states = hidden_states.view(-1, hidden_dim)
+        if getattr(self, "_step5_replicated_shared", False):
+            if not input_is_sequence_parallel:
+                raise ValueError("Replicated shared MoE requires attention RS token owners")
+            xq, xs = ((None, None) if shared_x_and_scale_quanted is None
+                      else shared_x_and_scale_quanted)
+            # tp_size=1 describes router output rows in this opaque op, not
+            # the distributed group: all local rows need their own logits.
+            shared, logits = torch.ops.vllm.step5_ll_router_shared.default(
+                hidden_states, xq, xs, self.experts.layer_name,
+                1, self.gate.weight.shape[1])
+            routed = self.experts(hidden_states=hidden_states, router_logits=logits)
+            return shared, routed
         shared_kwargs = {}
         if shared_x_and_scale_quanted is not None:
             if (not (self.fold_shared_expert or self._step5_ll_fused_restore)
@@ -2021,6 +2120,20 @@ class Step5DecoderLayer(nn.Module):
             )
             if FP8_DENSE:
                 _use_fp8(self.mlp.gate_up_proj, self.mlp.down_proj)
+        self._step5_replicated_shared = (
+            self.use_moe and getattr(self.moe, "_step5_replicated_shared", False)
+        )
+        if getattr(self, "_step5_replicated_shared", False):
+            # Preserve the native o_proj GEMM/quantization. Its output is a TP
+            # partial, reduced by the owner RS below instead of RowParallel AR.
+            self.self_attn.o_proj.reduce_results = False
+            from vllm_hcu.model_executor.layers.fused_moe.step5_replicated_shared import (
+                attention_rs_op, finish_owner_op,
+            )
+            attention_rs_op()
+            finish_owner_op()
+            from vllm_hcu.model_executor.layers.fused_moe.step5_shared_fabric import initialize_shared_fabric
+            initialize_shared_fabric(self.tp_group)
         self.input_layernorm = _fp32_gemma_rms_norm(
             config.hidden_size, config.rms_norm_eps
         )
@@ -2048,6 +2161,14 @@ class Step5DecoderLayer(nn.Module):
             hidden_states, input_is_sequence_parallel=input_is_sequence_parallel,
             shared_x_and_scale_quanted=shared_x_and_scale_quanted,
         )
+        if getattr(self, "_step5_replicated_shared", False):
+            assert residual is not None and orig_num_tokens is not None
+            from vllm_hcu.model_executor.layers.fused_moe.step5_replicated_shared import finish_owner_op
+            group = get_tp_group()
+            return finish_owner_op()(
+                shared_output, routed_output, residual, orig_num_tokens,
+                group.world_size, group.unique_name,
+            )
         if getattr(self.moe, "_step5_ll_fused_restore", False) and not input_is_sequence_parallel:
             from vllm_hcu.model_executor.layers.fused_moe.step5_deepep import restore_ll_shared_and_routed
             return restore_ll_shared_and_routed(
@@ -2115,12 +2236,13 @@ class Step5DecoderLayer(nn.Module):
             return self._forward_ffn(hidden_states) + residual
 
         ffn_output, residual = self.forward_residual(positions, hidden_states)
-        return self._cast_for_residual(ffn_output) + residual
+        return (self._cast_for_residual(ffn_output) if residual is None
+                else self._cast_for_residual(ffn_output) + residual)
 
     def forward_residual(
         self, positions: torch.Tensor, hidden_states: torch.Tensor,
         residual: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Keep the FFN contribution separate until the next input norm.
 
         Public layer.forward and pipeline boundaries still materialize their
@@ -2142,11 +2264,22 @@ class Step5DecoderLayer(nn.Module):
                 x_and_scale_quanted=(x_q, x_scale),
             )
 
+        if getattr(self, "_step5_replicated_shared", False):
+            from vllm_hcu.model_executor.layers.fused_moe.step5_replicated_shared import (
+                attention_rs_op, owner_residual,
+            )
+            group = get_tp_group()
+            hidden_states = attention_rs_op()(
+                hidden_states, group.world_size, group.unique_name,
+            )
+            residual = owner_residual(residual, group.world_size, group.rank_in_group)
+
         shared_quanted = None
         if (
             INT8_ATTN_NORM_QUANT and torch.compiler.is_compiling()
             and self.compute_dtype == torch.bfloat16 and self.use_moe
-            and (self.moe.fold_shared_expert or self.moe._step5_ll_fused_restore)
+            and (self.moe.fold_shared_expert or self.moe._step5_ll_fused_restore
+                 or getattr(self, "_step5_replicated_shared", False))
             and _can_fuse_int8_shared_expert(self.moe.share_expert)
         ):
             from vllm_hcu.ops.step5.attention_int8 import (
@@ -2164,12 +2297,14 @@ class Step5DecoderLayer(nn.Module):
             hidden_states = self.post_attention_layernorm(residual).to(self.compute_dtype)
         ffn_output = self._forward_ffn(
             hidden_states,
-            input_is_sequence_parallel=False,
-            residual=None,
+            input_is_sequence_parallel=getattr(self, "_step5_replicated_shared", False),
+            residual=residual if getattr(self, "_step5_replicated_shared", False) else None,
             orig_num_tokens=orig_num_tokens,
             shared_x_and_scale_quanted=shared_quanted,
         )
-        return ffn_output, residual
+        # finish_owner already added the local FP32 residual before gathering.
+        # Returning None prevents public forward/the model loop adding it twice.
+        return ffn_output, None if getattr(self, "_step5_replicated_shared", False) else residual
 
 
 @support_torch_compile
@@ -2210,7 +2345,12 @@ class Step5Model(nn.Module):
                 # max_num_seqs would do; the slack absorbs rows left behind by
                 # requests that finished mid-region, which are only reclaimed
                 # least-recently-touched.
-                max_pending=2 * vllm_config.scheduler_config.max_num_seqs + 16,
+                # Step5 P/D retains the final region of every finished
+                # prefill until the connector's capture() runs on a later
+                # engine step. At bs32 the old 2x+16 sizing (80 rows) filled
+                # exactly and capture recycled the row it still needed; 4x+32
+                # leaves room.
+                max_pending=4 * vllm_config.scheduler_config.max_num_seqs + 32,
                 dtype=self.compute_dtype,
                 # Capture bounds: the decode schedule lives in [max_num_reqs]
                 # buffers at a score width covering max_model_len, so that both
@@ -2237,9 +2377,15 @@ class Step5Model(nn.Module):
         if get_pp_group().is_first_rank or (
             config.tie_word_embeddings and get_pp_group().is_last_rank
         ):
+            if (REPLICATED_EMBEDDING and config.tie_word_embeddings
+                    and get_tensor_model_parallel_world_size() > 1):
+                raise ValueError(
+                    "Replicated Step5 input embeddings cannot tie a TP-sharded lm_head"
+                )
             self.embed_tokens = VocabParallelEmbedding(
                 self.vocab_size,
                 config.hidden_size,
+                disable_tp=REPLICATED_EMBEDDING,
             )
         else:
             self.embed_tokens = PPMissingLayer()

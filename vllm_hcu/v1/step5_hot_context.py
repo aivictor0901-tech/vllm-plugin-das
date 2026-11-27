@@ -72,9 +72,12 @@ def record_context_graph_mode(runner, batch_desc):
     if not HOT_REGIONS or not getattr(runner, "_step5_hot_context_real_batch", False):
         return
     mode = batch_desc.cg_mode.name
-    if mode != getattr(runner, "_step5_hot_context_last_mode", None):
-        runner._step5_hot_context_last_mode = mode
+    regions = getattr(batch_desc, "context_regions", 0)
+    key = (mode, regions) if regions else mode
+    if key != getattr(runner, "_step5_hot_context_last_mode", None):
+        runner._step5_hot_context_last_mode = key
+        context = f" regions={regions} context_tokens={regions * 8}" if regions else ""
         print(
-            f"[step5_context_graph] dp={runner.dp_rank} mode={mode} upper={getattr(runner, '_step5_hot_context_upper', None)} tokens={batch_desc.num_tokens}",
+            f"[step5_context_graph] dp={runner.dp_rank} mode={mode} upper={getattr(runner, '_step5_hot_context_upper', None)} tokens={batch_desc.num_tokens}{context}",
             flush=True,
         )

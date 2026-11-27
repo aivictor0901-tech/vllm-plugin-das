@@ -44,6 +44,18 @@ ENVIRONMENT_VARIABLES = {
     "VLLM_HCU_STEP5_PREFILL_SHARED_INT8": lambda: (
         os.getenv("VLLM_HCU_STEP5_PREFILL_SHARED_INT8", "0") == "1"
     ),
+    # Include the opt-in in vLLM's environment/cache factors.
+    "VLLM_HCU_STEP5_FUSED_ATTN_QK_NORM_ROPE": lambda: (
+        os.getenv("VLLM_HCU_STEP5_FUSED_ATTN_QK_NORM_ROPE", "0") == "1"
+    ),
+    # Changing embedding TP layout also changes the compiled main graph.
+    "HCU_STEP5_REPLICATED_EMBEDDING": lambda: (
+        os.getenv("HCU_STEP5_REPLICATED_EMBEDDING", "0") == "1"
+    ),
+    # One cache factor covers metadata update graphs and prefix/suffix overlap.
+    "HCU_STEP5_METADATA_OVERLAP": lambda: (
+        os.getenv("HCU_STEP5_METADATA_OVERLAP", "0") == "1"
+    ),
     "VLLM_STEP5_LIGHTOP_SPEC_INDEXER": lambda: (
         os.getenv("VLLM_STEP5_LIGHTOP_SPEC_INDEXER", "0") == "1"
     ),
@@ -61,6 +73,10 @@ ENVIRONMENT_VARIABLES = {
     ),
     "VLLM_STEP_CC_LEVEL": lambda: int(os.getenv("VLLM_STEP_CC_LEVEL", "0")),
     "VLLM_STEP5_DISABLE_DSA": is_dsa_disabled,
+    # Changes the attention graph boundary and output tensor contract.
+    "VLLM_HCU_STEP5_DSA_GATE_QUANT_NO_COPY": lambda: (
+        os.getenv("VLLM_HCU_STEP5_DSA_GATE_QUANT_NO_COPY", "0") == "1"
+    ),
     "VLLM_STEP5_TOOL_PARSER_MAX_HEADER_CHARS": lambda: int(
         os.getenv("VLLM_STEP5_TOOL_PARSER_MAX_HEADER_CHARS", "512")
     ),
@@ -78,6 +94,10 @@ ENVIRONMENT_VARIABLES = {
     ),
     "VLLM_STEP5_SPARSE_INDEXER_ROPE_DIM": lambda: int(
         os.getenv("VLLM_STEP5_SPARSE_INDEXER_ROPE_DIM", "32")
+    ),
+    # Indexer launch policy also participates in compiled-cache invalidation.
+    "VLLM_HCU_STEP5_FUSED_INDEXER_QK_NORM_ROPE": lambda: (
+        os.getenv("VLLM_HCU_STEP5_FUSED_INDEXER_QK_NORM_ROPE", "0") == "1"
     ),
     "VLLM_STEP5_SPARSE_PROXY_DIM": lambda: int(
         os.getenv("VLLM_STEP5_SPARSE_PROXY_DIM", "256")

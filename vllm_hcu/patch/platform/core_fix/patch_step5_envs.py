@@ -48,6 +48,14 @@ def apply_to_module(module: ModuleType) -> bool:
         for name in sorted(os.environ):
             if name.startswith("VLLM_HCU_"):
                 factors[name] = os.environ[name]
+        # These opt-in paths change weight/row layout and captured kernels.
+        # They use HCU_ names, so the VLLM_HCU_ prefix loop does not cover them.
+        for name in (
+            "HCU_STEP5_REPLICATED_SHARED_RS_AG",
+            "HCU_STEP5_SHARED_SMALL_M_BM16",
+            "HCU_STEP5_REPLICATED_SHARED_FABRIC",
+        ):
+            factors[name] = os.environ.get(name, "0") == "1"
         return factors
 
     target.compile_factors = compile_factors

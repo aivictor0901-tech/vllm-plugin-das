@@ -2,6 +2,8 @@
 """Opt-in offline placement for Step5 LL; no live expert weight migration."""
 import os
 
+from .step5_ll_topology import supports_step5_ll_topology
+
 
 def allows_static_step5_ll_eplb(config=None):
     if os.getenv("HCU_STEP5_LL_STATIC_EPLB", "0") != "1":
@@ -22,8 +24,9 @@ def allows_static_step5_ll_eplb(config=None):
     return bool(
         p.enable_eplb and p.enable_expert_parallel
         and p.all2all_backend == "deepep_low_latency"
-        and (p.tensor_parallel_size, p.data_parallel_size, p.pipeline_parallel_size)
-            == (4, 4, 1)
+        and supports_step5_ll_topology(
+            p.tensor_parallel_size, p.data_parallel_size, p.pipeline_parallel_size
+        )
         and not p.enable_dbo
         and not cfg.compilation_config.pass_config.enable_sp
         and not p.eplb_config.use_async
@@ -68,6 +71,7 @@ def install_int64_eplb_mapping(router, config):
     if os.getenv("HCU_STEP5_LL_EPLB_I64", "0") != "1":
         return
     if not allows_static_step5_ll_eplb(config):
-        raise ValueError("INT64 EPLB mapping requires static Step5 TP4/DP4 LL")
+        raise ValueError("INT64 EPLB mapping requires static Step5 LL placement "
+                         "with TP4/DP2, TP4/DP4 or TP1/DP16")
     from types import MethodType
     router._apply_eplb_mapping = MethodType(_map_int64_ids, router)
